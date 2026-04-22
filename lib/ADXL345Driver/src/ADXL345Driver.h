@@ -24,6 +24,7 @@ class ADXL345Driver {
     Hz50 = 0x09,
     Hz100 = 0x0A,
     Hz200 = 0x0B,
+    Hz400 = 0x0C,
   };
 
   explicit ADXL345Driver(TwoWire& wire,

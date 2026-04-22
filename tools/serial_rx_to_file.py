@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-将接收端串口中的:
-timestamp_ms,ax_raw,ay_raw,az_raw
+Capture RX serial samples and write CSV/TXT rows with wall-clock timestamps.
 
-转换并保存为:
-2026/3/13 1:27:28.0320,0.000000,-0.000033,0.000004
-
-说明:
-1. 不修改单片机固件, 只在电脑端做串口转存。
-2. 默认把原始值按 ADXL345 full-resolution 的 3.9 mg/LSB 转成 g。
-3. 发送端时间基准是 millis(), 所以绝对时间需要用“电脑当前时间”或用户指定的起始时间做锚定。
-4. 由于输入时间只有毫秒级, 输出里的第 4 位小数会固定为 0。
+Supported serial data formats:
+1. Multi-device RX output:
+   dev_id,timestamp_ms,ax_raw,ay_raw,az_raw
+2. Legacy single-device RX output:
+   timestamp_ms,ax_raw,ay_raw,az_raw
 """
 
 from __future__ import annotations
@@ -28,13 +24,16 @@ try:
     from serial import SerialException
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "未找到 pyserial。建议直接使用 PlatformIO 自带 Python 运行本脚本:\n"
-        r"C:\Users\26223\.platformio\penv\Scripts\python.exe tools\serial_rx_to_file.py --port COM6 --output rx.csv"
+        "pyserial is required.\n"
+        r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
+        r"tools\serial_rx_to_file.py --port COM6 --output rx.csv"
     ) from exc
 
 
-DATA_LINE_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
+MULTI_DEVICE_RE = re.compile(r"^\s*(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
+LEGACY_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 DEFAULT_SCALE_G = 0.0039
+DEFAULT_DEVICE_ID = "1001"
 
 
 @dataclass
@@ -47,47 +46,94 @@ class CaptureConfig:
     append: bool
     echo_data: bool
     write_header: bool
+    include_id: bool
+    legacy_device_id: str
+
+
+@dataclass
+class ParsedSample:
+    device_id: str
+    sensor_ms: int
+    ax_raw: int
+    ay_raw: int
+    az_raw: int
+    from_legacy_line: bool
+
+
+@dataclass
+class TimeAnchor:
+    base_time: datetime | None = None
+    anchor_wallclock: datetime | None = None
+    anchor_sensor_ms: int | None = None
+    last_sensor_ms: int | None = None
+
+    def to_datetime(self, sensor_ms: int) -> tuple[datetime, bool]:
+        reanchored = False
+        if self.anchor_sensor_ms is None:
+            self.anchor_sensor_ms = sensor_ms
+            self.anchor_wallclock = self.base_time or datetime.now()
+            reanchored = True
+        elif self.last_sensor_ms is not None and sensor_ms < self.last_sensor_ms:
+            self.anchor_sensor_ms = sensor_ms
+            self.anchor_wallclock = datetime.now()
+            reanchored = True
+
+        self.last_sensor_ms = sensor_ms
+        assert self.anchor_wallclock is not None
+        assert self.anchor_sensor_ms is not None
+        delta_ms = sensor_ms - self.anchor_sensor_ms
+        return self.anchor_wallclock + timedelta(milliseconds=delta_ms), reanchored
 
 
 def parse_args() -> CaptureConfig:
     parser = argparse.ArgumentParser(
-        description="读取接收端串口数据并转换为绝对时间 + 浮点值后写入 CSV/TXT。"
+        description=(
+            "Read RX serial samples, restore wall-clock time and save CSV/TXT rows."
+        )
     )
-    parser.add_argument("--port", required=True, help="串口号，例如 COM6")
-    parser.add_argument("--baud", type=int, default=115200, help="串口波特率，默认 115200")
+    parser.add_argument("--port", required=True, help="Serial port, for example COM6")
     parser.add_argument(
-        "--output",
-        required=True,
-        help="输出文件路径，例如 rx.csv 或 rx.txt",
+        "--baud", type=int, default=115200, help="Serial baud rate, default 115200"
     )
+    parser.add_argument("--output", required=True, help="Output file path")
     parser.add_argument(
         "--scale",
         type=float,
         default=DEFAULT_SCALE_G,
-        help="原始值乘法缩放系数，默认 0.0039（转换为 g）",
+        help="Raw to g scale factor. Default: 0.0039",
     )
     parser.add_argument(
         "--base-time",
         default="",
-        help=(
-            "可选，指定第一条样本对应的绝对时间。"
-            "格式示例: 2026/3/13 1:27:28.0320"
-        ),
+        help="Optional anchor time. Example: 2026/3/13 1:27:28.0320",
     )
     parser.add_argument(
         "--append",
         action="store_true",
-        help="追加写入文件，而不是覆盖",
+        help="Append to the output file instead of overwriting it",
     )
     parser.add_argument(
         "--echo-data",
         action="store_true",
-        help="在控制台同步打印转换后的数据行",
+        help="Print converted rows to the console",
     )
     parser.add_argument(
         "--with-header",
         action="store_true",
-        help="在文件首行写入表头 datetime,ax,ay,az",
+        help="Write a header row to the output file",
+    )
+    parser.add_argument(
+        "--include-id",
+        action="store_true",
+        help="Write device id as the first column",
+    )
+    parser.add_argument(
+        "--device-id",
+        default=DEFAULT_DEVICE_ID,
+        help=(
+            "Fallback device id used only for legacy 4-field serial lines. "
+            f"Default: {DEFAULT_DEVICE_ID}"
+        ),
     )
     args = parser.parse_args()
 
@@ -101,18 +147,20 @@ def parse_args() -> CaptureConfig:
         append=args.append,
         echo_data=args.echo_data,
         write_header=args.with_header,
+        include_id=args.include_id,
+        legacy_device_id=str(args.device_id),
     )
 
 
 def parse_user_time(text: str) -> datetime:
     text = text.strip()
-    for fmt in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S.%f"):
+    for fmt in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S"):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
     raise SystemExit(
-        "base-time 格式错误。示例: 2026/3/13 1:27:28.0320"
+        "Invalid --base-time format. Example: 2026/3/13 1:27:28.0320"
     )
 
 
@@ -139,30 +187,66 @@ def open_output(path: Path, append: bool):
     return path.open(mode, newline="", encoding="utf-8")
 
 
+def parse_serial_sample(line: str, fallback_device_id: str) -> ParsedSample | None:
+    match = MULTI_DEVICE_RE.match(line)
+    if match:
+        return ParsedSample(
+            device_id=match.group(1),
+            sensor_ms=int(match.group(2)),
+            ax_raw=int(match.group(3)),
+            ay_raw=int(match.group(4)),
+            az_raw=int(match.group(5)),
+            from_legacy_line=False,
+        )
+
+    match = LEGACY_RE.match(line)
+    if match:
+        return ParsedSample(
+            device_id=fallback_device_id,
+            sensor_ms=int(match.group(1)),
+            ax_raw=int(match.group(2)),
+            ay_raw=int(match.group(3)),
+            az_raw=int(match.group(4)),
+            from_legacy_line=True,
+        )
+
+    return None
+
+
+def build_header(include_id: bool) -> list[str]:
+    if include_id:
+        return ["id", "datetime", "ax", "ay", "az"]
+    return ["datetime", "ax", "ay", "az"]
+
+
 def capture(config: CaptureConfig) -> int:
-    first_sample_ms: int | None = None
-    first_sample_time: datetime | None = config.base_time
+    anchors: dict[str, TimeAnchor] = {}
+    omitted_id_warned = False
 
     try:
         ser = serial.Serial(config.port, config.baud, timeout=1)
     except SerialException as exc:
-        print(f"[error] 串口打开失败: {exc}", file=sys.stderr)
+        print(f"[error] Serial open failed: {exc}", file=sys.stderr)
         return 1
 
     with ser, open_output(config.output, config.append) as fp:
         writer = csv.writer(fp)
 
         if config.write_header and (not config.append or config.output.stat().st_size == 0):
-            writer.writerow(["datetime", "ax", "ay", "az"])
+            writer.writerow(build_header(config.include_id))
             fp.flush()
 
-        print(f"[info] 正在监听串口 {config.port} @ {config.baud}")
-        print(f"[info] 输出文件: {config.output}")
-        print(f"[info] 缩放系数: {config.scale}")
+        print(f"[info] Listening on serial {config.port} @ {config.baud}")
+        print(f"[info] Output file: {config.output}")
+        print(f"[info] Scale: {config.scale}")
+        print(f"[info] Include id column: {config.include_id}")
         if config.base_time is None:
-            print("[info] 第一条数据到达时，将使用电脑当前时间作为起始时间")
+            print("[info] The first sample from each device will anchor to current PC time")
         else:
-            print(f"[info] 第一条数据的绝对时间固定为: {format_datetime_4(config.base_time)}")
+            print(
+                "[info] The first sample from each device will anchor to: "
+                f"{format_datetime_4(config.base_time)}"
+            )
 
         try:
             while True:
@@ -170,37 +254,42 @@ def capture(config: CaptureConfig) -> int:
                 if not raw_line:
                     continue
 
-                try:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                except UnicodeDecodeError:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                sample = parse_serial_sample(line, config.legacy_device_id)
+                if sample is None:
+                    if line:
+                        print(f"[serial] {line}")
                     continue
 
-                match = DATA_LINE_RE.match(line)
-                if not match:
-                    # 非数据行只做透传提示，便于观察 RX 状态
-                    print(f"[serial] {line}")
-                    continue
+                anchor = anchors.setdefault(
+                    sample.device_id, TimeAnchor(base_time=config.base_time)
+                )
+                sample_time, reanchored = anchor.to_datetime(sample.sensor_ms)
+                if reanchored:
+                    print(
+                        f"[info] Time anchor set for device {sample.device_id}: "
+                        f"{format_datetime_4(sample_time)}"
+                    )
 
-                sample_ms = int(match.group(1))
-                ax_raw = int(match.group(2))
-                ay_raw = int(match.group(3))
-                az_raw = int(match.group(4))
+                if not config.include_id and not sample.from_legacy_line and not omitted_id_warned:
+                    print(
+                        "[warn] Device id is present on serial input but omitted from file output. "
+                        "Use --include-id if multiple transmitters share one gateway."
+                    )
+                    omitted_id_warned = True
 
-                if first_sample_ms is None:
-                    first_sample_ms = sample_ms
-                    if first_sample_time is None:
-                        first_sample_time = datetime.now()
+                row = []
+                if config.include_id:
+                    row.append(sample.device_id)
+                row.extend(
+                    [
+                        format_datetime_4(sample_time),
+                        f"{convert_value(sample.ax_raw, config.scale):.6f}",
+                        f"{convert_value(sample.ay_raw, config.scale):.6f}",
+                        f"{convert_value(sample.az_raw, config.scale):.6f}",
+                    ]
+                )
 
-                assert first_sample_time is not None
-                delta_ms = sample_ms - first_sample_ms
-                sample_time = first_sample_time + timedelta(milliseconds=delta_ms)
-
-                row = [
-                    format_datetime_4(sample_time),
-                    f"{convert_value(ax_raw, config.scale):.6f}",
-                    f"{convert_value(ay_raw, config.scale):.6f}",
-                    f"{convert_value(az_raw, config.scale):.6f}",
-                ]
                 writer.writerow(row)
                 fp.flush()
 
@@ -208,7 +297,7 @@ def capture(config: CaptureConfig) -> int:
                     print(",".join(row))
 
         except KeyboardInterrupt:
-            print("\n[info] 用户终止采集")
+            print("\n[info] Capture stopped by user")
             return 0
 
 

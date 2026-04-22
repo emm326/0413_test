@@ -31,6 +31,27 @@
 #define PIN_LORA_DIO1 DIO0
 #endif
 
+// 板载 OLED / 用户按键
+#ifndef PIN_OLED_SDA
+#define PIN_OLED_SDA SDA_OLED
+#endif
+
+#ifndef PIN_OLED_SCL
+#define PIN_OLED_SCL SCL_OLED
+#endif
+
+#ifndef PIN_OLED_RST
+#define PIN_OLED_RST RST_OLED
+#endif
+
+#ifndef PIN_VEXT_CTRL
+#define PIN_VEXT_CTRL Vext
+#endif
+
+#ifndef PIN_USER_BUTTON
+#define PIN_USER_BUTTON 0
+#endif
+
 // ADXL345 当前改为 I2C 接线
 // Heltec -> ADXL345:
 // GPIO42 -> SCL
