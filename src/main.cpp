@@ -10,6 +10,9 @@
 #include "board_pins.h"
 #include "config.h"
 #include "lora_transport.h"
+#if defined(APP_LORAWAN_TX)
+#include "lorawan_transport.h"
+#endif
 #include "protocol.h"
 
 namespace {
@@ -125,7 +128,11 @@ void markDisplayDirty() { displayDirty = true; }
 
 void printRoleInfo() {
 #if defined(ROLE_TX)
+#if defined(APP_LORAWAN_TX)
+  Serial.println("ROLE=TX_LORAWAN");
+#else
   Serial.println("ROLE=TX");
+#endif
 #elif defined(ROLE_RX)
   Serial.println("ROLE=RX");
 #endif
@@ -277,7 +284,11 @@ void showBootScreen() {
   oled.printf("RATE %s Hz%s\r\n",
               activeRateProfile().label,
               experimentalTag(activeRateProfile()));
+#if defined(APP_LORAWAN_TX)
+  oled.printf("LoRaWAN CN470\r\n");
+#else
   oled.printf("LoRa %.1f MHz\r\n", AppConfig::LORA_FREQUENCY_MHZ);
+#endif
   oled.printf("Click: Menu\r\n");
   oled.printf("Hold : Apply\r\n");
   oled.display();
@@ -324,6 +335,18 @@ bool initAdxl() {
 }
 
 bool initLoRa() {
+#if defined(APP_LORAWAN_TX)
+  if (!LoRaWanTransport::begin()) {
+    Serial.printf("LoRaWAN init failed: %s (%d)\r\n",
+                  LoRaWanTransport::stateToString(LoRaWanTransport::lastState()),
+                  LoRaWanTransport::lastState());
+    return false;
+  }
+
+  Serial.println("LoRaWAN init ok");
+  LoRaWanTransport::printConfig(Serial);
+  return true;
+#else
   if (!LoRaTransport::begin()) {
     Serial.println("LoRa init failed");
     return false;
@@ -332,6 +355,7 @@ bool initLoRa() {
   Serial.println("LoRa init ok");
   LoRaTransport::printConfig(Serial);
   return true;
+#endif
 }
 
 void applyRateProfile(size_t newIndex, bool printLog) {
@@ -456,11 +480,39 @@ bool sendCurrentBatch() {
     delay(packetJitterMs);
   }
 
-  if (!LoRaTransport::sendPacket(txPacketBuffer, packetLength)) {
+  bool sent = false;
+#if defined(APP_LORAWAN_TX)
+  sent = LoRaWanTransport::sendUplink(txPacketBuffer, packetLength);
+#else
+  sent = LoRaTransport::sendPacket(txPacketBuffer, packetLength);
+#endif
+  if (!sent) {
+#if defined(APP_LORAWAN_TX)
+    Serial.printf("TX LoRaWAN uplink failed: %s (%d)\r\n",
+                  LoRaWanTransport::stateToString(LoRaWanTransport::lastState()),
+                  LoRaWanTransport::lastState());
+#else
     Serial.println("TX LoRa send failed");
+#endif
     return false;
   }
 
+#if defined(APP_LORAWAN_TX)
+  const LoRaWanTransport::UplinkMeta& meta = LoRaWanTransport::lastUplinkMeta();
+  Serial.printf("TX dev=%u,seq=%u,count=%u,fs=%.1f%s,t0=%lu,len=%u,jitter=%lu,fcnt=%lu,dr=%u,freq=%.3f,toa=%lu\r\n",
+                AppConfig::DEVICE_ID,
+                packetSeq,
+                pendingSamples,
+                sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
+                experimentalTag(activeRateProfile()),
+                static_cast<unsigned long>(batchStartMs),
+                static_cast<unsigned>(packetLength),
+                static_cast<unsigned long>(packetJitterMs),
+                static_cast<unsigned long>(meta.frameCounter),
+                meta.dataRate,
+                meta.frequencyMHz,
+                static_cast<unsigned long>(meta.timeOnAirMs));
+#else
   Serial.printf("TX dev=%u,seq=%u,count=%u,fs=%.1f%s,t0=%lu,len=%u,jitter=%lu\r\n",
                 AppConfig::DEVICE_ID,
                 packetSeq,
@@ -470,6 +522,7 @@ bool sendCurrentBatch() {
                 static_cast<unsigned long>(batchStartMs),
                 static_cast<unsigned>(packetLength),
                 static_cast<unsigned long>(packetJitterMs));
+#endif
   ++packetSeq;
   clearPendingBatch();
   markDisplayDirty();

@@ -31,6 +31,10 @@
 #define APP_LORA_FREQUENCY_MHZ_VALUE 470.0f
 #endif
 
+#ifndef APP_MAX_SAMPLES_PER_PACKET_VALUE
+#define APP_MAX_SAMPLES_PER_PACKET_VALUE 20
+#endif
+
 #ifndef APP_TX_STARTUP_JITTER_MAX_MS
 #define APP_TX_STARTUP_JITTER_MAX_MS 200UL
 #endif
@@ -43,15 +47,72 @@
 #error "ROLE_TX and ROLE_RX cannot be defined at the same time"
 #endif
 
+#if defined(APP_LORAWAN_TX) && defined(ROLE_RX)
+#error "APP_LORAWAN_TX can only be used with ROLE_TX"
+#endif
+
 #if !defined(ROLE_TX) && !defined(ROLE_RX)
 #define ROLE_TX
+#endif
+
+#ifndef APP_LORAWAN_DEV_ADDR_VALUE
+#define APP_LORAWAN_DEV_ADDR_VALUE 0x26011001UL
+#endif
+
+#ifndef APP_LORAWAN_FNWKSINT_KEY_VALUE
+#define APP_LORAWAN_FNWKSINT_KEY_VALUE \
+  0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01
+#endif
+
+#ifndef APP_LORAWAN_SNWKSINT_KEY_VALUE
+#define APP_LORAWAN_SNWKSINT_KEY_VALUE \
+  0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x01
+#endif
+
+#ifndef APP_LORAWAN_NWKSENC_KEY_VALUE
+#define APP_LORAWAN_NWKSENC_KEY_VALUE \
+  0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x01
+#endif
+
+#ifndef APP_LORAWAN_APPS_KEY_VALUE
+#define APP_LORAWAN_APPS_KEY_VALUE \
+  0x13, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01
+#endif
+
+#ifndef APP_LORAWAN_SUB_BAND_VALUE
+#define APP_LORAWAN_SUB_BAND_VALUE 1
+#endif
+
+#ifndef APP_LORAWAN_DATARATE_VALUE
+#define APP_LORAWAN_DATARATE_VALUE 5
+#endif
+
+#ifndef APP_LORAWAN_FPORT_VALUE
+#define APP_LORAWAN_FPORT_VALUE 10
+#endif
+
+#ifndef APP_LORAWAN_CONFIRMED_UPLINK_VALUE
+#define APP_LORAWAN_CONFIRMED_UPLINK_VALUE 0
+#endif
+
+#ifndef APP_LORAWAN_ADR_ENABLED_VALUE
+#define APP_LORAWAN_ADR_ENABLED_VALUE 0
+#endif
+
+#ifndef APP_LORAWAN_DUTY_CYCLE_ENABLED_VALUE
+#define APP_LORAWAN_DUTY_CYCLE_ENABLED_VALUE 0
 #endif
 
 namespace AppConfig {
 
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint16_t DEVICE_ID = static_cast<uint16_t>(APP_DEVICE_ID_VALUE);
-constexpr uint8_t MAX_SAMPLES_PER_PACKET = 20;
+constexpr uint8_t MAX_SAMPLES_PER_PACKET =
+    static_cast<uint8_t>(APP_MAX_SAMPLES_PER_PACKET_VALUE);
 constexpr uint16_t DEFAULT_SAMPLE_RATE_X10_HZ = 1000;  // 100.0 Hz
 
 // ADXL345 configuration
@@ -67,6 +128,20 @@ constexpr uint8_t LORA_CODING_RATE = 5;  // 4/5
 constexpr uint8_t LORA_SYNC_WORD = 0x12;
 constexpr uint16_t LORA_PREAMBLE_LEN = 8;
 constexpr int8_t LORA_TX_POWER_DBM = 14;
+
+// LoRaWAN ABP configuration for CN470 SX1302 gateways.
+constexpr uint32_t LORAWAN_DEV_ADDR = static_cast<uint32_t>(APP_LORAWAN_DEV_ADDR_VALUE);
+constexpr uint8_t LORAWAN_FNWKSINT_KEY[16] = {APP_LORAWAN_FNWKSINT_KEY_VALUE};
+constexpr uint8_t LORAWAN_SNWKSINT_KEY[16] = {APP_LORAWAN_SNWKSINT_KEY_VALUE};
+constexpr uint8_t LORAWAN_NWKSENC_KEY[16] = {APP_LORAWAN_NWKSENC_KEY_VALUE};
+constexpr uint8_t LORAWAN_APPS_KEY[16] = {APP_LORAWAN_APPS_KEY_VALUE};
+constexpr uint8_t LORAWAN_SUB_BAND = static_cast<uint8_t>(APP_LORAWAN_SUB_BAND_VALUE);
+constexpr uint8_t LORAWAN_DATARATE = static_cast<uint8_t>(APP_LORAWAN_DATARATE_VALUE);
+constexpr uint8_t LORAWAN_FPORT = static_cast<uint8_t>(APP_LORAWAN_FPORT_VALUE);
+constexpr bool LORAWAN_CONFIRMED_UPLINK = (APP_LORAWAN_CONFIRMED_UPLINK_VALUE != 0);
+constexpr bool LORAWAN_ADR_ENABLED = (APP_LORAWAN_ADR_ENABLED_VALUE != 0);
+constexpr bool LORAWAN_DUTY_CYCLE_ENABLED =
+    (APP_LORAWAN_DUTY_CYCLE_ENABLED_VALUE != 0);
 
 // Multi-node mitigation knobs
 constexpr uint32_t TX_STARTUP_JITTER_MAX_MS = APP_TX_STARTUP_JITTER_MAX_MS;
