@@ -9,6 +9,10 @@ namespace Protocol {
 constexpr uint16_t FRAME_MAGIC = 0xA55A;
 constexpr uint8_t FRAME_VERSION = 0x01;
 constexpr uint8_t FRAME_TYPE_VIBRATION_RAW = 0x01;
+constexpr uint8_t FRAME_TYPE_START_AT = 0x02;
+constexpr uint8_t FRAME_TYPE_POLL = 0x03;
+constexpr uint8_t FRAME_TYPE_ACK = 0x04;
+constexpr uint8_t FRAME_TYPE_NO_DATA = 0x05;
 constexpr size_t MAX_PACKET_SIZE =
     64 + AppConfig::MAX_SAMPLES_PER_PACKET * sizeof(int16_t) * 3;
 
@@ -29,6 +33,18 @@ struct VibrationFrameHeader {
   uint16_t fsHzX10;
   uint8_t count;
   uint8_t reserved;
+};
+
+struct ControlFrame {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t frameType;
+  uint16_t devId;
+  uint16_t seq;
+  uint64_t epochUs;
+  uint32_t param;
+  uint16_t fsHzX10;
+  uint16_t reserved;
 };
 #pragma pack(pop)
 
@@ -51,8 +67,11 @@ struct DecodedPacketView {
 };
 
 const char* decodeErrorToString(DecodeError err);
+bool isControlFrameType(uint8_t frameType);
+bool peekFrameType(const uint8_t* buffer, size_t length, uint8_t& outFrameType);
 uint16_t crc16Ccitt(const uint8_t* data, size_t len);
 size_t calcPacketSize(uint8_t sampleCount);
+size_t controlFrameSize();
 bool encodePacket(uint16_t devId,
                   uint16_t seq,
                   uint32_t t0Ms,
@@ -65,5 +84,17 @@ bool encodePacket(uint16_t devId,
 DecodeError decodePacket(const uint8_t* buffer,
                          size_t length,
                          DecodedPacketView& outView);
+bool encodeControlFrame(uint8_t frameType,
+                        uint16_t devId,
+                        uint16_t seq,
+                        uint64_t epochUs,
+                        uint32_t param,
+                        uint16_t fsHzX10,
+                        uint8_t* outBuffer,
+                        size_t outCapacity,
+                        size_t& outLength);
+DecodeError decodeControlFrame(const uint8_t* buffer,
+                               size_t length,
+                               ControlFrame& outFrame);
 
 }  // namespace Protocol

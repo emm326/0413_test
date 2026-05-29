@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,10 @@ LEGACY_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 DEFAULT_SCALE_G = 0.0039
 DEFAULT_DEVICE_ID = "1001"
 DEFAULT_ROTATE_MINUTES = 0
+DEFAULT_START_DELAY_SECONDS = 5.0
+DEFAULT_SAMPLE_RATE_HZ = 100.0
+DEFAULT_SERIAL_STARTUP_DELAY_SECONDS = 2.0
+EPOCH_US_THRESHOLD = 1_000_000_000_000
 TK_RELAUNCH_ENV = "SERIAL_RX_TO_FILE_TK_RELAUNCHED"
 
 
@@ -80,6 +85,10 @@ class CaptureConfig:
     write_header: bool
     include_id: bool
     legacy_device_id: str
+    send_start_at: bool
+    start_delay_seconds: float
+    sample_rate_hz: float
+    serial_startup_delay_seconds: float
 
 
 @dataclass
@@ -97,6 +106,7 @@ class ParsedSample:
     ay_raw: int
     az_raw: int
     from_legacy_line: bool
+    time_is_epoch_us: bool
 
 
 @dataclass
@@ -205,6 +215,29 @@ def parse_args() -> CaptureConfig | None:
             f"Default: {DEFAULT_DEVICE_ID}"
         ),
     )
+    parser.add_argument(
+        "--no-start-at",
+        action="store_true",
+        help="Do not send START_AT to the RX board when opening the serial port",
+    )
+    parser.add_argument(
+        "--start-delay-seconds",
+        type=float,
+        default=DEFAULT_START_DELAY_SECONDS,
+        help="Future delay used for START_AT. Default: 5.0",
+    )
+    parser.add_argument(
+        "--sample-rate-hz",
+        type=float,
+        default=DEFAULT_SAMPLE_RATE_HZ,
+        help="Sample rate announced in START_AT. Default: 100",
+    )
+    parser.add_argument(
+        "--serial-startup-delay-seconds",
+        type=float,
+        default=DEFAULT_SERIAL_STARTUP_DELAY_SECONDS,
+        help="Delay after opening serial before START_AT, useful when the board resets. Default: 2.0",
+    )
     args = parser.parse_args()
 
     if args.gui or len(sys.argv) == 1:
@@ -220,6 +253,12 @@ def parse_args() -> CaptureConfig | None:
     base_time = parse_user_time(args.base_time) if args.base_time else None
     if args.rotate_minutes < 0:
         raise SystemExit("--rotate-minutes must be 0 or greater")
+    if args.start_delay_seconds <= 0:
+        raise SystemExit("--start-delay-seconds must be greater than 0")
+    if args.sample_rate_hz <= 0:
+        raise SystemExit("--sample-rate-hz must be greater than 0")
+    if args.serial_startup_delay_seconds < 0:
+        raise SystemExit("--serial-startup-delay-seconds must be 0 or greater")
 
     return CaptureConfig(
         ports=ports,
@@ -233,6 +272,10 @@ def parse_args() -> CaptureConfig | None:
         write_header=args.with_header,
         include_id=args.include_id,
         legacy_device_id=str(args.device_id),
+        send_start_at=not args.no_start_at,
+        start_delay_seconds=float(args.start_delay_seconds),
+        sample_rate_hz=float(args.sample_rate_hz),
+        serial_startup_delay_seconds=float(args.serial_startup_delay_seconds),
     )
 
 
@@ -299,13 +342,15 @@ def open_output(path: Path, append: bool):
 def parse_serial_sample(line: str, fallback_device_id: str) -> ParsedSample | None:
     match = MULTI_DEVICE_RE.match(line)
     if match:
+        time_value = int(match.group(2))
         return ParsedSample(
             device_id=match.group(1),
-            sensor_ms=int(match.group(2)),
+            sensor_ms=time_value,
             ax_raw=int(match.group(3)),
             ay_raw=int(match.group(4)),
             az_raw=int(match.group(5)),
             from_legacy_line=False,
+            time_is_epoch_us=time_value >= EPOCH_US_THRESHOLD,
         )
 
     match = LEGACY_RE.match(line)
@@ -317,6 +362,7 @@ def parse_serial_sample(line: str, fallback_device_id: str) -> ParsedSample | No
             ay_raw=int(match.group(3)),
             az_raw=int(match.group(4)),
             from_legacy_line=True,
+            time_is_epoch_us=False,
         )
 
     return None
@@ -326,6 +372,30 @@ def build_header(include_id: bool) -> list[str]:
     if include_id:
         return ["id", "datetime", "ax", "ay", "az"]
     return ["datetime", "ax", "ay", "az"]
+
+
+def epoch_us_to_datetime(epoch_us: int) -> datetime:
+    return datetime.fromtimestamp(epoch_us / 1_000_000)
+
+
+def send_start_at_command(ser: serial.Serial, port: str, config: CaptureConfig, log: Callable[[str], None] | None) -> None:
+    if config.serial_startup_delay_seconds > 0:
+        emit(
+            f"[info] {port}: waiting {config.serial_startup_delay_seconds:.1f}s before START_AT",
+            log,
+        )
+        time.sleep(config.serial_startup_delay_seconds)
+
+    start_epoch_us = int((time.time() + config.start_delay_seconds) * 1_000_000)
+    delay_ms = int(config.start_delay_seconds * 1000)
+    command = f"START_AT {start_epoch_us} {config.sample_rate_hz:g} {delay_ms}\n"
+    ser.write(command.encode("ascii"))
+    ser.flush()
+    emit(
+        f"[info] {port}: sent {command.strip()} "
+        f"({format_datetime_4(epoch_us_to_datetime(start_epoch_us))})",
+        log,
+    )
 
 
 def emit(message: str, log: Callable[[str], None] | None = None) -> None:
@@ -412,6 +482,9 @@ def read_serial_port(
 
     with ser:
         emit(f"[info] {port}: listening @ {config.baud}", log)
+        if config.send_start_at:
+            send_start_at_command(ser, port, config, log)
+
         while not stop_event.is_set():
             try:
                 raw_line = ser.readline()
@@ -430,10 +503,14 @@ def read_serial_port(
                 continue
 
             with anchor_lock:
-                anchor = anchors.setdefault(
-                    sample.device_id, TimeAnchor(base_time=config.base_time)
-                )
-                sample_time, reanchored = anchor.to_datetime(sample.sensor_ms)
+                if sample.time_is_epoch_us:
+                    sample_time = epoch_us_to_datetime(sample.sensor_ms)
+                    reanchored = False
+                else:
+                    anchor = anchors.setdefault(
+                        sample.device_id, TimeAnchor(base_time=config.base_time)
+                    )
+                    sample_time, reanchored = anchor.to_datetime(sample.sensor_ms)
 
             if reanchored:
                 emit(
@@ -500,6 +577,14 @@ def capture(
         emit(f"[info] Output file: {config.output}", log)
     emit(f"[info] Scale: {config.scale}", log)
     emit(f"[info] Include id column: {config.include_id}", log)
+    if config.send_start_at:
+        emit(
+            f"[info] START_AT enabled: delay={config.start_delay_seconds:.1f}s, "
+            f"sample_rate={config.sample_rate_hz:g}Hz",
+            log,
+        )
+    else:
+        emit("[info] START_AT disabled", log)
     if config.base_time is None:
         emit("[info] The first sample from each device will anchor to current PC time", log)
     else:
@@ -661,6 +746,10 @@ def run_gui() -> int:
     scale_var = tk.StringVar(value=str(DEFAULT_SCALE_G))
     base_time_var = tk.StringVar()
     device_id_var = tk.StringVar(value=DEFAULT_DEVICE_ID)
+    start_at_var = tk.BooleanVar(value=True)
+    start_delay_var = tk.StringVar(value=str(DEFAULT_START_DELAY_SECONDS))
+    sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
+    serial_startup_delay_var = tk.StringVar(value=str(DEFAULT_SERIAL_STARTUP_DELAY_SECONDS))
     header_var = tk.BooleanVar(value=True)
     include_id_var = tk.BooleanVar(value=False)
     append_var = tk.BooleanVar(value=False)
@@ -705,12 +794,21 @@ def run_gui() -> int:
             baud = int(baud_var.get().strip())
             rotate_minutes = int(rotate_var.get().strip())
             scale = float(scale_var.get().strip())
+            start_delay_seconds = float(start_delay_var.get().strip())
+            sample_rate_hz = float(sample_rate_var.get().strip())
+            serial_startup_delay_seconds = float(serial_startup_delay_var.get().strip())
         except ValueError as exc:
             messagebox.showerror("Invalid option", f"Numeric option is invalid: {exc}")
             return None
 
         if rotate_minutes < 0:
             messagebox.showerror("Invalid option", "Rotation minutes must be 0 or greater")
+            return None
+        if start_delay_seconds <= 0 or sample_rate_hz <= 0 or serial_startup_delay_seconds < 0:
+            messagebox.showerror(
+                "Invalid option",
+                "START_AT delay/rate must be positive and serial startup delay must be 0 or greater",
+            )
             return None
 
         ports = parse_ports_text(port_var.get())
@@ -742,6 +840,10 @@ def run_gui() -> int:
             write_header=header_var.get(),
             include_id=include_id_var.get(),
             legacy_device_id=device_id_var.get().strip() or DEFAULT_DEVICE_ID,
+            send_start_at=start_at_var.get(),
+            start_delay_seconds=start_delay_seconds,
+            sample_rate_hz=sample_rate_hz,
+            serial_startup_delay_seconds=serial_startup_delay_seconds,
         )
 
     def start_capture() -> None:
@@ -838,6 +940,14 @@ def run_gui() -> int:
 
     ttk.Label(form, text="Base Time").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Entry(form, textvariable=base_time_var).grid(row=3, column=1, columnspan=5, sticky="ew", pady=4)
+
+    ttk.Checkbutton(form, text="Send START_AT", variable=start_at_var).grid(row=4, column=0, sticky="w", pady=4)
+    ttk.Label(form, text="Start Delay s").grid(row=4, column=1, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=start_delay_var, width=10).grid(row=4, column=2, sticky="ew", pady=4)
+    ttk.Label(form, text="Sample Hz").grid(row=4, column=3, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=sample_rate_var, width=10).grid(row=4, column=4, sticky="ew", pady=4)
+    ttk.Label(form, text="Boot Wait s").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(form, textvariable=serial_startup_delay_var, width=8).grid(row=5, column=1, sticky="ew", pady=4)
 
     options = ttk.Frame(root, padding=(12, 0, 12, 8))
     options.grid(row=1, column=0, sticky="ew")

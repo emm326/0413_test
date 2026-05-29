@@ -7,6 +7,7 @@ namespace Protocol {
 namespace {
 
 constexpr size_t kHeaderSize = sizeof(VibrationFrameHeader);
+constexpr size_t kControlFrameSize = sizeof(ControlFrame);
 constexpr size_t kCrcSize = sizeof(uint16_t);
 
 }  // namespace
@@ -34,6 +35,27 @@ const char* decodeErrorToString(DecodeError err) {
   }
 }
 
+bool isControlFrameType(uint8_t frameType) {
+  return frameType == FRAME_TYPE_START_AT || frameType == FRAME_TYPE_POLL ||
+         frameType == FRAME_TYPE_ACK || frameType == FRAME_TYPE_NO_DATA;
+}
+
+bool peekFrameType(const uint8_t* buffer, size_t length, uint8_t& outFrameType) {
+  outFrameType = 0;
+  if (buffer == nullptr || length < 4) {
+    return false;
+  }
+
+  uint16_t magic = 0;
+  memcpy(&magic, buffer, sizeof(magic));
+  if (magic != FRAME_MAGIC || buffer[2] != FRAME_VERSION) {
+    return false;
+  }
+
+  outFrameType = buffer[3];
+  return true;
+}
+
 uint16_t crc16Ccitt(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; ++i) {
@@ -53,6 +75,8 @@ size_t calcPacketSize(uint8_t sampleCount) {
   return kHeaderSize + static_cast<size_t>(sampleCount) * sizeof(AccelRawSample) +
          kCrcSize;
 }
+
+size_t controlFrameSize() { return kControlFrameSize + kCrcSize; }
 
 bool encodePacket(uint16_t devId,
                   uint16_t seq,
@@ -136,6 +160,79 @@ DecodeError decodePacket(const uint8_t* buffer,
   outView.samples = reinterpret_cast<const AccelRawSample*>(buffer + sizeof(header));
   outView.expectedCrc = expectedCrc;
   outView.actualCrc = actualCrc;
+  return DecodeError::None;
+}
+
+bool encodeControlFrame(uint8_t frameType,
+                        uint16_t devId,
+                        uint16_t seq,
+                        uint64_t epochUs,
+                        uint32_t param,
+                        uint16_t fsHzX10,
+                        uint8_t* outBuffer,
+                        size_t outCapacity,
+                        size_t& outLength) {
+  outLength = 0;
+  if (outBuffer == nullptr || !isControlFrameType(frameType)) {
+    return false;
+  }
+
+  const size_t frameSize = controlFrameSize();
+  if (frameSize > outCapacity) {
+    return false;
+  }
+
+  ControlFrame frame = {};
+  frame.magic = FRAME_MAGIC;
+  frame.version = FRAME_VERSION;
+  frame.frameType = frameType;
+  frame.devId = devId;
+  frame.seq = seq;
+  frame.epochUs = epochUs;
+  frame.param = param;
+  frame.fsHzX10 = fsHzX10;
+  frame.reserved = 0;
+
+  memcpy(outBuffer, &frame, sizeof(frame));
+  const uint16_t crc = crc16Ccitt(outBuffer, frameSize - kCrcSize);
+  memcpy(outBuffer + frameSize - kCrcSize, &crc, sizeof(crc));
+
+  outLength = frameSize;
+  return true;
+}
+
+DecodeError decodeControlFrame(const uint8_t* buffer,
+                               size_t length,
+                               ControlFrame& outFrame) {
+  if (buffer == nullptr || length < controlFrameSize()) {
+    return DecodeError::TooShort;
+  }
+
+  if (length != controlFrameSize()) {
+    return DecodeError::LengthMismatch;
+  }
+
+  ControlFrame frame = {};
+  memcpy(&frame, buffer, sizeof(frame));
+
+  if (frame.magic != FRAME_MAGIC) {
+    return DecodeError::BadMagic;
+  }
+  if (frame.version != FRAME_VERSION) {
+    return DecodeError::BadVersion;
+  }
+  if (!isControlFrameType(frame.frameType)) {
+    return DecodeError::BadFrameType;
+  }
+
+  uint16_t actualCrc = 0;
+  memcpy(&actualCrc, buffer + length - kCrcSize, sizeof(actualCrc));
+  const uint16_t expectedCrc = crc16Ccitt(buffer, length - kCrcSize);
+  if (actualCrc != expectedCrc) {
+    return DecodeError::CrcMismatch;
+  }
+
+  outFrame = frame;
   return DecodeError::None;
 }
 
