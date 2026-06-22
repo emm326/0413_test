@@ -4,7 +4,7 @@ Receive LoRaWAN gateway uplinks and write ADXL345 samples to per-device CSV file
 
 The expected application payload is the same binary vibration frame used by the
 existing P2P firmware:
-  dev_id, seq, t0_ms, fs_x10, count, int16 ax/ay/az samples, crc16
+  dev_id, seq, t0_us, fs_x10, count, int16 ax/ay/az samples, crc16
 
 Supported inputs:
   - stdin JSON lines or raw base64/hex payloads
@@ -34,7 +34,7 @@ from typing import Any, Iterable
 
 
 FRAME_MAGIC = 0xA55A
-FRAME_VERSION = 0x01
+FRAME_VERSION = 0x02
 FRAME_TYPE_VIBRATION_RAW = 0x01
 HEADER_STRUCT = struct.Struct("<HBBHHIHBB")
 SAMPLE_STRUCT = struct.Struct("<hhh")
@@ -73,7 +73,7 @@ class Sample:
 class VibrationPacket:
     dev_id: int
     seq: int
-    t0_ms: int
+    t0_us: int
     fs_x10: int
     samples: list[Sample]
 
@@ -99,25 +99,25 @@ class ActiveCsvFile:
 class TimeAnchor:
     base_time: datetime | None = None
     anchor_wallclock: datetime | None = None
-    anchor_sensor_ms: int | None = None
-    last_sensor_ms: int | None = None
+    anchor_sensor_us: int | None = None
+    last_sensor_us: int | None = None
 
-    def to_datetime(self, sensor_ms: int) -> tuple[datetime, bool]:
+    def to_datetime(self, sensor_us: int) -> tuple[datetime, bool]:
         reanchored = False
-        if self.anchor_sensor_ms is None:
-            self.anchor_sensor_ms = sensor_ms
+        if self.anchor_sensor_us is None:
+            self.anchor_sensor_us = sensor_us
             self.anchor_wallclock = self.base_time or datetime.now()
             reanchored = True
-        elif self.last_sensor_ms is not None and sensor_ms < self.last_sensor_ms:
-            self.anchor_sensor_ms = sensor_ms
+        elif self.last_sensor_us is not None and sensor_us < self.last_sensor_us:
+            self.anchor_sensor_us = sensor_us
             self.anchor_wallclock = datetime.now()
             reanchored = True
 
-        self.last_sensor_ms = sensor_ms
+        self.last_sensor_us = sensor_us
         assert self.anchor_wallclock is not None
-        assert self.anchor_sensor_ms is not None
+        assert self.anchor_sensor_us is not None
         return (
-            self.anchor_wallclock + timedelta(milliseconds=sensor_ms - self.anchor_sensor_ms),
+            self.anchor_wallclock + timedelta(microseconds=sensor_us - self.anchor_sensor_us),
             reanchored,
         )
 
@@ -139,7 +139,7 @@ def decode_vibration_payload(payload: bytes) -> VibrationPacket:
     if len(payload) < min_len:
         raise ValueError("payload too short")
 
-    magic, version, frame_type, dev_id, seq, t0_ms, fs_x10, count, _reserved = (
+    magic, version, frame_type, dev_id, seq, t0_us, fs_x10, count, _reserved = (
         HEADER_STRUCT.unpack_from(payload, 0)
     )
     if magic != FRAME_MAGIC:
@@ -172,7 +172,7 @@ def decode_vibration_payload(payload: bytes) -> VibrationPacket:
     return VibrationPacket(
         dev_id=dev_id,
         seq=seq,
-        t0_ms=t0_ms,
+        t0_us=t0_us,
         fs_x10=fs_x10,
         samples=samples,
     )
@@ -346,8 +346,21 @@ def build_rotated_output_path(
     return output_root / f"sensor{device_id}" / date_folder_name(bucket_start) / filename
 
 
-def sample_interval_ms(sample_index: int, fs_x10: int) -> int:
-    return (sample_index * 10000 + fs_x10 // 2) // fs_x10
+def actual_iim_sample_rate_x1000(fs_x10: int) -> int:
+    if fs_x10 == 500:
+        return 51200
+    if fs_x10 == 1000:
+        return 102400
+    if fs_x10 == 2000:
+        return 204800
+    if fs_x10 == 4000:
+        return 409600
+    return fs_x10 * 100
+
+
+def sample_interval_us(sample_index: int, fs_x10: int) -> int:
+    rate_x1000 = actual_iim_sample_rate_x1000(fs_x10)
+    return (sample_index * 1_000_000_000 + rate_x1000 // 2) // rate_x1000
 
 
 def ensure_parent_dir(path: Path) -> None:
@@ -535,7 +548,7 @@ class PacketProcessor:
 
         with self.anchor_lock:
             anchor = self.anchors.setdefault(packet.dev_id, TimeAnchor(self.base_time))
-            t0_wallclock, reanchored = anchor.to_datetime(packet.t0_ms)
+            t0_wallclock, reanchored = anchor.to_datetime(packet.t0_us)
 
         if reanchored:
             print(
@@ -544,8 +557,8 @@ class PacketProcessor:
             )
 
         for index, sample in enumerate(packet.samples):
-            sensor_ms = packet.t0_ms + sample_interval_ms(index, packet.fs_x10)
-            sample_time, _ = self.anchors[packet.dev_id].to_datetime(sensor_ms)
+            sensor_us = packet.t0_us + sample_interval_us(index, packet.fs_x10)
+            sample_time, _ = self.anchors[packet.dev_id].to_datetime(sensor_us)
             self.csv_writer.write_sample(packet.dev_id, sample_time, sample)
             if self.echo_data:
                 print(

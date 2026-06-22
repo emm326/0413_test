@@ -76,11 +76,27 @@ size_t calcPacketSize(uint8_t sampleCount) {
          kCrcSize;
 }
 
+size_t calcTxUsbCompactPacketSize(uint8_t sampleCount, bool includeCrc) {
+  return sizeof(TxUsbCompactHeader) +
+         static_cast<size_t>(sampleCount) * sizeof(AccelRawSample) +
+         (includeCrc ? kCrcSize : 0U);
+}
+
 size_t controlFrameSize() { return kControlFrameSize + kCrcSize; }
+
+bool shouldGrantBurstContinuation(bool pollWaiting,
+                                  bool duplicatePacket,
+                                  uint8_t receivedPacketsInBurst,
+                                  uint8_t burstLimit) {
+  if (!pollWaiting || duplicatePacket || burstLimit == 0) {
+    return false;
+  }
+  return receivedPacketsInBurst < burstLimit;
+}
 
 bool encodePacket(uint16_t devId,
                   uint16_t seq,
-                  uint32_t t0Ms,
+                  uint32_t t0Us,
                   uint16_t fsHzX10,
                   const AccelRawSample* samples,
                   uint8_t count,
@@ -104,7 +120,7 @@ bool encodePacket(uint16_t devId,
   header.frameType = FRAME_TYPE_VIBRATION_RAW;
   header.devId = devId;
   header.seq = seq;
-  header.t0Ms = t0Ms;
+  header.t0Us = t0Us;
   header.fsHzX10 = fsHzX10;
   header.count = count;
   header.reserved = 0;

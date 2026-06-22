@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import re
 import subprocess
@@ -62,18 +63,26 @@ except ImportError as exc:  # pragma: no cover
 
 MULTI_DEVICE_RE = re.compile(r"^\s*(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 LEGACY_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
-DEFAULT_SCALE_G = 0.0039
+# IIM-42352 default TX firmware uses +-4g full scale: 4g / 32768 counts.
+# Legacy ADXL345 nodes can still use --scale 0.0039.
+DEFAULT_SCALE_G = 0.0001220703125
 DEFAULT_DEVICE_ID = "1001"
 DEFAULT_ROTATE_MINUTES = 0
 DEFAULT_START_DELAY_SECONDS = 5.0
 DEFAULT_SAMPLE_RATE_HZ = 100.0
+DEFAULT_SERIAL_BAUD = 460800
 DEFAULT_SERIAL_STARTUP_DELAY_SECONDS = 2.0
+DEFAULT_GAP_FACTOR = 2.0
+DEFAULT_GAP_SAMPLES_PER_PACKET = 37
+DEFAULT_GAP_TOP = 5
+SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 EPOCH_US_THRESHOLD = 1_000_000_000_000
 TK_RELAUNCH_ENV = "SERIAL_RX_TO_FILE_TK_RELAUNCHED"
 
 
 @dataclass
 class CaptureConfig:
+    mode: str
     ports: list[str]
     baud: int
     output: Path
@@ -89,6 +98,10 @@ class CaptureConfig:
     start_delay_seconds: float
     sample_rate_hz: float
     serial_startup_delay_seconds: float
+    gap_csv_files: list[Path]
+    gap_factor: float
+    gap_samples_per_packet: int
+    gap_top: int
 
 
 @dataclass
@@ -134,6 +147,33 @@ class TimeAnchor:
         return self.anchor_wallclock + timedelta(milliseconds=delta_ms), reanchored
 
 
+@dataclass
+class GapInfo:
+    from_line: int
+    to_line: int
+    from_time: datetime
+    to_time: datetime
+    gap_ms: float
+    missing_samples: int
+    missing_packets: int
+
+
+@dataclass
+class CsvGapReport:
+    path: Path
+    rows: int
+    first_time: datetime | None
+    last_time: datetime | None
+    gap_threshold_ms: float
+    gap_count: int
+    max_gap_ms: float
+    max_gap_from_line: int
+    max_gap_to_line: int
+    max_gap_missing_samples: int
+    max_gap_missing_packets: int
+    gaps: list[GapInfo]
+
+
 def parse_ports_text(text: str) -> list[str]:
     ports = [item.strip() for item in re.split(r"[,;\s]+", text) if item.strip()]
     unique_ports: list[str] = []
@@ -144,6 +184,61 @@ def parse_ports_text(text: str) -> list[str]:
             unique_ports.append(port)
             seen.add(key)
     return unique_ports
+
+
+def parse_gap_csv_paths_text(text: str) -> list[Path]:
+    raw_paths = [item.strip() for item in re.split(r"[;\n\r]+", text) if item.strip()]
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        key = raw_path.lower()
+        if key not in seen:
+            paths.append(Path(raw_path))
+            seen.add(key)
+    return paths
+
+
+def is_supported_sample_rate(sample_rate_hz: float) -> bool:
+    return any(abs(sample_rate_hz - value) < 0.001 for value in SUPPORTED_SAMPLE_RATES_HZ)
+
+
+def parse_gap_analysis_options(
+    sample_rate_text: str,
+    samples_per_packet_text: str,
+    top_gaps_text: str,
+) -> tuple[float, int, int]:
+    try:
+        sample_rate_hz = float(sample_rate_text.strip())
+        samples_per_packet = int(samples_per_packet_text.strip())
+        top_gaps = int(top_gaps_text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Gap analysis option is invalid: {exc}") from exc
+
+    if sample_rate_hz <= 0:
+        raise ValueError("Analyze Hz must be greater than 0")
+    if not is_supported_sample_rate(sample_rate_hz):
+        allowed = ", ".join(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ)
+        raise ValueError(f"Analyze Hz must be one of: {allowed}")
+    if samples_per_packet <= 0:
+        raise ValueError("Samples per packet must be greater than 0")
+    if top_gaps < 0:
+        raise ValueError("Top gaps must be 0 or greater")
+
+    return sample_rate_hz, samples_per_packet, top_gaps
+
+
+def actual_iim_sample_rate_hz(sample_rate_hz: float) -> float:
+    return sample_rate_hz * 1.024
+
+
+def parse_sample_datetime(text: str) -> datetime:
+    text = text.strip()
+    for fmt in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"invalid datetime: {text!r}")
 
 
 def parse_args() -> CaptureConfig | None:
@@ -157,13 +252,25 @@ def parse_args() -> CaptureConfig | None:
         action="store_true",
         help="Open a simple GUI for selecting serial and CSV options",
     )
+    parser.add_argument(
+        "--analyze-gaps",
+        nargs="+",
+        metavar="CSV",
+        help=(
+            "Analyze timestamp gaps in one or more existing sensor CSV files "
+            "instead of opening a serial port"
+        ),
+    )
     parser.add_argument("--port", help="Single serial port, for example COM6")
     parser.add_argument(
         "--ports",
         help="Multiple serial ports, for example COM6,COM7,COM8",
     )
     parser.add_argument(
-        "--baud", type=int, default=115200, help="Serial baud rate, default 115200"
+        "--baud",
+        type=int,
+        default=DEFAULT_SERIAL_BAUD,
+        help=f"Serial baud rate, default {DEFAULT_SERIAL_BAUD}",
     )
     parser.add_argument("--output", help="Output file path or rotated output folder")
     parser.add_argument(
@@ -180,7 +287,10 @@ def parse_args() -> CaptureConfig | None:
         "--scale",
         type=float,
         default=DEFAULT_SCALE_G,
-        help="Raw to g scale factor. Default: 0.0039",
+        help=(
+            "Raw to g scale factor. Default is IIM-42352 +-4g: "
+            f"{DEFAULT_SCALE_G}. Use 0.0039 for legacy ADXL345 nodes"
+        ),
     )
     parser.add_argument(
         "--base-time",
@@ -230,7 +340,7 @@ def parse_args() -> CaptureConfig | None:
         "--sample-rate-hz",
         type=float,
         default=DEFAULT_SAMPLE_RATE_HZ,
-        help="Sample rate announced in START_AT. Default: 100",
+        help="Sample rate announced in START_AT. Supported: 50, 100, 200, 400. Default: 100",
     )
     parser.add_argument(
         "--serial-startup-delay-seconds",
@@ -238,10 +348,64 @@ def parse_args() -> CaptureConfig | None:
         default=DEFAULT_SERIAL_STARTUP_DELAY_SECONDS,
         help="Delay after opening serial before START_AT, useful when the board resets. Default: 2.0",
     )
+    parser.add_argument(
+        "--gap-factor",
+        type=float,
+        default=DEFAULT_GAP_FACTOR,
+        help="Gap threshold multiplier for analysis mode. Default: 2.0",
+    )
+    parser.add_argument(
+        "--samples-per-packet",
+        type=int,
+        default=DEFAULT_GAP_SAMPLES_PER_PACKET,
+        help="Samples per TX packet for gap packet-loss estimates. Default: 37",
+    )
+    parser.add_argument(
+        "--top-gaps",
+        type=int,
+        default=DEFAULT_GAP_TOP,
+        help="Largest gaps to print per CSV in analysis mode. Default: 5",
+    )
     args = parser.parse_args()
 
     if args.gui or len(sys.argv) == 1:
         return None
+
+    if args.sample_rate_hz <= 0:
+        raise SystemExit("--sample-rate-hz must be greater than 0")
+    if not is_supported_sample_rate(args.sample_rate_hz):
+        allowed = ", ".join(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ)
+        raise SystemExit(f"--sample-rate-hz must be one of: {allowed}")
+
+    if args.analyze_gaps:
+        if args.gap_factor <= 0:
+            raise SystemExit("--gap-factor must be greater than 0")
+        if args.samples_per_packet <= 0:
+            raise SystemExit("--samples-per-packet must be greater than 0")
+        if args.top_gaps < 0:
+            raise SystemExit("--top-gaps must be 0 or greater")
+        return CaptureConfig(
+            mode="analyze_gaps",
+            ports=[],
+            baud=args.baud,
+            output=Path(args.output) if args.output else Path(),
+            rotate_minutes=args.rotate_minutes,
+            scale=args.scale,
+            base_time=None,
+            append=args.append,
+            echo_data=args.echo_data,
+            write_header=args.with_header,
+            include_id=args.include_id,
+            legacy_device_id=str(args.device_id),
+            send_start_at=not args.no_start_at,
+            start_delay_seconds=float(args.start_delay_seconds),
+            sample_rate_hz=float(args.sample_rate_hz),
+            serial_startup_delay_seconds=float(args.serial_startup_delay_seconds),
+            gap_csv_files=[Path(item) for item in args.analyze_gaps],
+            gap_factor=float(args.gap_factor),
+            gap_samples_per_packet=int(args.samples_per_packet),
+            gap_top=int(args.top_gaps),
+        )
 
     port_text = args.ports or args.port or ""
     ports = parse_ports_text(port_text)
@@ -255,12 +419,11 @@ def parse_args() -> CaptureConfig | None:
         raise SystemExit("--rotate-minutes must be 0 or greater")
     if args.start_delay_seconds <= 0:
         raise SystemExit("--start-delay-seconds must be greater than 0")
-    if args.sample_rate_hz <= 0:
-        raise SystemExit("--sample-rate-hz must be greater than 0")
     if args.serial_startup_delay_seconds < 0:
         raise SystemExit("--serial-startup-delay-seconds must be 0 or greater")
 
     return CaptureConfig(
+        mode="capture",
         ports=ports,
         baud=args.baud,
         output=Path(args.output),
@@ -276,6 +439,10 @@ def parse_args() -> CaptureConfig | None:
         start_delay_seconds=float(args.start_delay_seconds),
         sample_rate_hz=float(args.sample_rate_hz),
         serial_startup_delay_seconds=float(args.serial_startup_delay_seconds),
+        gap_csv_files=[],
+        gap_factor=float(args.gap_factor),
+        gap_samples_per_packet=int(args.samples_per_packet),
+        gap_top=int(args.top_gaps),
     )
 
 
@@ -297,6 +464,129 @@ def format_datetime_4(dt: datetime) -> str:
         f"{dt.year}/{dt.month}/{dt.day} "
         f"{dt.hour}:{dt.minute:02d}:{dt.second:02d}.{fraction4:04d}"
     )
+
+
+def analyze_csv_file(
+    path: Path,
+    *,
+    sample_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ,
+    gap_factor: float = DEFAULT_GAP_FACTOR,
+    samples_per_packet: int = DEFAULT_GAP_SAMPLES_PER_PACKET,
+) -> CsvGapReport:
+    actual_rate_hz = actual_iim_sample_rate_hz(sample_rate_hz)
+    expected_period_ms = 1000.0 / actual_rate_hz
+    gap_threshold_ms = expected_period_ms * gap_factor
+    gaps: list[GapInfo] = []
+    first_time: datetime | None = None
+    last_time: datetime | None = None
+    previous_time: datetime | None = None
+    previous_line = 0
+    rows = 0
+
+    with path.open(newline="", encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        if "datetime" not in (reader.fieldnames or []):
+            raise ValueError(f"{path}: CSV must contain a datetime column")
+
+        for line_number, row in enumerate(reader, start=2):
+            sample_time = parse_sample_datetime(row["datetime"])
+            rows += 1
+            if first_time is None:
+                first_time = sample_time
+
+            if previous_time is not None:
+                gap_ms = (sample_time - previous_time).total_seconds() * 1000.0
+                if gap_ms > gap_threshold_ms:
+                    intervals = max(1, round(gap_ms / expected_period_ms))
+                    missing_samples = max(0, intervals - 1)
+                    missing_packets = int(math.ceil(missing_samples / samples_per_packet))
+                    gaps.append(
+                        GapInfo(
+                            from_line=previous_line,
+                            to_line=line_number,
+                            from_time=previous_time,
+                            to_time=sample_time,
+                            gap_ms=gap_ms,
+                            missing_samples=missing_samples,
+                            missing_packets=missing_packets,
+                        )
+                    )
+
+            previous_time = sample_time
+            previous_line = line_number
+            last_time = sample_time
+
+    max_gap = max(gaps, key=lambda item: item.gap_ms, default=None)
+    return CsvGapReport(
+        path=path,
+        rows=rows,
+        first_time=first_time,
+        last_time=last_time,
+        gap_threshold_ms=gap_threshold_ms,
+        gap_count=len(gaps),
+        max_gap_ms=max_gap.gap_ms if max_gap else 0.0,
+        max_gap_from_line=max_gap.from_line if max_gap else 0,
+        max_gap_to_line=max_gap.to_line if max_gap else 0,
+        max_gap_missing_samples=max_gap.missing_samples if max_gap else 0,
+        max_gap_missing_packets=max_gap.missing_packets if max_gap else 0,
+        gaps=gaps,
+    )
+
+
+def format_gap_report_lines(report: CsvGapReport, top: int) -> list[str]:
+    lines = [
+        f"FILE={report.path}",
+        "rows={rows} first={first} last={last} gap_threshold_ms={threshold:.4f}".format(
+            rows=report.rows,
+            first=format_datetime_4(report.first_time) if report.first_time else "-",
+            last=format_datetime_4(report.last_time) if report.last_time else "-",
+            threshold=report.gap_threshold_ms,
+        ),
+        "gaps={gaps} max_gap_ms={max_gap:.4f} from_line={from_line} "
+        "to_line={to_line} missing_samples={samples} missing_packets={packets}".format(
+            gaps=report.gap_count,
+            max_gap=report.max_gap_ms,
+            from_line=report.max_gap_from_line,
+            to_line=report.max_gap_to_line,
+            samples=report.max_gap_missing_samples,
+            packets=report.max_gap_missing_packets,
+        ),
+    ]
+    if top > 0 and report.gaps:
+        lines.append(f"top_{top}_gaps:")
+        for gap in sorted(report.gaps, key=lambda item: item.gap_ms, reverse=True)[:top]:
+            lines.append(
+                "  gap_ms={gap:.4f} from_line={from_line} from={from_time} "
+                "to_line={to_line} to={to_time} missing_samples={samples} "
+                "missing_packets={packets}".format(
+                    gap=gap.gap_ms,
+                    from_line=gap.from_line,
+                    from_time=format_datetime_4(gap.from_time),
+                    to_line=gap.to_line,
+                    to_time=format_datetime_4(gap.to_time),
+                    samples=gap.missing_samples,
+                    packets=gap.missing_packets,
+                )
+            )
+    return lines
+
+
+def print_gap_report(report: CsvGapReport, top: int) -> None:
+    for line in format_gap_report_lines(report, top):
+        print(line)
+    print()
+
+
+def analyze_gaps(config: CaptureConfig) -> int:
+    for csv_file in config.gap_csv_files:
+        report = analyze_csv_file(
+            csv_file,
+            sample_rate_hz=config.sample_rate_hz,
+            gap_factor=config.gap_factor,
+            samples_per_packet=config.gap_samples_per_packet,
+        )
+        print_gap_report(report, config.gap_top)
+    return 0
 
 
 def convert_value(raw: int, scale: float) -> float:
@@ -393,7 +683,8 @@ def send_start_at_command(ser: serial.Serial, port: str, config: CaptureConfig, 
     ser.flush()
     emit(
         f"[info] {port}: sent {command.strip()} "
-        f"({format_datetime_4(epoch_us_to_datetime(start_epoch_us))})",
+        f"({format_datetime_4(epoch_us_to_datetime(start_epoch_us))}, "
+        f"actual_iim_fs={actual_iim_sample_rate_hz(config.sample_rate_hz):g}Hz)",
         log,
     )
 
@@ -580,7 +871,8 @@ def capture(
     if config.send_start_at:
         emit(
             f"[info] START_AT enabled: delay={config.start_delay_seconds:.1f}s, "
-            f"sample_rate={config.sample_rate_hz:g}Hz",
+            f"sample_rate={config.sample_rate_hz:g}Hz, "
+            f"actual_iim_fs={actual_iim_sample_rate_hz(config.sample_rate_hz):g}Hz",
             log,
         )
     else:
@@ -729,8 +1021,8 @@ def run_gui() -> int:
 
     root = tk.Tk()
     root.title("LoRa RX CSV Capture")
-    root.geometry("780x560")
-    root.minsize(720, 520)
+    root.geometry("820x580")
+    root.minsize(760, 540)
 
     log_queue: "queue.Queue[object]"
     import queue
@@ -740,7 +1032,7 @@ def run_gui() -> int:
     stop_event: threading.Event | None = None
 
     port_var = tk.StringVar()
-    baud_var = tk.StringVar(value="115200")
+    baud_var = tk.StringVar(value=str(DEFAULT_SERIAL_BAUD))
     output_var = tk.StringVar(value=str(Path.cwd() / "data"))
     rotate_var = tk.StringVar(value="30")
     scale_var = tk.StringVar(value=str(DEFAULT_SCALE_G))
@@ -750,6 +1042,10 @@ def run_gui() -> int:
     start_delay_var = tk.StringVar(value=str(DEFAULT_START_DELAY_SECONDS))
     sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
     serial_startup_delay_var = tk.StringVar(value=str(DEFAULT_SERIAL_STARTUP_DELAY_SECONDS))
+    gap_files_var = tk.StringVar()
+    gap_sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
+    gap_samples_per_packet_var = tk.StringVar(value=str(DEFAULT_GAP_SAMPLES_PER_PACKET))
+    gap_top_var = tk.StringVar(value=str(DEFAULT_GAP_TOP))
     header_var = tk.BooleanVar(value=True)
     include_id_var = tk.BooleanVar(value=False)
     append_var = tk.BooleanVar(value=False)
@@ -766,6 +1062,8 @@ def run_gui() -> int:
         stop_button.configure(state="normal" if is_running else "disabled")
         refresh_button.configure(state="disabled" if is_running else "normal")
         browse_button.configure(state="disabled" if is_running else "normal")
+        choose_gap_files_button.configure(state="disabled" if is_running else "normal")
+        analyze_gaps_button.configure(state="disabled" if is_running else "normal")
         status_var.set("Running" if is_running else "Stopped")
 
     def refresh_ports() -> None:
@@ -789,6 +1087,15 @@ def run_gui() -> int:
         if selected:
             output_var.set(selected)
 
+    def choose_gap_files() -> None:
+        selected = filedialog.askopenfilenames(
+            title="Choose sensor CSV files",
+            initialdir=output_var.get() or str(Path.cwd()),
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+        )
+        if selected:
+            gap_files_var.set("; ".join(selected))
+
     def build_config_from_ui() -> CaptureConfig | None:
         try:
             baud = int(baud_var.get().strip())
@@ -810,6 +1117,10 @@ def run_gui() -> int:
                 "START_AT delay/rate must be positive and serial startup delay must be 0 or greater",
             )
             return None
+        if not is_supported_sample_rate(sample_rate_hz):
+            allowed = ", ".join(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ)
+            messagebox.showerror("Invalid sample rate", f"Sample Hz must be one of: {allowed}")
+            return None
 
         ports = parse_ports_text(port_var.get())
         if not ports:
@@ -829,6 +1140,7 @@ def run_gui() -> int:
             return None
 
         return CaptureConfig(
+            mode="capture",
             ports=ports,
             baud=baud,
             output=output_path,
@@ -844,7 +1156,50 @@ def run_gui() -> int:
             start_delay_seconds=start_delay_seconds,
             sample_rate_hz=sample_rate_hz,
             serial_startup_delay_seconds=serial_startup_delay_seconds,
+            gap_csv_files=[],
+            gap_factor=DEFAULT_GAP_FACTOR,
+            gap_samples_per_packet=DEFAULT_GAP_SAMPLES_PER_PACKET,
+            gap_top=DEFAULT_GAP_TOP,
         )
+
+    def analyze_selected_gap_files() -> None:
+        try:
+            sample_rate_hz, samples_per_packet, top_gaps = parse_gap_analysis_options(
+                gap_sample_rate_var.get(),
+                gap_samples_per_packet_var.get(),
+                gap_top_var.get(),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid gap option", str(exc))
+            return
+
+        csv_paths = parse_gap_csv_paths_text(gap_files_var.get())
+        if not csv_paths:
+            messagebox.showerror("Missing CSV", "Please choose one or more CSV files to analyze")
+            return
+
+        log_text.configure(state="normal")
+        log_text.delete("1.0", "end")
+        log_text.configure(state="disabled")
+        append_log(
+            f"[info] Analyzing {len(csv_paths)} CSV file(s), "
+            f"sample_rate={sample_rate_hz:g}Hz, samples_per_packet={samples_per_packet}"
+        )
+        for csv_path in csv_paths:
+            try:
+                report = analyze_csv_file(
+                    csv_path,
+                    sample_rate_hz=sample_rate_hz,
+                    gap_factor=DEFAULT_GAP_FACTOR,
+                    samples_per_packet=samples_per_packet,
+                )
+            except (OSError, ValueError) as exc:
+                append_log(f"[error] {csv_path}: {exc}")
+                continue
+
+            for line in format_gap_report_lines(report, top_gaps):
+                append_log(line)
+            append_log("")
 
     def start_capture() -> None:
         nonlocal worker_thread, stop_event
@@ -945,9 +1300,35 @@ def run_gui() -> int:
     ttk.Label(form, text="Start Delay s").grid(row=4, column=1, sticky="w", padx=(8, 8), pady=4)
     ttk.Entry(form, textvariable=start_delay_var, width=10).grid(row=4, column=2, sticky="ew", pady=4)
     ttk.Label(form, text="Sample Hz").grid(row=4, column=3, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(form, textvariable=sample_rate_var, width=10).grid(row=4, column=4, sticky="ew", pady=4)
+    sample_rate_combo = ttk.Combobox(
+        form,
+        textvariable=sample_rate_var,
+        values=tuple(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ),
+        width=10,
+    )
+    sample_rate_combo.grid(row=4, column=4, sticky="ew", pady=4)
     ttk.Label(form, text="Boot Wait s").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Entry(form, textvariable=serial_startup_delay_var, width=8).grid(row=5, column=1, sticky="ew", pady=4)
+
+    ttk.Label(form, text="CSV Gap Files").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_files_var).grid(row=6, column=1, columnspan=3, sticky="ew", pady=4)
+    choose_gap_files_button = ttk.Button(form, text="Choose CSVs", command=choose_gap_files)
+    choose_gap_files_button.grid(row=6, column=4, sticky="ew", padx=(8, 0), pady=4)
+    analyze_gaps_button = ttk.Button(form, text="Analyze Gaps", command=analyze_selected_gap_files)
+    analyze_gaps_button.grid(row=6, column=5, sticky="ew", padx=(8, 0), pady=4)
+
+    ttk.Label(form, text="Analyze Hz").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+    gap_sample_rate_combo = ttk.Combobox(
+        form,
+        textvariable=gap_sample_rate_var,
+        values=tuple(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ),
+        width=8,
+    )
+    gap_sample_rate_combo.grid(row=7, column=1, sticky="ew", pady=4)
+    ttk.Label(form, text="Samples/Packet").grid(row=7, column=2, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_samples_per_packet_var, width=8).grid(row=7, column=3, sticky="ew", pady=4)
+    ttk.Label(form, text="Top Gaps").grid(row=7, column=4, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_top_var, width=8).grid(row=7, column=5, sticky="ew", pady=4)
 
     options = ttk.Frame(root, padding=(12, 0, 12, 8))
     options.grid(row=1, column=0, sticky="ew")
@@ -980,6 +1361,8 @@ def main() -> int:
     config = parse_args()
     if config is None:
         return run_gui()
+    if config.mode == "analyze_gaps":
+        return analyze_gaps(config)
     return capture(config)
 
 

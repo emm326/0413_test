@@ -8,7 +8,15 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#if defined(APP_SENSOR_IIM42352)
+#include "Ds3231Clock.h"
+#include "GpsTimebase.h"
+#include "IIM42352Driver.h"
+using SensorDriver = IIM42352Driver;
+#else
 #include "ADXL345Driver.h"
+using SensorDriver = ADXL345Driver;
+#endif
 #include "board_pins.h"
 #include "config.h"
 #include "lora_transport.h"
@@ -17,11 +25,21 @@
 #endif
 #include "protocol.h"
 
+#if !defined(APP_IIM42352_INT1_INPUT_PULLUP_VALUE)
+#define APP_IIM42352_INT1_INPUT_PULLUP_VALUE 0
+#endif
+
+#if !defined(APP_IIM42352_INT1_INTERRUPT_MODE_CHANGE) && \
+    !defined(APP_IIM42352_INT1_INTERRUPT_MODE_FALLING) && \
+    !defined(APP_IIM42352_INT1_INTERRUPT_MODE_RISING)
+#define APP_IIM42352_INT1_INTERRUPT_MODE_RISING 1
+#endif
+
 namespace {
 
 struct RateProfile {
   uint16_t sampleRateX10Hz;
-  ADXL345Driver::DataRate adxlRate;
+  SensorDriver::DataRate sensorRate;
   bool experimental;
   const char* label;
 };
@@ -32,27 +50,44 @@ enum class TxUiMode : uint8_t {
 };
 
 constexpr RateProfile kRateProfiles[] = {
-    {250, ADXL345Driver::DataRate::Hz25, false, "25"},
-    {500, ADXL345Driver::DataRate::Hz50, false, "50"},
-    {1000, ADXL345Driver::DataRate::Hz100, false, "100"},
-    {2000, ADXL345Driver::DataRate::Hz200, true, "200"},
-    {4000, ADXL345Driver::DataRate::Hz400, true, "400"},
+    {500, SensorDriver::DataRate::Hz50, false, "50"},
+    {1000, SensorDriver::DataRate::Hz100, false, "100"},
+    {2000, SensorDriver::DataRate::Hz200, false, "200"},
+    {4000, SensorDriver::DataRate::Hz400, true, "400"},
 };
 constexpr size_t kRateProfileCount = sizeof(kRateProfiles) / sizeof(kRateProfiles[0]);
 
 TwoWire& sensorWire = Wire;
 TwoWire displayWire(1);
 
-ADXL345Driver adxl(sensorWire,
-                   ADXL345_I2C_ADDRESS,
-                   PIN_ADXL345_SDA,
-                   PIN_ADXL345_SCL,
-                   AppConfig::ADXL345_I2C_CLOCK_HZ);
+#if defined(APP_SENSOR_IIM42352)
+SPIClass iimSpi(HSPI);
+SensorDriver adxl(iimSpi,
+                  PIN_IIM42352_SCK,
+                  PIN_IIM42352_MISO,
+                  PIN_IIM42352_MOSI,
+                  PIN_IIM42352_CS,
+                  AppConfig::IIM42352_SPI_CLOCK_HZ);
+TwoWire& rtcWire = Wire;
+HardwareSerial gpsSerial(1);
+Ds3231Clock ds3231(rtcWire,
+                   DS3231_I2C_ADDRESS,
+                   PIN_DS3231_SDA,
+                   PIN_DS3231_SCL,
+                   AppConfig::DS3231_I2C_CLOCK_HZ);
+GpsTimebase gpsTimebase(gpsSerial);
+#else
+SensorDriver adxl(sensorWire,
+                  ADXL345_I2C_ADDRESS,
+                  PIN_ADXL345_SDA,
+                  PIN_ADXL345_SCL,
+                  AppConfig::ADXL345_I2C_CLOCK_HZ);
+#endif
 
 Adafruit_SSD1306 oled(AppConfig::OLED_WIDTH, AppConfig::OLED_HEIGHT, &displayWire, PIN_OLED_RST);
 
 Protocol::AccelRawSample sampleBuffer[AppConfig::MAX_SAMPLES_PER_PACKET] = {};
-ADXL345Driver::RawSample fifoBurstBuffer[AppConfig::ADXL345_FIFO_WATERMARK] = {};
+SensorDriver::RawSample fifoBurstBuffer[AppConfig::SENSOR_FIFO_WATERMARK] = {};
 uint8_t txPacketBuffer[Protocol::MAX_PACKET_SIZE] = {};
 uint8_t rxPacketBuffer[Protocol::MAX_PACKET_SIZE] = {};
 uint8_t controlPacketBuffer[Protocol::MAX_PACKET_SIZE] = {};
@@ -61,7 +96,7 @@ struct QueuedTxPacket {
   uint8_t data[Protocol::MAX_PACKET_SIZE];
   size_t length;
   uint16_t seq;
-  uint32_t t0Ms;
+  uint32_t t0Us;
   uint8_t count;
   uint8_t retries;
 };
@@ -71,11 +106,32 @@ uint8_t txQueueHead = 0;
 uint8_t txQueueCount = 0;
 
 uint16_t packetSeq = 0;
-uint32_t samplePeriodUs = 10000000UL / AppConfig::DEFAULT_SAMPLE_RATE_X10_HZ;
+uint32_t samplePeriodUs = 10000UL;
 uint32_t currentBatchStartUs = 0;
 uint8_t pendingSamples = 0;
 int16_t lastRxRadioStateLogged = 0;
 uint32_t queueOverflowCount = 0;
+uint32_t txUsbPackets = 0;
+uint32_t txUsbSamples = 0;
+uint32_t txUsbFifoReadFail = 0;
+uint32_t txUsbInt1Missing = 0;
+char txSerialLine[96] = {};
+size_t txSerialLineLen = 0;
+
+#if defined(APP_SENSOR_IIM42352)
+bool ds3231Ready = false;
+bool ds3231_32k_valid = false;
+uint32_t lastGpsWaitLogMs = 0;
+constexpr uint8_t kIimInt1TimestampCapacity = 64;
+volatile uint32_t iimInt1Timestamps[kIimInt1TimestampCapacity] = {};
+volatile uint8_t iimInt1TimestampHead = 0;
+volatile uint8_t iimInt1TimestampCount = 0;
+volatile uint32_t iimInt1TimestampOverflow = 0;
+volatile uint32_t iimInt1RawEdges = 0;
+volatile uint32_t iimInt1LastEdgeUs = 0;
+uint32_t lastIimInt1TimestampUs = 0;
+uint32_t lastIimInt1ReportMs = 0;
+#endif
 
 bool txRunArmed = false;
 bool txCaptureStarted = false;
@@ -97,6 +153,7 @@ uint8_t rxPollIndex = 0;
 bool rxPollWaiting = false;
 uint16_t rxPollTargetDevId = 0;
 uint32_t rxPollDeadlineMs = 0;
+uint8_t rxPollBurstPackets = 0;
 uint16_t rxLastSeq[AppConfig::P2P_NODE_COUNT] = {};
 bool rxLastSeqValid[AppConfig::P2P_NODE_COUNT] = {};
 
@@ -125,17 +182,51 @@ uint32_t overloadEventCount = 0;
 
 constexpr uint32_t kBootScreenMs = 1500;
 
+#if defined(APP_SENSOR_IIM42352)
+bool txTimebaseReady();
+#endif
+
 float sampleRateHzFloat(uint16_t sampleRateX10Hz) { return sampleRateX10Hz / 10.0f; }
 
+uint32_t actualSampleRateX1000Hz(uint16_t sampleRateX10Hz) {
+#if defined(APP_USE_DS3231_32K_TIMESTAMPS)
+  switch (sampleRateX10Hz) {
+    case 500:
+      return 51200UL;
+    case 1000:
+      return 102400UL;
+    case 2000:
+      return 204800UL;
+    case 4000:
+      return 409600UL;
+    default:
+      break;
+  }
+#endif
+  return static_cast<uint32_t>(sampleRateX10Hz) * 100UL;
+}
+
+float actualSampleRateHzFloat(uint16_t sampleRateX10Hz) {
+  return actualSampleRateX1000Hz(sampleRateX10Hz) / 1000.0f;
+}
+
+uint32_t samplePeriodUsForRate(uint16_t sampleRateX10Hz) {
+  const uint32_t rateX1000 = actualSampleRateX1000Hz(sampleRateX10Hz);
+  return static_cast<uint32_t>((1000000000ULL + rateX1000 / 2ULL) / rateX1000);
+}
+
 uint32_t sampleIntervalMsRounded(uint8_t sampleIndex, uint16_t sampleRateX10Hz) {
-  const uint32_t numerator = static_cast<uint32_t>(sampleIndex) * 10000UL + sampleRateX10Hz / 2U;
-  return numerator / sampleRateX10Hz;
+  const uint32_t rateX1000 = actualSampleRateX1000Hz(sampleRateX10Hz);
+  return static_cast<uint32_t>((static_cast<uint64_t>(sampleIndex) * 1000000ULL +
+                                rateX1000 / 2ULL) /
+                               rateX1000);
 }
 
 uint32_t sampleIntervalUsRounded(uint8_t sampleIndex, uint16_t sampleRateX10Hz) {
-  const uint32_t numerator =
-      static_cast<uint32_t>(sampleIndex) * 10000000UL + sampleRateX10Hz / 2U;
-  return numerator / sampleRateX10Hz;
+  const uint32_t rateX1000 = actualSampleRateX1000Hz(sampleRateX10Hz);
+  return static_cast<uint32_t>((static_cast<uint64_t>(sampleIndex) * 1000000000ULL +
+                                rateX1000 / 2ULL) /
+                               rateX1000);
 }
 
 bool timeReachedMs(uint32_t deadlineMs) {
@@ -167,6 +258,12 @@ int p2pDeviceIndex(uint16_t devId) {
     return -1;
   }
   return static_cast<int>(offset);
+}
+
+uint8_t p2pBurstPacketsPerNode() {
+  return AppConfig::P2P_BURST_PACKETS_PER_NODE == 0
+             ? 1
+             : AppConfig::P2P_BURST_PACKETS_PER_NODE;
 }
 
 void seedTxRandom() {
@@ -213,11 +310,26 @@ void printRoleInfo() {
 #if defined(ROLE_TX)
 #if defined(APP_LORAWAN_TX)
   Serial.println("ROLE=TX_LORAWAN");
+#elif defined(APP_TX_USB_STREAM_TEST)
+  Serial.println("ROLE=TX_USB_STREAM_TEST");
 #else
   Serial.println("ROLE=TX");
 #endif
 #elif defined(ROLE_RX)
   Serial.println("ROLE=RX");
+#endif
+#if defined(APP_TX_USB_STREAM_TEST)
+  Serial.printf("USB stream cfg: packet_samples=%u,compact_header=%u,compact_packet=%u\r\n",
+                AppConfig::MAX_SAMPLES_PER_PACKET,
+                static_cast<unsigned>(sizeof(Protocol::TxUsbCompactHeader)),
+                static_cast<unsigned>(
+                    Protocol::calcTxUsbCompactPacketSize(AppConfig::MAX_SAMPLES_PER_PACKET)));
+#elif !defined(APP_LORAWAN_TX)
+  Serial.printf("P2P cfg: nodes=%u,burst=%u,queue=%u,packet_samples=%u\r\n",
+                AppConfig::P2P_NODE_COUNT,
+                p2pBurstPacketsPerNode(),
+                AppConfig::TX_QUEUE_PACKET_CAPACITY,
+                AppConfig::MAX_SAMPLES_PER_PACKET);
 #endif
 }
 
@@ -225,6 +337,108 @@ void clearPendingBatch() {
   pendingSamples = 0;
   currentBatchStartUs = 0;
 }
+
+#if defined(APP_SENSOR_IIM42352)
+void IRAM_ATTR onIimInt1() {
+  const uint32_t nowUs = micros();
+  ++iimInt1RawEdges;
+  iimInt1LastEdgeUs = nowUs;
+  if (iimInt1TimestampCount >= kIimInt1TimestampCapacity) {
+    ++iimInt1TimestampOverflow;
+    return;
+  }
+
+  const uint8_t tail = static_cast<uint8_t>(
+      (iimInt1TimestampHead + iimInt1TimestampCount) % kIimInt1TimestampCapacity);
+  iimInt1Timestamps[tail] = nowUs;
+  ++iimInt1TimestampCount;
+}
+
+void clearIimInt1Timestamps() {
+  noInterrupts();
+  iimInt1TimestampHead = 0;
+  iimInt1TimestampCount = 0;
+  iimInt1TimestampOverflow = 0;
+  iimInt1RawEdges = 0;
+  iimInt1LastEdgeUs = 0;
+  interrupts();
+  lastIimInt1TimestampUs = 0;
+}
+
+bool popIimInt1Timestamp(uint32_t& outTimestampUs) {
+  bool ok = false;
+  noInterrupts();
+  if (iimInt1TimestampCount > 0) {
+    outTimestampUs = iimInt1Timestamps[iimInt1TimestampHead];
+    iimInt1TimestampHead = static_cast<uint8_t>(
+        (iimInt1TimestampHead + 1U) % kIimInt1TimestampCapacity);
+    --iimInt1TimestampCount;
+    ok = true;
+  }
+  interrupts();
+  return ok;
+}
+
+uint8_t iimInt1QueuedTimestamps() {
+  uint8_t count = 0;
+  noInterrupts();
+  count = iimInt1TimestampCount;
+  interrupts();
+  return count;
+}
+
+uint32_t iimInt1OverflowCount() {
+  uint32_t count = 0;
+  noInterrupts();
+  count = iimInt1TimestampOverflow;
+  interrupts();
+  return count;
+}
+
+uint32_t iimInt1RawEdgeCount() {
+  uint32_t count = 0;
+  noInterrupts();
+  count = iimInt1RawEdges;
+  interrupts();
+  return count;
+}
+
+uint32_t iimInt1LastEdgeTimestampUs() {
+  uint32_t timestampUs = 0;
+  noInterrupts();
+  timestampUs = iimInt1LastEdgeUs;
+  interrupts();
+  return timestampUs;
+}
+
+int iimInt1PinMode() {
+#if APP_IIM42352_INT1_INPUT_PULLUP_VALUE
+  return INPUT_PULLUP;
+#else
+  return INPUT;
+#endif
+}
+
+int iimInt1InterruptMode() {
+#if defined(APP_IIM42352_INT1_INTERRUPT_MODE_FALLING)
+  return FALLING;
+#elif defined(APP_IIM42352_INT1_INTERRUPT_MODE_RISING)
+  return RISING;
+#else
+  return CHANGE;
+#endif
+}
+
+const char* iimInt1InterruptModeName() {
+#if defined(APP_IIM42352_INT1_INTERRUPT_MODE_FALLING)
+  return "FALLING";
+#elif defined(APP_IIM42352_INT1_INTERRUPT_MODE_RISING)
+  return "RISING";
+#else
+  return "CHANGE";
+#endif
+}
+#endif
 
 void clearTxQueue() {
   txQueueHead = 0;
@@ -248,7 +462,7 @@ void popTxQueueFront() {
 bool pushTxQueue(const uint8_t* data,
                  size_t length,
                  uint16_t seq,
-                 uint32_t t0Ms,
+                 uint32_t t0Us,
                  uint8_t count) {
   if (data == nullptr || length == 0 || length > Protocol::MAX_PACKET_SIZE) {
     return false;
@@ -269,7 +483,7 @@ bool pushTxQueue(const uint8_t* data,
   memcpy(item.data, data, length);
   item.length = length;
   item.seq = seq;
-  item.t0Ms = t0Ms;
+  item.t0Us = t0Us;
   item.count = count;
   item.retries = 0;
   ++txQueueCount;
@@ -291,7 +505,7 @@ void discardSensorFifo(bool printLog) {
   }
 
   if (printLog && flushed > 0) {
-    Serial.printf("ADXL345 fifo flushed: %u samples\r\n", static_cast<unsigned>(flushed));
+    Serial.printf("sensor fifo flushed: %u samples\r\n", static_cast<unsigned>(flushed));
   }
 }
 
@@ -351,6 +565,10 @@ void drawTxScreen() {
       oled.printf("RADIO READY\r\n");
     }
 #else
+#if defined(APP_SENSOR_IIM42352)
+    } else if (!txTimebaseReady()) {
+      oled.printf("WAIT GPS/PPS\r\n");
+#endif
     } else if (!txRunArmed) {
       oled.printf("WAIT START\r\n");
     } else if (!txCaptureStarted) {
@@ -428,12 +646,20 @@ void showBootScreen() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
   oled.setCursor(0, 0);
+#if defined(APP_TX_USB_STREAM_TEST)
+  oled.printf("TX USB TEST\r\n");
+#elif defined(APP_SENSOR_IIM42352)
+  oled.printf("TX IIM GPS PPS\r\n");
+#else
   oled.printf("TX FIELD READY\r\n");
+#endif
   oled.printf("DEV %u\r\n", AppConfig::DEVICE_ID);
   oled.printf("RATE %s Hz%s\r\n",
               activeRateProfile().label,
               experimentalTag(activeRateProfile()));
-#if defined(APP_LORAWAN_TX)
+#if defined(APP_TX_USB_STREAM_TEST)
+  oled.printf("USB STREAM\r\n");
+#elif defined(APP_LORAWAN_TX)
   oled.printf("LoRaWAN CN470\r\n");
 #else
   oled.printf("LoRa %.1f MHz\r\n", AppConfig::LORA_FREQUENCY_MHZ);
@@ -445,7 +671,73 @@ void showBootScreen() {
   markDisplayDirty();
 }
 
+const char* sensorName() {
+#if defined(APP_SENSOR_IIM42352)
+  return "IIM-42352";
+#else
+  return "ADXL345";
+#endif
+}
+
 bool initAdxl() {
+#if defined(APP_SENSOR_IIM42352)
+  pinMode(PIN_LORA_NSS, OUTPUT);
+  digitalWrite(PIN_LORA_NSS, HIGH);
+  pinMode(PIN_IIM42352_CS, OUTPUT);
+  digitalWrite(PIN_IIM42352_CS, HIGH);
+  pinMode(PIN_IIM42352_INT1, iimInt1PinMode());
+  clearIimInt1Timestamps();
+
+  Serial.printf("IIM-42352 SPI pins: SCK=%d MOSI=%d MISO=%d CS=%d INT1=%d INT2=%d\r\n",
+                PIN_IIM42352_SCK,
+                PIN_IIM42352_MOSI,
+                PIN_IIM42352_MISO,
+                PIN_IIM42352_CS,
+                PIN_IIM42352_INT1,
+                PIN_IIM42352_INT2);
+
+  if (!adxl.begin()) {
+    Serial.printf("IIM-42352 init failed: WHO_AM_I read=0x%02X, expected=0x%02X\r\n",
+                  adxl.lastDeviceId(),
+                  adxl.expectedDeviceId());
+    Serial.printf("IIM-42352 diag: WHO=0x%02X PWR=0x%02X ACCEL_CFG=0x%02X FIFO_STATUS=0x%02X\r\n",
+                  adxl.readRegister(0x75),
+                  adxl.readRegister(adxl.regPowerCtl()),
+                  adxl.readRegister(adxl.regDataFormat()),
+                  adxl.readRegister(adxl.regFifoStatus()));
+    return false;
+  }
+
+  adxl.setRange(SensorDriver::Range::Range4G);
+  adxl.setFullResolution(true);
+  adxl.setDataRate(activeRateProfile().sensorRate);
+  const bool iimClkinOk = adxl.externalClockConfigured();
+  const bool iimInt1Ok = adxl.dataReadyInt1Configured();
+  delay(5);
+  discardSensorFifo(false);
+  clearIimInt1Timestamps();
+  attachInterrupt(digitalPinToInterrupt(PIN_IIM42352_INT1),
+                  onIimInt1,
+                  iimInt1InterruptMode());
+
+  Serial.println("IIM-42352 init ok");
+  Serial.printf("IIM-42352 who_am_i=0x%02X\r\n", adxl.readRegister(0x75));
+  Serial.printf("IIM-42352 clk_in=%u,int1_drdy=%u,INTF_CONFIG1=0x%02X,INTF_CONFIG5=0x%02X,INT_SOURCE0=0x%02X,INT_CONFIG1=0x%02X,INT_CONFIG=0x%02X,INT_STATUS=0x%02X\r\n",
+                iimClkinOk ? 1 : 0,
+                iimInt1Ok ? 1 : 0,
+                adxl.readRegister(adxl.regIntfConfig1()),
+                adxl.readBankedRegister(1, adxl.regIntfConfig5()),
+                adxl.readRegister(adxl.regIntSource0()),
+                adxl.readRegister(adxl.regIntConfig1()),
+                adxl.readRegister(adxl.regIntConfig()),
+                adxl.readRegister(adxl.regIntStatus()));
+  Serial.printf("IIM-42352 INT1 capture: pin=%d,pullup=%u,mode=%s,level=%u\r\n",
+                PIN_IIM42352_INT1,
+                APP_IIM42352_INT1_INPUT_PULLUP_VALUE ? 1 : 0,
+                iimInt1InterruptModeName(),
+                digitalRead(PIN_IIM42352_INT1) == HIGH ? 1 : 0);
+  Serial.println("IIM-42352 range=+-4g, spi+fifo+DS3231 CLKIN+INT1 DRDY mode");
+#else
   Serial.printf("ADXL345 I2C pins: SDA=%d SCL=%d ADDR=0x%02X INT1=%d\r\n",
                 PIN_ADXL345_SDA,
                 PIN_ADXL345_SCL,
@@ -468,20 +760,74 @@ bool initAdxl() {
     return false;
   }
 
-  adxl.setRange(ADXL345Driver::Range::Range4G);
+  adxl.setRange(SensorDriver::Range::Range4G);
   adxl.setFullResolution(true);
-  adxl.setDataRate(activeRateProfile().adxlRate);
+  adxl.setDataRate(activeRateProfile().sensorRate);
   delay(5);
   discardSensorFifo(false);
 
   Serial.println("ADXL345 init ok");
   Serial.printf("ADXL345 devid=0x%02X\r\n", adxl.readRegister(0x00));
   Serial.println("ADXL345 range=+-4g, full-resolution=on");
-  Serial.printf("ADXL345 sample_rate=%.1f Hz%s\r\n",
+#endif
+
+  Serial.printf("%s sample_rate configured=%.1f Hz actual=%.3f Hz%s\r\n",
+                sensorName(),
                 sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
+                actualSampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
                 experimentalTag(activeRateProfile()));
   return true;
 }
+
+#if defined(APP_SENSOR_IIM42352)
+bool initDs3231() {
+  Serial.printf("DS3231 I2C pins: SDA=%d SCL=%d ADDR=0x%02X\r\n",
+                PIN_DS3231_SDA,
+                PIN_DS3231_SCL,
+                DS3231_I2C_ADDRESS);
+  ds3231Ready = ds3231.begin();
+  ds3231_32k_valid = ds3231Ready && ds3231.is32kHzEnabled();
+  if (!ds3231Ready) {
+    Serial.println("DS3231 init failed: TX will wait and reject START_AT until fixed");
+    return false;
+  }
+  Serial.printf("DS3231 init ok: status=0x%02X,32k=%u,osf=%u\r\n",
+                ds3231.lastStatus(),
+                ds3231_32k_valid ? 1 : 0,
+                ds3231.oscillatorStopped() ? 1 : 0);
+  return ds3231_32k_valid;
+}
+
+bool initGpsTimebase() {
+  Serial.printf("LC76G UART pins: RX=%d TX=%d PPS=%d baud=%lu\r\n",
+                PIN_GPS_RX,
+                PIN_GPS_TX,
+                PIN_GPS_PPS,
+                static_cast<unsigned long>(AppConfig::GPS_BAUD));
+  return gpsTimebase.begin(PIN_GPS_RX, PIN_GPS_TX, PIN_GPS_PPS, AppConfig::GPS_BAUD);
+}
+
+void updateGpsTimebase() { gpsTimebase.update(); }
+
+bool txTimebaseReady() {
+  return ds3231Ready && ds3231_32k_valid && gpsTimebase.timeValid();
+}
+
+void logGpsWaitStatus(uint32_t nowMs) {
+  if (nowMs - lastGpsWaitLogMs < 1000UL) {
+    return;
+  }
+  lastGpsWaitLogMs = nowMs;
+  Serial.printf("TX wait timebase: gps_fix=%u,pps=%u,ds3231=%u,32k=%u,pps_interval_us=%lu\r\n",
+                gpsTimebase.fixValid() ? 1 : 0,
+                gpsTimebase.ppsValid() ? 1 : 0,
+                ds3231Ready ? 1 : 0,
+                ds3231_32k_valid ? 1 : 0,
+                static_cast<unsigned long>(gpsTimebase.ppsIntervalUs()));
+}
+#else
+void updateGpsTimebase() {}
+#endif
 
 bool initLoRa() {
 #if defined(APP_LORAWAN_TX)
@@ -564,9 +910,9 @@ void applyRateProfile(size_t newIndex, bool printLog) {
   const RateProfile& previous = activeRateProfile();
   activeRateIndex = newIndex;
   candidateRateIndex = newIndex;
-  samplePeriodUs = 10000000UL / activeRateProfile().sampleRateX10Hz;
+  samplePeriodUs = samplePeriodUsForRate(activeRateProfile().sampleRateX10Hz);
 
-  adxl.setDataRate(activeRateProfile().adxlRate);
+  adxl.setDataRate(activeRateProfile().sensorRate);
   delay(5);
   discardSensorFifo(true);
   clearPendingBatch();
@@ -662,15 +1008,14 @@ bool sendCurrentBatch() {
 
   size_t packetLength = 0;
 #if defined(APP_LORAWAN_TX)
-  const uint32_t batchStartMs = (currentBatchStartUs + 500UL) / 1000UL;
+  const uint32_t batchStartUs = currentBatchStartUs;
 #else
-  const uint32_t batchStartElapsedUs = currentBatchStartUs - txRunStartLocalUs;
-  const uint32_t batchStartMs = (batchStartElapsedUs + 500UL) / 1000UL;
+  const uint32_t batchStartUs = currentBatchStartUs - txRunStartLocalUs;
 #endif
   const bool ok =
       Protocol::encodePacket(AppConfig::DEVICE_ID,
                              packetSeq,
-                             batchStartMs,
+                             batchStartUs,
                              activeRateProfile().sampleRateX10Hz,
                              sampleBuffer,
                              pendingSamples,
@@ -682,7 +1027,50 @@ bool sendCurrentBatch() {
     return false;
   }
 
-#if defined(APP_LORAWAN_TX)
+#if defined(APP_TX_USB_STREAM_TEST)
+  Serial.printf("TXH,%u,%u,%lu,%u,%u\r\n",
+                AppConfig::DEVICE_ID,
+                packetSeq,
+                static_cast<unsigned long>(batchStartUs),
+                activeRateProfile().sampleRateX10Hz,
+                pendingSamples);
+  for (uint8_t i = 0; i < pendingSamples; ++i) {
+    const uint64_t sampleEpochUs =
+        txRunStartEpochUs + static_cast<uint64_t>(batchStartUs) +
+        sampleIntervalUsRounded(i, activeRateProfile().sampleRateX10Hz);
+    Serial.printf("%u,%llu,%d,%d,%d\r\n",
+                  AppConfig::DEVICE_ID,
+                  static_cast<unsigned long long>(sampleEpochUs),
+                  sampleBuffer[i].ax,
+                  sampleBuffer[i].ay,
+                  sampleBuffer[i].az);
+  }
+  ++txUsbPackets;
+  txUsbSamples += pendingSamples;
+  Serial.printf("TXS,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u\r\n",
+                AppConfig::DEVICE_ID,
+                static_cast<unsigned long>(txUsbPackets),
+                static_cast<unsigned long>(txUsbSamples),
+                static_cast<unsigned long>(txUsbInt1Missing),
+#if defined(APP_SENSOR_IIM42352)
+                static_cast<unsigned long>(iimInt1OverflowCount()),
+#else
+                0UL,
+#endif
+                static_cast<unsigned long>(txUsbFifoReadFail),
+#if defined(APP_SENSOR_IIM42352)
+                static_cast<unsigned long>(iimInt1RawEdgeCount()),
+                digitalRead(PIN_IIM42352_INT1) == HIGH ? 1 : 0
+#else
+                0UL,
+                0
+#endif
+                );
+  ++packetSeq;
+  clearPendingBatch();
+  markDisplayDirty();
+  return true;
+#elif defined(APP_LORAWAN_TX)
   const uint32_t packetJitterMs = randomDelayMs(AppConfig::TX_PACKET_JITTER_MAX_MS);
   if (packetJitterMs > 0) {
     delay(packetJitterMs);
@@ -713,7 +1101,7 @@ bool sendCurrentBatch() {
                 pendingSamples,
                 sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
                 experimentalTag(activeRateProfile()),
-                static_cast<unsigned long>(batchStartMs),
+                static_cast<unsigned long>(batchStartUs),
                 static_cast<unsigned>(packetLength),
                 static_cast<unsigned long>(packetJitterMs),
                 static_cast<unsigned long>(meta.frameCounter),
@@ -727,7 +1115,7 @@ bool sendCurrentBatch() {
                 pendingSamples,
                 sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
                 experimentalTag(activeRateProfile()),
-                static_cast<unsigned long>(batchStartMs),
+                static_cast<unsigned long>(batchStartUs),
                 static_cast<unsigned>(packetLength),
                 static_cast<unsigned long>(packetJitterMs));
 #endif
@@ -738,15 +1126,15 @@ bool sendCurrentBatch() {
   return true;
 #else
   const bool queued =
-      pushTxQueue(txPacketBuffer, packetLength, packetSeq, batchStartMs, pendingSamples);
+      pushTxQueue(txPacketBuffer, packetLength, packetSeq, batchStartUs, pendingSamples);
   if (queued) {
-    Serial.printf("TX queued dev=%u,seq=%u,count=%u,fs=%.1f%s,t0_offset_ms=%lu,len=%u,q=%u/%u\r\n",
+    Serial.printf("TX queued dev=%u,seq=%u,count=%u,fs=%.1f%s,t0_offset_us=%lu,len=%u,q=%u/%u\r\n",
                   AppConfig::DEVICE_ID,
                   packetSeq,
                   pendingSamples,
                   sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
                   experimentalTag(activeRateProfile()),
-                  static_cast<unsigned long>(batchStartMs),
+                  static_cast<unsigned long>(batchStartUs),
                   static_cast<unsigned>(packetLength),
                   txQueueCount,
                   AppConfig::TX_QUEUE_PACKET_CAPACITY);
@@ -770,22 +1158,27 @@ void processFifoSamples() {
   }
 
   if (activeRateProfile().experimental &&
-      fifoDepth >= AppConfig::ADXL345_FIFO_OVERLOAD_LEVEL) {
+      fifoDepth >= AppConfig::SENSOR_FIFO_OVERLOAD_LEVEL) {
     noteOverload(fifoDepth);
   }
 
   const size_t burstCapacity =
       sizeof(fifoBurstBuffer) / sizeof(fifoBurstBuffer[0]);
   const size_t requested = min(static_cast<size_t>(fifoDepth), burstCapacity);
-  const uint32_t burstEndUs = micros();
   const size_t actual = adxl.readFifoBurst(fifoBurstBuffer, requested);
   if (actual == 0) {
-    Serial.println("ADXL345 readFifoBurst failed");
+#if defined(APP_TX_USB_STREAM_TEST)
+    ++txUsbFifoReadFail;
+#endif
+    Serial.printf("%s readFifoBurst failed\r\n", sensorName());
     return;
   }
 
+#if !defined(APP_SENSOR_IIM42352)
+  const uint32_t burstEndUs = micros();
   const uint32_t burstStartUs =
       burstEndUs - static_cast<uint32_t>((static_cast<uint64_t>(actual) - 1ULL) * samplePeriodUs);
+#endif
 
   for (size_t i = 0; i < actual; ++i) {
     if (pendingSamples >= AppConfig::MAX_SAMPLES_PER_PACKET) {
@@ -794,8 +1187,49 @@ void processFifoSamples() {
       }
     }
 
+#if defined(APP_SENSOR_IIM42352)
+    uint32_t sampleTimestampUs = 0;
+    if (popIimInt1Timestamp(sampleTimestampUs)) {
+      lastIimInt1TimestampUs = sampleTimestampUs;
+    } else if (lastIimInt1TimestampUs != 0) {
+      sampleTimestampUs = lastIimInt1TimestampUs + samplePeriodUs;
+      lastIimInt1TimestampUs = sampleTimestampUs;
+#if defined(APP_TX_USB_STREAM_TEST)
+      ++txUsbInt1Missing;
+#endif
+      const uint32_t nowMs = millis();
+      if (nowMs - lastIimInt1ReportMs >= 1000UL) {
+        lastIimInt1ReportMs = nowMs;
+        Serial.printf("IIM INT1 timestamp missing: fifo=%u,queued=%u,overflow=%lu,pin_level=%u,raw_edges=%lu,last_edge_us=%lu\r\n",
+                      fifoDepth,
+                      iimInt1QueuedTimestamps(),
+                      static_cast<unsigned long>(iimInt1OverflowCount()),
+                      digitalRead(PIN_IIM42352_INT1) == HIGH ? 1 : 0,
+                      static_cast<unsigned long>(iimInt1RawEdgeCount()),
+                      static_cast<unsigned long>(iimInt1LastEdgeTimestampUs()));
+      }
+    } else {
+      sampleTimestampUs = micros();
+      lastIimInt1TimestampUs = sampleTimestampUs;
+#if defined(APP_TX_USB_STREAM_TEST)
+      ++txUsbInt1Missing;
+#endif
+      const uint32_t nowMs = millis();
+      if (nowMs - lastIimInt1ReportMs >= 1000UL) {
+        lastIimInt1ReportMs = nowMs;
+        Serial.printf("IIM INT1 not seen yet: fifo=%u,queued=%u,overflow=%lu,pin_level=%u,raw_edges=%lu,last_edge_us=%lu\r\n",
+                      fifoDepth,
+                      iimInt1QueuedTimestamps(),
+                      static_cast<unsigned long>(iimInt1OverflowCount()),
+                      digitalRead(PIN_IIM42352_INT1) == HIGH ? 1 : 0,
+                      static_cast<unsigned long>(iimInt1RawEdgeCount()),
+                      static_cast<unsigned long>(iimInt1LastEdgeTimestampUs()));
+      }
+    }
+#else
     const uint32_t sampleTimestampUs =
         burstStartUs + static_cast<uint32_t>(static_cast<uint64_t>(i) * samplePeriodUs);
+#endif
     if (pendingSamples == 0) {
       currentBatchStartUs = sampleTimestampUs;
     }
@@ -828,11 +1262,23 @@ void armTxRun(const Protocol::ControlFrame& frame) {
     return;
   }
 
+  uint32_t startLocalUs = micros() + frame.param * 1000UL;
+#if defined(APP_REQUIRE_GPS_TIMEBASE)
+  updateGpsTimebase();
+  if (!gpsTimebase.localMicrosForEpoch(frame.epochUs, startLocalUs)) {
+    Serial.printf("TX ignored START_AT waiting GPS/PPS: dev=%u,run=%u,epoch_us=%llu\r\n",
+                  AppConfig::DEVICE_ID,
+                  frame.seq,
+                  static_cast<unsigned long long>(frame.epochUs));
+    return;
+  }
+#endif
+
   const bool newRun = !txRunArmed || frame.seq != txRunId ||
                       frame.epochUs != txRunStartEpochUs;
   txRunId = frame.seq;
   txRunStartEpochUs = frame.epochUs;
-  txRunStartLocalUs = micros() + frame.param * 1000UL;
+  txRunStartLocalUs = startLocalUs;
   txRunArmed = true;
 
   if (newRun) {
@@ -840,6 +1286,9 @@ void armTxRun(const Protocol::ControlFrame& frame) {
     packetSeq = 0;
     clearPendingBatch();
     clearTxQueue();
+#if defined(APP_SENSOR_IIM42352)
+    clearIimInt1Timestamps();
+#endif
     applyRateProfile(rateIndex, true);
     discardSensorFifo(false);
     Serial.printf("TX START_AT armed: dev=%u,run=%u,epoch_us=%llu,delay_ms=%lu,fs=%.1f\r\n",
@@ -858,6 +1307,115 @@ void armTxRun(const Protocol::ControlFrame& frame) {
   markDisplayDirty();
 }
 
+#if defined(APP_TX_USB_STREAM_TEST)
+void armTxRunUsb(uint64_t startEpochUs, uint16_t sampleRateX10Hz, uint32_t delayMs) {
+  if (startEpochUs == 0 || sampleRateX10Hz == 0) {
+    Serial.println("TX USB START_AT invalid");
+    return;
+  }
+
+  size_t rateIndex = 0;
+  if (!findRateIndex(sampleRateX10Hz, rateIndex)) {
+    Serial.printf("TX USB START_AT unsupported fs_x10=%u\r\n", sampleRateX10Hz);
+    return;
+  }
+
+  ++txRunId;
+  if (txRunId == 0) {
+    ++txRunId;
+  }
+  txRunStartEpochUs = startEpochUs;
+  txRunStartLocalUs = micros() + delayMs * 1000UL;
+  txRunArmed = true;
+  txCaptureStarted = false;
+  txWaitingAck = false;
+  txWaitingAckSeq = 0;
+  packetSeq = 0;
+  txUsbPackets = 0;
+  txUsbSamples = 0;
+  txUsbFifoReadFail = 0;
+  txUsbInt1Missing = 0;
+  clearPendingBatch();
+  clearTxQueue();
+#if defined(APP_SENSOR_IIM42352)
+  clearIimInt1Timestamps();
+#endif
+  applyRateProfile(rateIndex, true);
+  discardSensorFifo(false);
+
+  Serial.printf("TX USB START_AT armed: dev=%u,run=%u,epoch_us=%llu,delay_ms=%lu,fs=%.1f,compact_packet=%u\r\n",
+                AppConfig::DEVICE_ID,
+                txRunId,
+                static_cast<unsigned long long>(txRunStartEpochUs),
+                static_cast<unsigned long>(delayMs),
+                sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
+                static_cast<unsigned>(
+                    Protocol::calcTxUsbCompactPacketSize(AppConfig::MAX_SAMPLES_PER_PACKET)));
+  markDisplayDirty();
+}
+
+void handleTxSerialLine(char* line) {
+  if (line == nullptr) {
+    return;
+  }
+
+  char* command = strtok(line, " \t,");
+  if (command == nullptr) {
+    return;
+  }
+
+  if (strcmp(command, "START_AT") != 0) {
+    Serial.printf("TX USB unknown serial command: %s\r\n", command);
+    return;
+  }
+
+  char* epochText = strtok(nullptr, " \t,");
+  char* rateText = strtok(nullptr, " \t,");
+  char* delayText = strtok(nullptr, " \t,");
+  if (epochText == nullptr || rateText == nullptr) {
+    Serial.println("TX USB START_AT usage: START_AT epoch_us sample_rate_hz [delay_ms]");
+    return;
+  }
+
+  const uint64_t startEpochUs = strtoull(epochText, nullptr, 10);
+  const uint16_t sampleRateX10Hz = parseSampleRateX10(rateText);
+  uint32_t delayMs = AppConfig::P2P_START_DEFAULT_DELAY_MS;
+  if (delayText != nullptr) {
+    const unsigned long parsed = strtoul(delayText, nullptr, 10);
+    if (parsed > 0) {
+      delayMs = static_cast<uint32_t>(parsed);
+    }
+  }
+
+  armTxRunUsb(startEpochUs, sampleRateX10Hz, delayMs);
+}
+
+void handleTxSerial() {
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      txSerialLine[txSerialLineLen] = '\0';
+      handleTxSerialLine(txSerialLine);
+      txSerialLineLen = 0;
+      txSerialLine[0] = '\0';
+      continue;
+    }
+
+    if (txSerialLineLen + 1 < sizeof(txSerialLine)) {
+      txSerialLine[txSerialLineLen++] = c;
+    } else {
+      txSerialLineLen = 0;
+      txSerialLine[0] = '\0';
+      Serial.println("TX USB serial command too long");
+    }
+  }
+}
+#endif
+
 void startTxCaptureIfDue() {
 #if !defined(APP_LORAWAN_TX)
   if (!txRunArmed || txCaptureStarted || !timeReachedUs(txRunStartLocalUs)) {
@@ -866,6 +1424,9 @@ void startTxCaptureIfDue() {
 
   discardSensorFifo(false);
   clearPendingBatch();
+#if defined(APP_SENSOR_IIM42352)
+  clearIimInt1Timestamps();
+#endif
   txCaptureStarted = true;
   Serial.printf("TX capture started: dev=%u,run=%u,epoch_us=%llu,fs=%.1f\r\n",
                 AppConfig::DEVICE_ID,
@@ -942,19 +1503,26 @@ void handleTxControlFrame(const Protocol::ControlFrame& frame) {
 
   if (frame.frameType == Protocol::FRAME_TYPE_ACK && txWaitingAck &&
       !txQueueEmpty() && frame.seq == txQueueFront().seq) {
-    Serial.printf("TX acked: dev=%u,seq=%u,q_before=%u\r\n",
-                  AppConfig::DEVICE_ID,
-                  frame.seq,
-                  txQueueCount);
+    const uint8_t qBefore = txQueueCount;
+    const bool grantNext = frame.param > 0;
     popTxQueueFront();
     txWaitingAck = false;
     txWaitingAckSeq = 0;
+    Serial.printf("TX acked: dev=%u,seq=%u,grant=%u,q_before=%u,q_after=%u\r\n",
+                  AppConfig::DEVICE_ID,
+                  frame.seq,
+                  grantNext ? 1U : 0U,
+                  qBefore,
+                  txQueueCount);
+    if (grantNext) {
+      (void)sendTxQueueHead();
+    }
     markDisplayDirty();
   }
 }
 
 void handleTxRadio() {
-#if !defined(APP_LORAWAN_TX)
+#if !defined(APP_LORAWAN_TX) && !defined(APP_TX_USB_STREAM_TEST)
   if (txWaitingAck && timeReachedMs(txAckDeadlineMs)) {
     Serial.printf("TX ack timeout: dev=%u,seq=%u,q=%u/%u\r\n",
                   AppConfig::DEVICE_ID,
@@ -997,7 +1565,19 @@ void handleTxRadio() {
 
 void txLoop() {
   const uint32_t nowMs = millis();
+#if !defined(APP_TX_USB_STREAM_TEST)
+  updateGpsTimebase();
+#endif
+#if defined(APP_SENSOR_IIM42352) && !defined(APP_TX_USB_STREAM_TEST)
+  if (!txRunArmed) {
+    logGpsWaitStatus(nowMs);
+  }
+#endif
+#if defined(APP_TX_USB_STREAM_TEST)
+  handleTxSerial();
+#else
   handleTxRadio();
+#endif
   startTxCaptureIfDue();
 
   if (!txRunArmed || !txCaptureStarted) {
@@ -1052,12 +1632,13 @@ void resetRxPacketSeqs() {
 }
 
 void printDecodedPacket(const Protocol::DecodedPacketView& packet, bool duplicate) {
-  Serial.printf("dev_id=%u,seq=%u,count=%u,fs=%.1f,t0=%lu\r\n",
+  Serial.printf("dev_id=%u,seq=%u,count=%u,fs=%.1f,actual_fs=%.3f,t0_us=%lu\r\n",
                 packet.header.devId,
                 packet.header.seq,
                 packet.header.count,
                 sampleRateHzFloat(packet.header.fsHzX10),
-                static_cast<unsigned long>(packet.header.t0Ms));
+                actualSampleRateHzFloat(packet.header.fsHzX10),
+                static_cast<unsigned long>(packet.header.t0Us));
 
   if (duplicate) {
     Serial.printf("RX duplicate ignored: dev=%u,seq=%u\r\n",
@@ -1067,10 +1648,10 @@ void printDecodedPacket(const Protocol::DecodedPacketView& packet, bool duplicat
   }
 
   for (uint8_t i = 0; i < packet.header.count; ++i) {
-    uint64_t timestampValue = packet.header.t0Ms + sampleIntervalMsRounded(i, packet.header.fsHzX10);
+    uint64_t timestampValue = packet.header.t0Us + sampleIntervalUsRounded(i, packet.header.fsHzX10);
     if (rxRunStarted && rxRunStartEpochUs != 0) {
       timestampValue = rxRunStartEpochUs +
-                       static_cast<uint64_t>(packet.header.t0Ms) * 1000ULL +
+                       static_cast<uint64_t>(packet.header.t0Us) +
                        sampleIntervalUsRounded(i, packet.header.fsHzX10);
     }
     const auto& s = packet.samples[i];
@@ -1108,14 +1689,16 @@ void armRxRun(uint64_t startEpochUs, uint16_t sampleRateX10Hz, uint32_t delayMs)
   rxPollIndex = 0;
   rxPollWaiting = false;
   rxPollTargetDevId = 0;
+  rxPollBurstPackets = 0;
   resetRxPacketSeqs();
 
-  Serial.printf("RX START_AT armed: run=%u,epoch_us=%llu,delay_ms=%lu,fs=%.1f,nodes=%u\r\n",
+  Serial.printf("RX START_AT armed: run=%u,epoch_us=%llu,delay_ms=%lu,fs=%.1f,nodes=%u,burst=%u\r\n",
                 rxRunId,
                 static_cast<unsigned long long>(rxRunStartEpochUs),
                 static_cast<unsigned long>(delayMs),
                 sampleRateHzFloat(kRateProfiles[rateIndex].sampleRateX10Hz),
-                AppConfig::P2P_NODE_COUNT);
+                AppConfig::P2P_NODE_COUNT,
+                p2pBurstPacketsPerNode());
 }
 
 void handleRxSerialLine(char* line) {
@@ -1217,6 +1800,7 @@ void startRxRunIfDue() {
   rxRunStarted = true;
   rxPollIndex = 0;
   rxPollWaiting = false;
+  rxPollBurstPackets = 0;
   Serial.printf("RX polling started: run=%u,epoch_us=%llu\r\n",
                 rxRunId,
                 static_cast<unsigned long long>(rxRunStartEpochUs));
@@ -1225,7 +1809,13 @@ void startRxRunIfDue() {
 void advanceRxPoll() {
   rxPollWaiting = false;
   rxPollTargetDevId = 0;
+  rxPollBurstPackets = 0;
   rxPollIndex = static_cast<uint8_t>((rxPollIndex + 1U) % AppConfig::P2P_NODE_COUNT);
+}
+
+void continueRxBurstWait() {
+  rxPollWaiting = true;
+  rxPollDeadlineMs = millis() + AppConfig::P2P_POLL_RESPONSE_TIMEOUT_MS;
 }
 
 void sendNextPollIfReady() {
@@ -1238,7 +1828,7 @@ void sendNextPollIfReady() {
                        rxPollTargetDevId,
                        rxRunId,
                        rxRunStartEpochUs,
-                       0,
+                       p2pBurstPacketsPerNode(),
                        rxRunFsHzX10)) {
     rxPollWaiting = true;
     rxPollDeadlineMs = millis() + AppConfig::P2P_POLL_RESPONSE_TIMEOUT_MS;
@@ -1293,13 +1883,30 @@ void handleRxDataPacket(size_t packetLength, const LoRaTransport::ReceiveMeta& m
                 meta.snr);
   printDecodedPacket(packet, duplicate);
 
+  const uint8_t receivedPacketsInBurst =
+      static_cast<uint8_t>(rxPollBurstPackets + (duplicate ? 0U : 1U));
+  const bool grantNext = Protocol::shouldGrantBurstContinuation(
+      rxPollWaiting,
+      duplicate,
+      receivedPacketsInBurst,
+      p2pBurstPacketsPerNode());
   (void)sendControlFrame(Protocol::FRAME_TYPE_ACK,
                          packet.header.devId,
                          packet.header.seq,
                          0,
-                         0,
+                         grantNext ? 1UL : 0UL,
                          packet.header.fsHzX10);
-  advanceRxPoll();
+  if (grantNext) {
+    rxPollBurstPackets = receivedPacketsInBurst;
+    Serial.printf("RX burst grant: dev=%u,seq=%u,slot=%u/%u\r\n",
+                  packet.header.devId,
+                  packet.header.seq,
+                  rxPollBurstPackets,
+                  p2pBurstPacketsPerNode());
+    continueRxBurstWait();
+  } else {
+    advanceRxPoll();
+  }
 }
 
 void rxLoop() {
@@ -1376,7 +1983,7 @@ void setup() {
 
   activeRateIndex = defaultRateIndex();
   candidateRateIndex = activeRateIndex;
-  samplePeriodUs = 10000000UL / activeRateProfile().sampleRateX10Hz;
+  samplePeriodUs = samplePeriodUsForRate(activeRateProfile().sampleRateX10Hz);
 
   printRoleInfo();
   Serial.printf("DEV_ID=%u (0x%04X)\r\n", AppConfig::DEVICE_ID, AppConfig::DEVICE_ID);
@@ -1398,6 +2005,13 @@ void setup() {
     delay(startupJitterMs);
   }
 
+#if defined(APP_SENSOR_IIM42352)
+  (void)initDs3231();
+#if !defined(APP_TX_USB_STREAM_TEST)
+  (void)initGpsTimebase();
+#endif
+#endif
+
   if (!initAdxl()) {
     while (true) {
       delay(1000);
@@ -1405,16 +2019,18 @@ void setup() {
   }
 #endif
 
+#if !defined(APP_TX_USB_STREAM_TEST)
   if (!initLoRa()) {
     while (true) {
       delay(1000);
     }
   }
+#endif
 
 #if defined(ROLE_TX)
   (void)initOled();
   showBootScreen();
-#if !defined(APP_LORAWAN_TX)
+#if !defined(APP_LORAWAN_TX) && !defined(APP_TX_USB_STREAM_TEST)
   if (!LoRaTransport::startReceive()) {
     Serial.printf("LoRa TX listen arm failed: %s (%d)\r\n",
                   LoRaTransport::stateToString(LoRaTransport::lastState()),
@@ -1422,6 +2038,8 @@ void setup() {
   } else {
     Serial.println("LoRa TX control listen armed");
   }
+#elif defined(APP_TX_USB_STREAM_TEST)
+  Serial.println("TX USB stream test waiting for START_AT");
 #endif
   Serial.printf("TX active_rate=%.1f Hz%s\r\n",
                 sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),

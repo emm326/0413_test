@@ -79,3 +79,54 @@
 #ifndef ADXL345_I2C_ADDRESS
 #define ADXL345_I2C_ADDRESS 0x53
 #endif
+
+// IIM-42352 + LC76G + DS3231 多节点 GPS/PPS 同步方案
+// IIM-42352 使用 Header J2 上可用杜邦线连接的独立 SPI 引脚。
+// GPIO9/10/11 是板载 LoRa 的内部 SPI 连线，不适合外接 IIM-42352。
+#ifndef PIN_IIM42352_SCK
+#define PIN_IIM42352_SCK 47
+#endif
+
+#ifndef PIN_IIM42352_MOSI
+#define PIN_IIM42352_MOSI 48
+#endif
+
+#ifndef PIN_IIM42352_MISO
+#define PIN_IIM42352_MISO 33
+#endif
+
+#ifndef PIN_IIM42352_CS
+#define PIN_IIM42352_CS 34
+#endif
+
+#ifndef PIN_IIM42352_INT1
+#define PIN_IIM42352_INT1 26
+#endif
+
+#ifndef PIN_IIM42352_INT2
+#define PIN_IIM42352_INT2 -1
+#endif
+
+#ifndef PIN_GPS_RX
+#define PIN_GPS_RX 5
+#endif
+
+#ifndef PIN_GPS_TX
+#define PIN_GPS_TX 6
+#endif
+
+#ifndef PIN_GPS_PPS
+#define PIN_GPS_PPS 4
+#endif
+
+#ifndef PIN_DS3231_SDA
+#define PIN_DS3231_SDA 41
+#endif
+
+#ifndef PIN_DS3231_SCL
+#define PIN_DS3231_SCL 42
+#endif
+
+#ifndef DS3231_I2C_ADDRESS
+#define DS3231_I2C_ADDRESS 0x68
+#endif

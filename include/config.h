@@ -31,6 +31,10 @@
 #define APP_LORA_FREQUENCY_MHZ_VALUE 470.0f
 #endif
 
+#ifndef APP_GPS_BAUD_VALUE
+#define APP_GPS_BAUD_VALUE 115200UL
+#endif
+
 #ifndef APP_MAX_SAMPLES_PER_PACKET_VALUE
 #define APP_MAX_SAMPLES_PER_PACKET_VALUE 20
 #endif
@@ -67,6 +71,10 @@
 #define APP_P2P_TX_ACK_TIMEOUT_MS 220UL
 #endif
 
+#ifndef APP_P2P_BURST_PACKETS_PER_NODE_VALUE
+#define APP_P2P_BURST_PACKETS_PER_NODE_VALUE 1
+#endif
+
 #ifndef APP_TX_QUEUE_PACKET_CAPACITY_VALUE
 #define APP_TX_QUEUE_PACKET_CAPACITY_VALUE 16
 #endif
@@ -77,6 +85,10 @@
 
 #if defined(APP_LORAWAN_TX) && defined(ROLE_RX)
 #error "APP_LORAWAN_TX can only be used with ROLE_TX"
+#endif
+
+#if defined(APP_TX_USB_STREAM_TEST) && defined(APP_REQUIRE_GPS_TIMEBASE)
+#error "APP_TX_USB_STREAM_TEST uses PC START_AT and must not require GPS timebase"
 #endif
 
 #if !defined(ROLE_TX) && !defined(ROLE_RX)
@@ -137,7 +149,7 @@
 
 namespace AppConfig {
 
-constexpr uint32_t SERIAL_BAUD = 115200;
+constexpr uint32_t SERIAL_BAUD = 460800;
 constexpr uint16_t DEVICE_ID = static_cast<uint16_t>(APP_DEVICE_ID_VALUE);
 constexpr uint8_t MAX_SAMPLES_PER_PACKET =
     static_cast<uint8_t>(APP_MAX_SAMPLES_PER_PACKET_VALUE);
@@ -147,6 +159,11 @@ constexpr uint16_t DEFAULT_SAMPLE_RATE_X10_HZ = 1000;  // 100.0 Hz
 constexpr uint32_t ADXL345_I2C_CLOCK_HZ = 400000UL;
 constexpr uint8_t ADXL345_FIFO_WATERMARK = 16;
 constexpr uint8_t ADXL345_FIFO_OVERLOAD_LEVEL = 28;
+constexpr uint8_t SENSOR_FIFO_WATERMARK = 16;
+constexpr uint8_t SENSOR_FIFO_OVERLOAD_LEVEL = 28;
+constexpr uint32_t IIM42352_SPI_CLOCK_HZ = 8000000UL;
+constexpr uint32_t DS3231_I2C_CLOCK_HZ = 400000UL;
+constexpr uint32_t GPS_BAUD = APP_GPS_BAUD_VALUE;
 
 // LoRa configuration tuned toward higher throughput / short-to-mid range
 constexpr float LORA_FREQUENCY_MHZ = APP_LORA_FREQUENCY_MHZ_VALUE;
@@ -182,6 +199,8 @@ constexpr uint32_t P2P_START_BROADCAST_INTERVAL_MS =
     APP_P2P_START_BROADCAST_INTERVAL_MS;
 constexpr uint32_t P2P_START_DEFAULT_DELAY_MS = APP_P2P_START_DEFAULT_DELAY_MS;
 constexpr uint32_t P2P_TX_ACK_TIMEOUT_MS = APP_P2P_TX_ACK_TIMEOUT_MS;
+constexpr uint8_t P2P_BURST_PACKETS_PER_NODE =
+    static_cast<uint8_t>(APP_P2P_BURST_PACKETS_PER_NODE_VALUE);
 constexpr uint8_t TX_QUEUE_PACKET_CAPACITY =
     static_cast<uint8_t>(APP_TX_QUEUE_PACKET_CAPACITY_VALUE);
 
