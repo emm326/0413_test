@@ -32,6 +32,7 @@ import mimetypes
 import queue
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -42,17 +43,43 @@ from pathlib import Path
 from typing import TextIO
 from urllib import error, request
 
+
+def add_platformio_site_packages() -> bool:
+    candidates = [
+        Path.home() / ".platformio" / "penv" / "Lib" / "site-packages",
+        Path.home() / ".platformio" / "penv" / "lib" / "site-packages",
+    ]
+    for path in candidates:
+        if path.exists() and str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+            return True
+    return False
+
+
 try:
     import serial
     from serial import SerialException
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "pyserial is required.\n"
-        r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
-        r"tools\serial_gateway_csv_http.py --ports COM6 --gateway-ids rx01 "
-        r"--output-root data --rotation-minutes 30 "
-        r"--upload-url http://127.0.0.1:8000/upload"
-    ) from exc
+    if add_platformio_site_packages():
+        try:
+            import serial
+            from serial import SerialException
+        except ImportError as retry_exc:
+            raise SystemExit(
+                "pyserial is required.\n"
+                r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
+                r"tools\serial_gateway_csv_http.py --ports COM6 --gateway-ids rx01 "
+                r"--output-root data --rotation-minutes 30 "
+                r"--upload-url http://127.0.0.1:8000/upload"
+            ) from retry_exc
+    else:
+        raise SystemExit(
+            "pyserial is required.\n"
+            r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
+            r"tools\serial_gateway_csv_http.py --ports COM6 --gateway-ids rx01 "
+            r"--output-root data --rotation-minutes 30 "
+            r"--upload-url http://127.0.0.1:8000/upload"
+        ) from exc
 
 
 MULTI_DEVICE_RE = re.compile(r"^\s*(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
@@ -62,7 +89,9 @@ FILE_NAME_RE = re.compile(
     r"(?P<end>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:_seg\d+)?$"
 )
 
-DEFAULT_SCALE_G = 0.0039
+DEFAULT_RANGE_G = 4
+SUPPORTED_RANGE_G = (4, 8, 16)
+DEFAULT_SCALE_G = DEFAULT_RANGE_G / 32768.0
 DEFAULT_DEVICE_ID = "1001"
 DEFAULT_ROTATION_MINUTES = 30
 DEFAULT_CONNECT_TIMEOUT = 10.0
@@ -89,6 +118,7 @@ class GatewayConfig:
     output_root: Path
     rotation_minutes: int
     upload_url: str
+    range_g: int
     scale: float
     base_time: datetime | None
     connect_timeout: float
@@ -260,7 +290,15 @@ class GatewayStats:
             }
 
 
-def parse_args() -> GatewayConfig:
+def scale_for_range_g(range_g: int) -> float:
+    return range_g / 32768.0
+
+
+def resolved_scale(args: argparse.Namespace) -> float:
+    return args.scale if args.scale is not None else scale_for_range_g(args.range_g)
+
+
+def parse_args(argv: list[str] | None = None) -> GatewayConfig:
     parser = argparse.ArgumentParser(
         description=(
             "Read multiple LoRa RX serial ports, package samples by transmitter "
@@ -306,8 +344,15 @@ def parse_args() -> GatewayConfig:
     parser.add_argument(
         "--scale",
         type=float,
-        default=DEFAULT_SCALE_G,
-        help=f"Raw to g scale factor. Default: {DEFAULT_SCALE_G}",
+        default=None,
+        help=f"Raw to g scale factor. Default is derived from --range-g (4g: {DEFAULT_SCALE_G})",
+    )
+    parser.add_argument(
+        "--range-g",
+        type=int,
+        choices=SUPPORTED_RANGE_G,
+        default=DEFAULT_RANGE_G,
+        help="IIM-42352 accelerometer full-scale range in g. Default: 4",
     )
     parser.add_argument(
         "--base-time",
@@ -381,7 +426,7 @@ def parse_args() -> GatewayConfig:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Console log level. Default: INFO",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     ports = [item.strip() for item in args.ports.split(",") if item.strip()]
     if not ports:
@@ -403,6 +448,9 @@ def parse_args() -> GatewayConfig:
 
     if args.sample_queue_size <= 0:
         raise SystemExit("--sample-queue-size must be greater than 0")
+    scale = resolved_scale(args)
+    if scale <= 0:
+        raise SystemExit("--scale must be positive")
 
     config = GatewayConfig(
         sources=[
@@ -413,7 +461,8 @@ def parse_args() -> GatewayConfig:
         output_root=Path(args.output_root),
         rotation_minutes=args.rotation_minutes,
         upload_url=args.upload_url,
-        scale=args.scale,
+        range_g=int(args.range_g),
+        scale=scale,
         base_time=parse_user_time(args.base_time) if args.base_time else None,
         connect_timeout=args.connect_timeout,
         retry_interval=args.retry_interval,
@@ -1101,6 +1150,7 @@ def main() -> int:
     LOGGER.info("Output root: %s", config.output_root)
     LOGGER.info("Rotation window: %s minutes", config.rotation_minutes)
     LOGGER.info("Upload URL: %s", config.upload_url)
+    LOGGER.info("Range g: %s", config.range_g)
     LOGGER.info("Scale: %s", config.scale)
     if config.base_time is not None:
         LOGGER.info(

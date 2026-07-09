@@ -185,6 +185,7 @@ bool encodeControlFrame(uint8_t frameType,
                         uint64_t epochUs,
                         uint32_t param,
                         uint16_t fsHzX10,
+                        uint16_t reserved,
                         uint8_t* outBuffer,
                         size_t outCapacity,
                         size_t& outLength) {
@@ -207,7 +208,7 @@ bool encodeControlFrame(uint8_t frameType,
   frame.epochUs = epochUs;
   frame.param = param;
   frame.fsHzX10 = fsHzX10;
-  frame.reserved = 0;
+  frame.reserved = reserved;
 
   memcpy(outBuffer, &frame, sizeof(frame));
   const uint16_t crc = crc16Ccitt(outBuffer, frameSize - kCrcSize);

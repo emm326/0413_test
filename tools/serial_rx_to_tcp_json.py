@@ -19,25 +19,52 @@ import json
 import queue
 import re
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def add_platformio_site_packages() -> bool:
+    candidates = [
+        Path.home() / ".platformio" / "penv" / "Lib" / "site-packages",
+        Path.home() / ".platformio" / "penv" / "lib" / "site-packages",
+    ]
+    for path in candidates:
+        if path.exists() and str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+            return True
+    return False
 
 try:
     import serial
     from serial import SerialException
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "pyserial is required.\n"
-        r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
-        r"tools\serial_rx_to_tcp_json.py --port COM6 --host 1.2.3.4 --server-port 9000"
-    ) from exc
+    if add_platformio_site_packages():
+        try:
+            import serial
+            from serial import SerialException
+        except ImportError as retry_exc:
+            raise SystemExit(
+                "pyserial is required.\n"
+                r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
+                r"tools\serial_rx_to_tcp_json.py --port COM6 --host 1.2.3.4 --server-port 9000"
+            ) from retry_exc
+    else:
+        raise SystemExit(
+            "pyserial is required.\n"
+            r"Try: C:\Users\26223\.platformio\penv\Scripts\python.exe "
+            r"tools\serial_rx_to_tcp_json.py --port COM6 --host 1.2.3.4 --server-port 9000"
+        ) from exc
 
 
 MULTI_DEVICE_RE = re.compile(r"^\s*(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 LEGACY_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
-DEFAULT_SCALE_G = 0.0039
+DEFAULT_RANGE_G = 4
+SUPPORTED_RANGE_G = (4, 8, 16)
+DEFAULT_SCALE_G = DEFAULT_RANGE_G / 32768.0
 DEFAULT_DEVICE_ID = "1001"
 
 
@@ -48,6 +75,7 @@ class UploadConfig:
     host: str
     server_port: int
     device_id: str
+    range_g: int
     scale: float
     base_time: datetime | None
     connect_timeout: float
@@ -189,6 +217,14 @@ def build_json_line(
     )
 
 
+def scale_for_range_g(range_g: int) -> float:
+    return range_g / 32768.0
+
+
+def resolved_scale(args: argparse.Namespace) -> float:
+    return args.scale if args.scale is not None else scale_for_range_g(args.range_g)
+
+
 def parse_serial_sample(line: str, fallback_device_id: str) -> ParsedSample | None:
     match = MULTI_DEVICE_RE.match(line)
     if match:
@@ -213,7 +249,7 @@ def parse_serial_sample(line: str, fallback_device_id: str) -> ParsedSample | No
     return None
 
 
-def parse_args() -> UploadConfig:
+def parse_args(argv: list[str] | None = None) -> UploadConfig:
     parser = argparse.ArgumentParser(
         description=(
             "Read RX serial samples and upload one JSON record per sample to a TCP "
@@ -239,8 +275,15 @@ def parse_args() -> UploadConfig:
     parser.add_argument(
         "--scale",
         type=float,
-        default=DEFAULT_SCALE_G,
-        help="Raw to g scale factor. Default: 0.0039",
+        default=None,
+        help=f"Raw to g scale factor. Default is derived from --range-g (4g: {DEFAULT_SCALE_G})",
+    )
+    parser.add_argument(
+        "--range-g",
+        type=int,
+        choices=SUPPORTED_RANGE_G,
+        default=DEFAULT_RANGE_G,
+        help="IIM-42352 accelerometer full-scale range in g. Default: 4",
     )
     parser.add_argument(
         "--base-time",
@@ -281,7 +324,10 @@ def parse_args() -> UploadConfig:
         action="store_true",
         help="Print non-data serial lines for troubleshooting",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    scale = resolved_scale(args)
+    if scale <= 0:
+        raise SystemExit("--scale must be positive")
 
     return UploadConfig(
         serial_port=args.port,
@@ -289,7 +335,8 @@ def parse_args() -> UploadConfig:
         host=args.host,
         server_port=args.server_port,
         device_id=str(args.device_id),
-        scale=args.scale,
+        range_g=int(args.range_g),
+        scale=scale,
         base_time=parse_user_time(args.base_time) if args.base_time else None,
         connect_timeout=args.connect_timeout,
         reconnect_interval=args.reconnect_interval,
@@ -396,6 +443,7 @@ def main() -> int:
     print(f"[info] Serial: {config.serial_port} @ {config.serial_baud}")
     print(f"[info] Server: {config.host}:{config.server_port}")
     print(f"[info] Legacy fallback device id: {config.device_id}")
+    print(f"[info] Range g: {config.range_g}")
     print(f"[info] Scale: {config.scale}")
     if config.base_time is not None:
         print(

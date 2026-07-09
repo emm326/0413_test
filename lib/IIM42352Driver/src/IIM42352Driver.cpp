@@ -113,6 +113,17 @@ bool IIM42352Driver::configureExternalClockAndDataReady() {
   return externalClockConfigured() && dataReadyInt1Configured();
 }
 
+bool IIM42352Driver::restartAccel() {
+  writeRegister(REG_PWR_MGMT0, 0x00);
+  delay(2);
+  configureExternalClockAndDataReady();
+  setRange(range_);
+  setDataRate(dataRate_);
+  writeRegister(REG_PWR_MGMT0, 0x03);
+  delay(20);
+  return externalClockConfigured() && dataReadyInt1Configured();
+}
+
 bool IIM42352Driver::externalClockConfigured() {
   const uint8_t intfConfig1 = readRegister(REG_INTF_CONFIG1);
   const uint8_t intfConfig5 = readBankedRegister(1, REG_BANK1_INTF_CONFIG5);

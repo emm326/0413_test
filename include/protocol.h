@@ -104,6 +104,7 @@ bool encodeControlFrame(uint8_t frameType,
                         uint64_t epochUs,
                         uint32_t param,
                         uint16_t fsHzX10,
+                        uint16_t reserved,
                         uint8_t* outBuffer,
                         size_t outCapacity,
                         size_t& outLength);

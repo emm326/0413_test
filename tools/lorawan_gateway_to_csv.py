@@ -39,7 +39,9 @@ FRAME_TYPE_VIBRATION_RAW = 0x01
 HEADER_STRUCT = struct.Struct("<HBBHHIHBB")
 SAMPLE_STRUCT = struct.Struct("<hhh")
 CRC_SIZE = 2
-DEFAULT_SCALE_G = 0.0039
+DEFAULT_RANGE_G = 4
+SUPPORTED_RANGE_G = (4, 8, 16)
+DEFAULT_SCALE_G = DEFAULT_RANGE_G / 32768.0
 DEFAULT_ROTATE_MINUTES = 30
 DEFAULT_OUTPUT = Path("data")
 EXAMPLES_TEXT = r"""
@@ -363,6 +365,14 @@ def sample_interval_us(sample_index: int, fs_x10: int) -> int:
     return (sample_index * 1_000_000_000 + rate_x1000 // 2) // rate_x1000
 
 
+def scale_for_range_g(range_g: int) -> float:
+    return range_g / 32768.0
+
+
+def resolved_scale(args: argparse.Namespace) -> float:
+    return args.scale if args.scale is not None else scale_for_range_g(args.range_g)
+
+
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -677,14 +687,26 @@ def run_mqtt(
     return 0
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Receive LoRaWAN gateway uplinks and write per-device CSV files.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--rotate-minutes", type=int, default=DEFAULT_ROTATE_MINUTES)
-    parser.add_argument("--scale", type=float, default=DEFAULT_SCALE_G)
+    parser.add_argument(
+        "--range-g",
+        type=int,
+        choices=SUPPORTED_RANGE_G,
+        default=DEFAULT_RANGE_G,
+        help="IIM-42352 accelerometer full-scale range in g. Default: 4",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help=f"Raw to g scale factor. Default is derived from --range-g (4g: {DEFAULT_SCALE_G})",
+    )
     parser.add_argument("--base-time", default="")
     parser.add_argument("--no-header", action="store_true")
     parser.add_argument("--include-id", action="store_true")
@@ -712,7 +734,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print common MQTT/HTTP/TCP/stdin commands and exit",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def input_mode_description(args: argparse.Namespace) -> str:
@@ -754,10 +776,14 @@ def main() -> int:
     if quality_log is None:
         quality_log = args.output / "quality.csv"
 
+    scale = resolved_scale(args)
+    if scale <= 0:
+        raise SystemExit("--scale must be positive")
+
     processor = PacketProcessor(
         output=args.output,
         rotate_minutes=args.rotate_minutes,
-        scale=args.scale,
+        scale=scale,
         base_time=base_time,
         write_header=not args.no_header,
         include_id=args.include_id,
@@ -769,7 +795,8 @@ def main() -> int:
     print(f"[info] Input mode: {input_mode_description(args)}")
     print(f"[info] Output root: {args.output.resolve()}")
     print(f"[info] Rotate minutes: {args.rotate_minutes}")
-    print(f"[info] Data scale: raw * {args.scale}")
+    print(f"[info] Range g: {args.range_g}")
+    print(f"[info] Data scale: raw * {scale}")
     print(f"[info] CSV header: {'on' if not args.no_header else 'off'}")
     print(f"[info] Include device id in data CSV: {'on' if args.include_id else 'off'}")
     print(f"[info] Quality log: {quality_log.resolve() if quality_log is not None else 'off'}")

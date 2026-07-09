@@ -107,6 +107,10 @@
 #define PIN_IIM42352_INT2 -1
 #endif
 
+#ifndef PIN_IIM42352_CLKOUT
+#define PIN_IIM42352_CLKOUT 3
+#endif
+
 #ifndef PIN_GPS_RX
 #define PIN_GPS_RX 5
 #endif

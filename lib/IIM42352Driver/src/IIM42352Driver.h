@@ -53,6 +53,7 @@ class IIM42352Driver {
   void setFullResolution(bool en);
   void setDataRate(DataRate rate);
   bool configureExternalClockAndDataReady();
+  bool restartAccel();
   bool externalClockConfigured();
   bool dataReadyInt1Configured();
   uint8_t readBankedRegister(uint8_t bank, uint8_t reg);

@@ -66,6 +66,8 @@ LEGACY_RE = re.compile(r"^\s*(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 # IIM-42352 default TX firmware uses +-4g full scale: 4g / 32768 counts.
 # Legacy ADXL345 nodes can still use --scale 0.0039.
 DEFAULT_SCALE_G = 0.0001220703125
+DEFAULT_RANGE_G = 4
+SUPPORTED_RANGE_G = (4, 8, 16)
 DEFAULT_DEVICE_ID = "1001"
 DEFAULT_ROTATE_MINUTES = 0
 DEFAULT_START_DELAY_SECONDS = 5.0
@@ -73,8 +75,13 @@ DEFAULT_SAMPLE_RATE_HZ = 100.0
 DEFAULT_SERIAL_BAUD = 460800
 DEFAULT_SERIAL_STARTUP_DELAY_SECONDS = 2.0
 DEFAULT_GAP_FACTOR = 2.0
-DEFAULT_GAP_SAMPLES_PER_PACKET = 37
+DEFAULT_GAP_SAMPLES_PER_PACKET = 24
 DEFAULT_GAP_TOP = 5
+P2P_VIBRATION_HEADER_BYTES = 16
+P2P_ACCEL_RAW_SAMPLE_BYTES = 6
+P2P_CRC_BYTES = 2
+EPOCH_PLAUSIBILITY_PAST_SECONDS = 30.0
+EPOCH_PLAUSIBILITY_FUTURE_SECONDS = 300.0
 SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 EPOCH_US_THRESHOLD = 1_000_000_000_000
 TK_RELAUNCH_ENV = "SERIAL_RX_TO_FILE_TK_RELAUNCHED"
@@ -87,6 +94,7 @@ class CaptureConfig:
     baud: int
     output: Path
     rotate_minutes: int
+    range_g: int
     scale: float
     base_time: datetime | None
     append: bool
@@ -102,6 +110,7 @@ class CaptureConfig:
     gap_factor: float
     gap_samples_per_packet: int
     gap_top: int
+    start_epoch_us: int | None = None
 
 
 @dataclass
@@ -231,6 +240,27 @@ def actual_iim_sample_rate_hz(sample_rate_hz: float) -> float:
     return sample_rate_hz * 1.024
 
 
+def scale_for_range_g(range_g: int) -> float:
+    return range_g / 32768.0
+
+
+def format_range_scale_text(range_g: int) -> str:
+    current = scale_for_range_g(range_g)
+    table = "  ".join(
+        f"+/-{value}g: {scale_for_range_g(value):.12f} g/count"
+        for value in SUPPORTED_RANGE_G
+    )
+    return f"Current +/-{range_g}g = {current:.12f} g/count\n{table}"
+
+
+def resolved_scale(args: argparse.Namespace) -> float:
+    return args.scale if args.scale is not None else scale_for_range_g(args.range_g)
+
+
+def calc_p2p_packet_size_bytes(samples_per_packet: int) -> int:
+    return P2P_VIBRATION_HEADER_BYTES + samples_per_packet * P2P_ACCEL_RAW_SAMPLE_BYTES + P2P_CRC_BYTES
+
+
 def parse_sample_datetime(text: str) -> datetime:
     text = text.strip()
     for fmt in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S"):
@@ -286,11 +316,18 @@ def parse_args() -> CaptureConfig | None:
     parser.add_argument(
         "--scale",
         type=float,
-        default=DEFAULT_SCALE_G,
+        default=None,
         help=(
-            "Raw to g scale factor. Default is IIM-42352 +-4g: "
-            f"{DEFAULT_SCALE_G}. Use 0.0039 for legacy ADXL345 nodes"
+            "Raw to g scale factor. Default is derived from --range-g "
+            f"(4g: {DEFAULT_SCALE_G}). Use 0.0039 for legacy ADXL345 nodes"
         ),
+    )
+    parser.add_argument(
+        "--range-g",
+        type=int,
+        choices=SUPPORTED_RANGE_G,
+        default=DEFAULT_RANGE_G,
+        help="IIM-42352 accelerometer full-scale range in g. Default: 4",
     )
     parser.add_argument(
         "--base-time",
@@ -358,7 +395,11 @@ def parse_args() -> CaptureConfig | None:
         "--samples-per-packet",
         type=int,
         default=DEFAULT_GAP_SAMPLES_PER_PACKET,
-        help="Samples per TX packet for gap packet-loss estimates. Default: 37",
+        help=(
+            "Samples per TX packet for gap packet-loss estimates. "
+            f"Default: {DEFAULT_GAP_SAMPLES_PER_PACKET} "
+            f"(P2P packet {calc_p2p_packet_size_bytes(DEFAULT_GAP_SAMPLES_PER_PACKET)} bytes)"
+        ),
     )
     parser.add_argument(
         "--top-gaps",
@@ -390,7 +431,8 @@ def parse_args() -> CaptureConfig | None:
             baud=args.baud,
             output=Path(args.output) if args.output else Path(),
             rotate_minutes=args.rotate_minutes,
-            scale=args.scale,
+            range_g=int(args.range_g),
+            scale=resolved_scale(args),
             base_time=None,
             append=args.append,
             echo_data=args.echo_data,
@@ -428,7 +470,8 @@ def parse_args() -> CaptureConfig | None:
         baud=args.baud,
         output=Path(args.output),
         rotate_minutes=args.rotate_minutes,
-        scale=args.scale,
+        range_g=int(args.range_g),
+        scale=resolved_scale(args),
         base_time=base_time,
         append=args.append,
         echo_data=args.echo_data,
@@ -668,6 +711,28 @@ def epoch_us_to_datetime(epoch_us: int) -> datetime:
     return datetime.fromtimestamp(epoch_us / 1_000_000)
 
 
+def invalid_epoch_sample_reason(
+    sample_epoch_us: int,
+    start_epoch_us: int | None,
+    now_epoch_us: int | None = None,
+) -> str | None:
+    if now_epoch_us is None:
+        now_epoch_us = int(time.time() * 1_000_000)
+
+    future_limit_us = now_epoch_us + int(EPOCH_PLAUSIBILITY_FUTURE_SECONDS * 1_000_000)
+    if sample_epoch_us > future_limit_us:
+        delta_s = (sample_epoch_us - now_epoch_us) / 1_000_000.0
+        return f"future by {delta_s:.1f}s"
+
+    if start_epoch_us is not None:
+        past_limit_us = start_epoch_us - int(EPOCH_PLAUSIBILITY_PAST_SECONDS * 1_000_000)
+        if sample_epoch_us < past_limit_us:
+            delta_s = (start_epoch_us - sample_epoch_us) / 1_000_000.0
+            return f"before START_AT by {delta_s:.1f}s"
+
+    return None
+
+
 def send_start_at_command(ser: serial.Serial, port: str, config: CaptureConfig, log: Callable[[str], None] | None) -> None:
     if config.serial_startup_delay_seconds > 0:
         emit(
@@ -678,7 +743,11 @@ def send_start_at_command(ser: serial.Serial, port: str, config: CaptureConfig, 
 
     start_epoch_us = int((time.time() + config.start_delay_seconds) * 1_000_000)
     delay_ms = int(config.start_delay_seconds * 1000)
-    command = f"START_AT {start_epoch_us} {config.sample_rate_hz:g} {delay_ms}\n"
+    config.start_epoch_us = start_epoch_us
+    command = (
+        f"START_AT {start_epoch_us} {config.sample_rate_hz:g} "
+        f"{delay_ms} {config.range_g}\n"
+    )
     ser.write(command.encode("ascii"))
     ser.flush()
     emit(
@@ -795,6 +864,18 @@ def read_serial_port(
 
             with anchor_lock:
                 if sample.time_is_epoch_us:
+                    invalid_reason = invalid_epoch_sample_reason(
+                        sample.sensor_ms,
+                        start_epoch_us=config.start_epoch_us if config.send_start_at else None,
+                    )
+                    if invalid_reason is not None:
+                        emit(
+                            f"[warn] {port}: dropped implausible timestamp for device "
+                            f"{sample.device_id}: epoch_us={sample.sensor_ms} "
+                            f"({invalid_reason})",
+                            log,
+                        )
+                        continue
                     sample_time = epoch_us_to_datetime(sample.sensor_ms)
                     reanchored = False
                 else:
@@ -1035,7 +1116,8 @@ def run_gui() -> int:
     baud_var = tk.StringVar(value=str(DEFAULT_SERIAL_BAUD))
     output_var = tk.StringVar(value=str(Path.cwd() / "data"))
     rotate_var = tk.StringVar(value="30")
-    scale_var = tk.StringVar(value=str(DEFAULT_SCALE_G))
+    range_g_var = tk.StringVar(value=str(DEFAULT_RANGE_G))
+    scale_var = tk.StringVar(value=f"{scale_for_range_g(DEFAULT_RANGE_G):.12f}")
     base_time_var = tk.StringVar()
     device_id_var = tk.StringVar(value=DEFAULT_DEVICE_ID)
     start_at_var = tk.BooleanVar(value=True)
@@ -1050,6 +1132,17 @@ def run_gui() -> int:
     include_id_var = tk.BooleanVar(value=False)
     append_var = tk.BooleanVar(value=False)
     echo_var = tk.BooleanVar(value=False)
+    range_scale_text_var = tk.StringVar(value=format_range_scale_text(DEFAULT_RANGE_G))
+
+    def sync_scale_from_range(*_args: object) -> None:
+        try:
+            range_g = int(range_g_var.get())
+            scale_var.set(f"{scale_for_range_g(range_g):.12f}")
+            range_scale_text_var.set(format_range_scale_text(range_g))
+        except ValueError:
+            pass
+
+    range_g_var.trace_add("write", sync_scale_from_range)
 
     def append_log(message: str) -> None:
         log_text.configure(state="normal")
@@ -1100,6 +1193,7 @@ def run_gui() -> int:
         try:
             baud = int(baud_var.get().strip())
             rotate_minutes = int(rotate_var.get().strip())
+            range_g = int(range_g_var.get().strip())
             scale = float(scale_var.get().strip())
             start_delay_seconds = float(start_delay_var.get().strip())
             sample_rate_hz = float(sample_rate_var.get().strip())
@@ -1110,6 +1204,10 @@ def run_gui() -> int:
 
         if rotate_minutes < 0:
             messagebox.showerror("Invalid option", "Rotation minutes must be 0 or greater")
+            return None
+        if range_g not in SUPPORTED_RANGE_G:
+            allowed = ", ".join(str(value) for value in SUPPORTED_RANGE_G)
+            messagebox.showerror("Invalid range", f"Range g must be one of: {allowed}")
             return None
         if start_delay_seconds <= 0 or sample_rate_hz <= 0 or serial_startup_delay_seconds < 0:
             messagebox.showerror(
@@ -1145,6 +1243,7 @@ def run_gui() -> int:
             baud=baud,
             output=output_path,
             rotate_minutes=rotate_minutes,
+            range_g=range_g,
             scale=scale,
             base_time=base_time,
             append=append_var.get(),
@@ -1287,48 +1386,63 @@ def run_gui() -> int:
     )
     rotate_combo.grid(row=2, column=1, sticky="ew", pady=4)
 
-    ttk.Label(form, text="Scale").grid(row=2, column=2, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(form, textvariable=scale_var, width=12).grid(row=2, column=3, sticky="ew", pady=4)
+    ttk.Label(form, text="Range g").grid(row=2, column=2, sticky="w", padx=(8, 8), pady=4)
+    ttk.Combobox(
+        form,
+        textvariable=range_g_var,
+        values=tuple(str(value) for value in SUPPORTED_RANGE_G),
+        width=8,
+    ).grid(row=2, column=3, sticky="ew", pady=4)
 
     ttk.Label(form, text="Legacy ID").grid(row=2, column=4, sticky="w", padx=(8, 8), pady=4)
     ttk.Entry(form, textvariable=device_id_var, width=10).grid(row=2, column=5, sticky="ew", pady=4)
 
     ttk.Label(form, text="Base Time").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(form, textvariable=base_time_var).grid(row=3, column=1, columnspan=5, sticky="ew", pady=4)
+    ttk.Entry(form, textvariable=base_time_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=4)
+    ttk.Label(form, text="Scale").grid(row=3, column=4, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=scale_var, width=12).grid(row=3, column=5, sticky="ew", pady=4)
 
-    ttk.Checkbutton(form, text="Send START_AT", variable=start_at_var).grid(row=4, column=0, sticky="w", pady=4)
-    ttk.Label(form, text="Start Delay s").grid(row=4, column=1, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(form, textvariable=start_delay_var, width=10).grid(row=4, column=2, sticky="ew", pady=4)
-    ttk.Label(form, text="Sample Hz").grid(row=4, column=3, sticky="w", padx=(8, 8), pady=4)
+    ttk.Label(form, textvariable=range_scale_text_var, foreground="#444").grid(
+        row=4,
+        column=0,
+        columnspan=6,
+        sticky="w",
+        pady=(4, 0),
+    )
+
+    ttk.Checkbutton(form, text="Send START_AT", variable=start_at_var).grid(row=5, column=0, sticky="w", pady=4)
+    ttk.Label(form, text="Start Delay s").grid(row=5, column=1, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=start_delay_var, width=10).grid(row=5, column=2, sticky="ew", pady=4)
+    ttk.Label(form, text="Sample Hz").grid(row=5, column=3, sticky="w", padx=(8, 8), pady=4)
     sample_rate_combo = ttk.Combobox(
         form,
         textvariable=sample_rate_var,
         values=tuple(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ),
         width=10,
     )
-    sample_rate_combo.grid(row=4, column=4, sticky="ew", pady=4)
-    ttk.Label(form, text="Boot Wait s").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(form, textvariable=serial_startup_delay_var, width=8).grid(row=5, column=1, sticky="ew", pady=4)
+    sample_rate_combo.grid(row=5, column=4, sticky="ew", pady=4)
+    ttk.Label(form, text="Boot Wait s").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(form, textvariable=serial_startup_delay_var, width=8).grid(row=6, column=1, sticky="ew", pady=4)
 
-    ttk.Label(form, text="CSV Gap Files").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(form, textvariable=gap_files_var).grid(row=6, column=1, columnspan=3, sticky="ew", pady=4)
+    ttk.Label(form, text="CSV Gap Files").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_files_var).grid(row=7, column=1, columnspan=3, sticky="ew", pady=4)
     choose_gap_files_button = ttk.Button(form, text="Choose CSVs", command=choose_gap_files)
-    choose_gap_files_button.grid(row=6, column=4, sticky="ew", padx=(8, 0), pady=4)
+    choose_gap_files_button.grid(row=7, column=4, sticky="ew", padx=(8, 0), pady=4)
     analyze_gaps_button = ttk.Button(form, text="Analyze Gaps", command=analyze_selected_gap_files)
-    analyze_gaps_button.grid(row=6, column=5, sticky="ew", padx=(8, 0), pady=4)
+    analyze_gaps_button.grid(row=7, column=5, sticky="ew", padx=(8, 0), pady=4)
 
-    ttk.Label(form, text="Analyze Hz").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Label(form, text="Analyze Hz").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
     gap_sample_rate_combo = ttk.Combobox(
         form,
         textvariable=gap_sample_rate_var,
         values=tuple(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ),
         width=8,
     )
-    gap_sample_rate_combo.grid(row=7, column=1, sticky="ew", pady=4)
-    ttk.Label(form, text="Samples/Packet").grid(row=7, column=2, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(form, textvariable=gap_samples_per_packet_var, width=8).grid(row=7, column=3, sticky="ew", pady=4)
-    ttk.Label(form, text="Top Gaps").grid(row=7, column=4, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(form, textvariable=gap_top_var, width=8).grid(row=7, column=5, sticky="ew", pady=4)
+    gap_sample_rate_combo.grid(row=8, column=1, sticky="ew", pady=4)
+    ttk.Label(form, text="Samples/Packet").grid(row=8, column=2, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_samples_per_packet_var, width=8).grid(row=8, column=3, sticky="ew", pady=4)
+    ttk.Label(form, text="Top Gaps").grid(row=8, column=4, sticky="w", padx=(8, 8), pady=4)
+    ttk.Entry(form, textvariable=gap_top_var, width=8).grid(row=8, column=5, sticky="ew", pady=4)
 
     options = ttk.Frame(root, padding=(12, 0, 12, 8))
     options.grid(row=1, column=0, sticky="ew")

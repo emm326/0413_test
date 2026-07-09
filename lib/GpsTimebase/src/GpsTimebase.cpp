@@ -1,5 +1,6 @@
 ﻿#include "GpsTimebase.h"
 
+#include <esp_timer.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,10 +16,16 @@ GpsTimebase::GpsTimebase(HardwareSerial& serial)
       lastNmeaEpochUs_(0),
       lastNmeaLocalMs_(0),
       lastPpsEpochUs_(0),
+      lastMappedPpsLocalUs64_(0),
+      lastMappedPpsLocalUs_(0),
+      lastMappedPpsLocalMs_(0),
+      lastPpsLocalUs64_(0),
       lastPpsLocalUs_(0),
       lastPpsIntervalUs_(0),
       ppsCount_(0),
-      consumedPpsCount_(0) {}
+      consumedPpsCount_(0),
+      ppsBadCount_(0),
+      localTimerJumpCount_(0) {}
 
 bool GpsTimebase::begin(int8_t rxPin, int8_t txPin, int8_t ppsPin, uint32_t baud) {
   ppsPin_ = ppsPin;
@@ -57,9 +64,11 @@ void GpsTimebase::update() {
   }
 
   uint32_t ppsCount = 0;
+  uint64_t ppsLocalUs64 = 0;
   uint32_t ppsLocalUs = 0;
   noInterrupts();
   ppsCount = ppsCount_;
+  ppsLocalUs64 = lastPpsLocalUs64_;
   ppsLocalUs = lastPpsLocalUs_;
   interrupts();
 
@@ -73,8 +82,14 @@ void GpsTimebase::update() {
   }
 
   const uint64_t nmeaSec = lastNmeaEpochUs_ / 1000000ULL;
-  lastPpsEpochUs_ = (nmeaSec + 1ULL) * 1000000ULL;
-  lastPpsLocalUs_ = ppsLocalUs;
+  const uint64_t candidatePpsEpochUs = (nmeaSec + 1ULL) * 1000000ULL;
+  if (lastPpsEpochUs_ != 0 && candidatePpsEpochUs <= lastPpsEpochUs_) {
+    return;
+  }
+  lastPpsEpochUs_ = candidatePpsEpochUs;
+  lastMappedPpsLocalUs64_ = ppsLocalUs64;
+  lastMappedPpsLocalUs_ = ppsLocalUs;
+  lastMappedPpsLocalMs_ = millis();
   timeValid_ = true;
 }
 
@@ -84,28 +99,96 @@ bool GpsTimebase::ppsValid() const { return ppsCount_ >= 2 && lastPpsIntervalUs_
 
 bool GpsTimebase::timeValid() const { return timeValid_ && fixValid() && ppsValid(); }
 
-bool GpsTimebase::localMicrosForEpoch(uint64_t targetEpochUs, uint32_t& outLocalUs) const {
-  if (!timeValid() || lastPpsEpochUs_ == 0) {
+bool GpsTimebase::healthy() const { return timeValid() && timebaseAgeMs() <= 3000UL; }
+
+bool GpsTimebase::localMicrosForEpoch(uint64_t targetEpochUs, uint64_t& outLocalUs) const {
+  if (!timeValid() || lastPpsEpochUs_ == 0 || lastMappedPpsLocalUs64_ == 0) {
     return false;
   }
 
-  if (targetEpochUs <= lastPpsEpochUs_) {
-    outLocalUs = micros();
-    return true;
-  }
-
-  const uint64_t deltaUs = targetEpochUs - lastPpsEpochUs_;
-  if (deltaUs > 0x7FFFFFFFULL) {
+  const int64_t deltaUs =
+      static_cast<int64_t>(targetEpochUs) - static_cast<int64_t>(lastPpsEpochUs_);
+  if (deltaUs < 0 && static_cast<uint64_t>(-deltaUs) > lastMappedPpsLocalUs64_) {
     return false;
   }
 
-  outLocalUs = lastPpsLocalUs_ + static_cast<uint32_t>(deltaUs);
+  outLocalUs = static_cast<uint64_t>(static_cast<int64_t>(lastMappedPpsLocalUs64_) + deltaUs);
   return true;
+}
+
+bool GpsTimebase::localMicrosForEpoch(uint64_t targetEpochUs, uint32_t& outLocalUs) const {
+  uint64_t localUs64 = 0;
+  if (!localMicrosForEpoch(targetEpochUs, localUs64)) {
+    return false;
+  }
+  outLocalUs = static_cast<uint32_t>(localUs64);
+  return true;
+}
+
+bool GpsTimebase::localMicrosToEpoch(uint64_t localUs, uint64_t& outEpochUs) const {
+  outEpochUs = 0;
+  if (!timeValid() || lastPpsEpochUs_ == 0 || lastMappedPpsLocalUs64_ == 0) {
+    return false;
+  }
+
+  const int64_t deltaUs =
+      static_cast<int64_t>(localUs) - static_cast<int64_t>(lastMappedPpsLocalUs64_);
+  const int64_t epochUs = lastPpsEpochUs_ + deltaUs;
+  if (epochUs < 0) {
+    return false;
+  }
+
+  outEpochUs = static_cast<uint64_t>(epochUs);
+  return true;
+}
+
+bool GpsTimebase::localMicrosToEpoch(uint32_t localUs, uint64_t& outEpochUs) const {
+  if (!timeValid() || lastMappedPpsLocalUs64_ == 0) {
+    return false;
+  }
+  const uint64_t base = lastMappedPpsLocalUs64_ & 0xFFFFFFFF00000000ULL;
+  uint64_t localUs64 = base | static_cast<uint64_t>(localUs);
+  const uint64_t previousCandidate =
+      base >= 0x100000000ULL ? (base - 0x100000000ULL) | static_cast<uint64_t>(localUs) : localUs64;
+  const uint64_t nextCandidate =
+      (base + 0x100000000ULL) | static_cast<uint64_t>(localUs);
+  uint64_t bestDistance =
+      localUs64 > lastMappedPpsLocalUs64_ ? localUs64 - lastMappedPpsLocalUs64_
+                                          : lastMappedPpsLocalUs64_ - localUs64;
+  const uint64_t previousDistance =
+      previousCandidate > lastMappedPpsLocalUs64_ ? previousCandidate - lastMappedPpsLocalUs64_
+                                                  : lastMappedPpsLocalUs64_ - previousCandidate;
+  if (previousDistance < bestDistance) {
+    localUs64 = previousCandidate;
+    bestDistance = previousDistance;
+  }
+  const uint64_t nextDistance =
+      nextCandidate > lastMappedPpsLocalUs64_ ? nextCandidate - lastMappedPpsLocalUs64_
+                                              : lastMappedPpsLocalUs64_ - nextCandidate;
+  if (nextDistance < bestDistance) {
+    localUs64 = nextCandidate;
+  }
+  return localMicrosToEpoch(localUs64, outEpochUs);
 }
 
 uint64_t GpsTimebase::epochUsAtLastPps() const { return lastPpsEpochUs_; }
 
+uint32_t GpsTimebase::localUsAtLastPps() const { return lastMappedPpsLocalUs_; }
+
+uint64_t GpsTimebase::localUs64AtLastPps() const { return lastMappedPpsLocalUs64_; }
+
 uint32_t GpsTimebase::ppsIntervalUs() const { return lastPpsIntervalUs_; }
+
+uint32_t GpsTimebase::timebaseAgeMs() const {
+  if (!timeValid_ || lastMappedPpsLocalMs_ == 0) {
+    return UINT32_MAX;
+  }
+  return millis() - lastMappedPpsLocalMs_;
+}
+
+uint32_t GpsTimebase::ppsBadCount() const { return ppsBadCount_; }
+
+uint32_t GpsTimebase::localTimerJumpCount() const { return localTimerJumpCount_; }
 
 void IRAM_ATTR GpsTimebase::onPpsThunk() {
   if (activeInstance_ != nullptr) {
@@ -114,10 +197,21 @@ void IRAM_ATTR GpsTimebase::onPpsThunk() {
 }
 
 void IRAM_ATTR GpsTimebase::handlePpsIsr() {
-  const uint32_t nowUs = micros();
-  if (lastPpsLocalUs_ != 0) {
-    lastPpsIntervalUs_ = nowUs - lastPpsLocalUs_;
+  const uint64_t nowUs64 = static_cast<uint64_t>(esp_timer_get_time());
+  const uint32_t nowUs = static_cast<uint32_t>(nowUs64);
+  if (lastPpsLocalUs64_ != 0) {
+    const uint64_t intervalUs64 = nowUs64 - lastPpsLocalUs64_;
+    if (intervalUs64 > UINT32_MAX) {
+      ++localTimerJumpCount_;
+      lastPpsIntervalUs_ = UINT32_MAX;
+    } else {
+      lastPpsIntervalUs_ = static_cast<uint32_t>(intervalUs64);
+      if (lastPpsIntervalUs_ <= 900000UL || lastPpsIntervalUs_ >= 1100000UL) {
+        ++ppsBadCount_;
+      }
+    }
   }
+  lastPpsLocalUs64_ = nowUs64;
   lastPpsLocalUs_ = nowUs;
   ++ppsCount_;
 }
