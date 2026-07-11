@@ -77,11 +77,16 @@ class GpsPeriodicTimebaseTest(unittest.TestCase):
         self.assertIn("#if defined(APP_TX_USB_STREAM_TEST)", send_batch_fn)
         self.assertIn("sampleTimestampBuffer[i]", send_batch_fn)
         self.assertIn("gpsTimebase.localMicrosToEpoch(sampleTimestampBuffer[i], sampleEpochUs)", send_batch_fn)
-        self.assertIn("#elif defined(APP_LORAWAN_TX)", send_batch_fn)
+        self.assertIn("const bool queued =", send_batch_fn)
 
+        usb_start = send_batch_fn.index(
+            "#if defined(APP_TX_USB_STREAM_TEST)",
+            send_batch_fn.index("Protocol::encodePacket"),
+        )
+        p2p_marker = "#else\n  const bool queued ="
         usb_branch = send_batch_fn[
-            send_batch_fn.index("#if defined(APP_TX_USB_STREAM_TEST)") :
-            send_batch_fn.index("#elif defined(APP_LORAWAN_TX)")
+            usb_start:
+            send_batch_fn.index(p2p_marker)
         ]
         self.assertNotIn("txBatchStartOffsetUs", usb_branch)
         self.assertNotIn("batchStartUs - txRunStartLocalUs", usb_branch)

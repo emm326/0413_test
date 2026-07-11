@@ -33,7 +33,7 @@ raw Analyze time error 的 nearest_mean_ms / nearest_p95_ms 是否降到 1ms 左
 
 如果 raw 误差仍明显大于 1ms，说明 ESP32 本地生成 32768Hz 还不能满足导师要求的硬件同步精度，下一步应改为外接 GPS 锁定 32768Hz 时钟或公共时钟分配小板。
 
-当前工程默认切换到 P2P GPS/PPS 同步方案。LoRaWAN 代码和环境仍保留在工程中，但默认不构建。
+当前工程使用 P2P GPS/PPS 同步方案。
 
 ## 项目目标
 
@@ -172,7 +172,7 @@ heltec_wifi_lora_32_V3_iim_gps_tx_1002_usb_gps_sync_test
 
 用于验证 TX USB 输出也落在 GPS/UTC 统一时间轴上，必须等待 GPS/PPS 稳定。
 
-旧 P2P ADXL345 环境和 LoRaWAN 环境仍在 `platformio.ini` 中保留，用于回退测试。
+旧 P2P ADXL345 环境仍在 `platformio.ini` 中保留，用于回退测试。
 
 ## 接线
 

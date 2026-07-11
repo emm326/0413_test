@@ -6,8 +6,7 @@
 
 本工程现在同时保留两条通信路线：
 
-- 原始 P2P LoRa 路线：`多个 TX -> 一个 HTIT-WB32LA RX -> 电脑串口 -> CSV`
-- LoRaWAN 路线：`TX -> LoRaWAN 网关 -> LoRaWAN 服务端 -> 电脑脚本 -> CSV`
+- P2P LoRa 路线：`多个 TX -> 一个 HTIT-WB32LA RX -> 电脑串口 -> CSV`
 
 本次新增和推荐使用的是第一条 P2P 路线，适合“不使用网关设备，只用 HTIT-WB32LA 接收端”的场景。
 
@@ -154,7 +153,7 @@ docs/p2p_polling_ack_start_anchor_usage.md
 - 最多 10 块 HTIT-WB32LA 作为 TX。
 - 1 台电脑运行串口采集脚本。
 
-适合现场没有 LoRaWAN 网关、只想快速建立多节点采集系统的场景。
+适合只使用 HTIT-WB32LA 接收端快速建立多节点采集系统的场景。
 
 ### 4.2 设备编号清晰
 
@@ -370,7 +369,6 @@ python -m py_compile tools\serial_rx_to_file.py
 pio run -e heltec_wifi_lora_32_V3_rx
 pio run -e heltec_wifi_lora_32_V3_tx_1001
 pio run -e heltec_wifi_lora_32_V3_tx_1010
-pio run -e heltec_wifi_lora_32_V3_lorawan_tx_1001
 ```
 
 结果均已通过。
@@ -427,5 +425,4 @@ python tools\serial_rx_to_file.py --port COM6 --output data --rotate-minutes 30 
 2. 给电脑端 CSV 增加 `quality.csv`，记录每个设备 ACK、超时、重发和队列状态。
 3. 增加 SD 卡缓存，解决高采样率下 RAM 队列容量不足问题。
 4. 根据实测数据调整 `P2P_POLL_RESPONSE_TIMEOUT_MS`。
-5. 如果 10 节点 100/200 Hz 必须实时完整传输，考虑多 RX 分组或重新使用 LoRaWAN 网关。
-
+5. 如果 10 节点 100/200 Hz 必须实时完整传输，考虑多 RX 分组或增加本地缓存。

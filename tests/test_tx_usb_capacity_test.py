@@ -1,7 +1,12 @@
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.tx_usb_capacity_test import (
     DEFAULT_BAUD,
@@ -17,6 +22,7 @@ from tools.tx_usb_capacity_test import (
     find_python_with_tkinter,
     format_range_scale_text,
     format_tkinter_missing_message,
+    gui_defaults_for_profile,
     indoor_cayd_gui_defaults,
     parse_args,
     parse_device_ids,
@@ -24,6 +30,7 @@ from tools.tx_usb_capacity_test import (
     parse_tx_usb_line,
     format_report_lines,
     scale_for_range_g,
+    usb_gps_sync_gui_defaults,
     validate_capture_args,
     write_sample_csv,
 )
@@ -303,10 +310,36 @@ class TxUsbCapacityTest(unittest.TestCase):
         self.assertIn("CSV timebase=raw", defaults.firmware_note)
         self.assertIn("data_mems_cayd_no_gps_16g", defaults.firmware_note)
 
+    def test_usb_gps_sync_gui_defaults_use_current_com_ports(self):
+        defaults = usb_gps_sync_gui_defaults()
+
+        self.assertEqual(defaults.ports, "COM6,COM12")
+        self.assertEqual(defaults.device_ids, "1001,1002")
+        self.assertEqual(defaults.baud, DEFAULT_BAUD)
+        self.assertEqual(defaults.sample_rate_hz, 50.0)
+        self.assertEqual(defaults.range_g, 4)
+        self.assertAlmostEqual(defaults.scale, 4 / 32768.0)
+        self.assertEqual(defaults.duration_seconds, 60.0)
+        self.assertEqual(defaults.start_delay_seconds, 5.0)
+        self.assertEqual(defaults.serial_startup_delay_seconds, 2.0)
+        self.assertTrue(defaults.gps_sync)
+        self.assertEqual(defaults.csv_timebase, "raw")
+        self.assertEqual(defaults.output, Path("data1"))
+        self.assertIn("usb_gps_sync_test", defaults.firmware_note)
+        self.assertIn("COM6->1001", defaults.firmware_note)
+        self.assertIn("COM12->1002", defaults.firmware_note)
+        self.assertIn("GPS sync=on", defaults.firmware_note)
+
+    def test_gui_defaults_profile_selects_usb_gps_by_default(self):
+        self.assertEqual(gui_defaults_for_profile(None).ports, "COM6,COM12")
+        self.assertEqual(gui_defaults_for_profile("usb-gps-sync").ports, "COM6,COM12")
+        self.assertEqual(gui_defaults_for_profile("indoor-cayd").ports, "COM6,COM16")
+
     def test_no_args_defaults_to_gui_mode(self):
         args = parse_args([])
 
         self.assertTrue(args.gui)
+        self.assertEqual(args.gui_profile, "usb-gps-sync")
         self.assertEqual(args.baud, DEFAULT_BAUD)
         self.assertTrue(args.gps_sync)
         self.assertEqual(resolve_csv_timebase(args), "raw")
@@ -511,7 +544,7 @@ class TxUsbCapacityTest(unittest.TestCase):
 
         self.assertIn("csv_timebase=raw", report)
         self.assertIn('meaning="raw GPS-calibrated INT1 edge time error"', report)
-        self.assertIn("nearest_max_ms=5.000", report)
+        self.assertIn("max_abs_ms=5.000", report)
 
     def test_find_python_with_tkinter_skips_current_and_picks_working_candidate(self):
         calls = []

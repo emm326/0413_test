@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="830" viewBox="0 0 1120 830" role="img" aria-labelledby="title desc">
+  <title id="title">09-20260709 sensor synchronization timing</title>
+  <desc id="desc">GPS PPS is an absolute UTC second marker. IIM samples are continuous 51.2 Hz edges derived from the DS3231 clock. Each sample is timestamped to UTC by mapping local INT1 or reconstructed FIFO timing through the latest PPS mapping.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 z" fill="#333333"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { font: 700 24px Arial, sans-serif; fill: #202124; }
+      .subtitle { font: 400 15px Arial, sans-serif; fill: #4b5563; }
+      .label { font: 400 15px Arial, sans-serif; fill: #202124; }
+      .small { font: 400 13px Arial, sans-serif; fill: #4b5563; }
+      .tiny { font: 400 12px Arial, sans-serif; fill: #4b5563; }
+      .axis { stroke: #374151; stroke-width: 2; }
+      .pps { stroke: #d32f2f; stroke-width: 3; }
+      .node-a { stroke: #1976d2; fill: #1976d2; }
+      .node-b { stroke: #2e7d32; fill: #2e7d32; }
+      .soft-a { fill: #e3f2fd; stroke: #1976d2; }
+      .soft-b { fill: #e8f5e9; stroke: #2e7d32; }
+      .soft-r { fill: #ffebee; stroke: #d32f2f; }
+      .soft-g { fill: #f3f4f6; stroke: #9ca3af; }
+      .wire { stroke: #6b7280; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 6 5; }
+      .box { rx: 8; ry: 8; stroke-width: 1.4; }
+      .sample-line { stroke: #94a3b8; stroke-width: 1; }
+      .window { fill: #fff7ed; stroke: #f59e0b; stroke-width: 1.4; stroke-dasharray: 5 5; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1120" height="690"/>
+  <text x="40" y="42" class="title">09-20260709 版本：PPS 绝对时间戳同步，而不是 PPS 上采样</text>
+  <text x="40" y="68" class="subtitle">PPS 可以落在两个 IIM 样本之间；代码把每个样本沿换算成 UTC 微秒，之后按时间戳对齐。</text>
+
+  <g transform="translate(40,100)">
+    <rect x="0" y="0" width="1040" height="130" class="box soft-g"/>
+    <text x="18" y="28" class="label">硬件/代码数据流</text>
+    <rect x="20" y="50" width="145" height="52" class="box soft-r"/>
+    <text x="36" y="73" class="label">GPS LC76G</text>
+    <text x="36" y="93" class="small">PPS + RMC UTC</text>
+    <rect x="240" y="50" width="150" height="52" class="box soft-g"/>
+    <text x="260" y="73" class="label">GpsTimebase</text>
+    <text x="260" y="93" class="small">PPS local ↔ UTC</text>
+    <rect x="465" y="50" width="155" height="52" class="box soft-a"/>
+    <text x="486" y="73" class="label">IIM-42352</text>
+    <text x="486" y="93" class="small">51.2 Hz continuous</text>
+    <rect x="695" y="50" width="145" height="52" class="box soft-g"/>
+    <text x="715" y="73" class="label">INT1/FIFO</text>
+    <text x="715" y="93" class="small">local sample time</text>
+    <rect x="900" y="50" width="120" height="52" class="box soft-b"/>
+    <text x="920" y="73" class="label">CSV/RX</text>
+    <text x="920" y="93" class="small">UTC epoch_us</text>
+    <path d="M165,76 L240,76" class="wire"/>
+    <path d="M390,76 L465,76" class="wire"/>
+    <path d="M620,76 L695,76" class="wire"/>
+    <path d="M840,76 L900,76" class="wire"/>
+    <text x="410" y="42" class="small">DS3231 32K -> IIM CLKIN</text>
+  </g>
+
+  <g transform="translate(70,285)">
+    <text x="0" y="-28" class="label">单节点时间轴：PPS 位于两个样本之间是正常的</text>
+    <line x1="0" y1="80" x2="960" y2="80" class="axis"/>
+    <line x1="520" y1="18" x2="520" y2="138" class="pps"/>
+    <polygon points="520,12 512,28 528,28" fill="#d32f2f"/>
+    <text x="482" y="160" class="label">GPS 1PPS</text>
+    <text x="474" y="180" class="small">T_pps = 1.000000 s</text>
+
+    <rect x="412" y="28" width="214" height="104" class="window"/>
+    <text x="424" y="50" class="small">PPS 周围的样本窗口</text>
+
+    <g>
+      <line x1="190" y1="60" x2="190" y2="100" class="sample-line"/>
+      <circle cx="190" cy="80" r="7" class="node-a"/>
+      <text x="166" y="118" class="small">0.9375s</text>
+      <text x="170" y="42" class="tiny">样本0</text>
+    </g>
+    <g>
+      <line x1="300" y1="60" x2="300" y2="100" class="sample-line"/>
+      <circle cx="300" cy="80" r="7" class="node-a"/>
+      <text x="276" y="118" class="small">0.9570s</text>
+      <text x="280" y="42" class="tiny">样本1</text>
+    </g>
+    <g>
+      <line x1="410" y1="60" x2="410" y2="100" class="sample-line"/>
+      <circle cx="410" cy="80" r="7" class="node-a"/>
+      <text x="386" y="118" class="small">0.9766s</text>
+      <text x="390" y="42" class="tiny">样本2</text>
+    </g>
+    <g>
+      <line x1="500" y1="60" x2="500" y2="100" class="sample-line"/>
+      <circle cx="500" cy="80" r="7" class="node-a"/>
+      <text x="476" y="118" class="small">0.9961s</text>
+      <text x="480" y="42" class="tiny">样本3</text>
+    </g>
+    <g>
+      <line x1="610" y1="60" x2="610" y2="100" class="sample-line"/>
+      <circle cx="610" cy="80" r="7" class="node-a"/>
+      <text x="586" y="118" class="small">1.0156s</text>
+      <text x="590" y="42" class="tiny">样本4</text>
+    </g>
+    <path d="M500,34 C510,15 530,15 540,34" fill="none" stroke="#d32f2f" stroke-width="1.6" marker-end="url(#arrow)"/>
+    <text x="555" y="34" class="small">PPS 不一定等于采样点</text>
+  </g>
+
+  <g transform="translate(70,500)">
+    <text x="0" y="-28" class="label">双节点对齐：比较 UTC 时间戳，而不是比较无线到达时间</text>
+    <line x1="0" y1="60" x2="960" y2="60" class="axis"/>
+    <line x1="520" y1="4" x2="520" y2="134" class="pps"/>
+    <text x="482" y="154" class="label">同一个 UTC 秒</text>
+
+    <text x="0" y="20" class="small">节点 A</text>
+    <circle cx="500" cy="60" r="7" class="node-a"/>
+    <text x="454" y="88" class="small">A: 0.9961s</text>
+    <circle cx="610" cy="60" r="7" class="node-a"/>
+    <text x="578" y="88" class="small">A: 1.0156s</text>
+
+    <text x="0" y="112" class="small">节点 B</text>
+    <line x1="0" y1="120" x2="960" y2="120" class="axis"/>
+    <circle cx="488" cy="120" r="7" class="node-b"/>
+    <text x="438" y="148" class="small">B: 0.9938s</text>
+    <circle cx="598" cy="120" r="7" class="node-b"/>
+    <text x="566" y="148" class="small">B: 1.0133s</text>
+
+    <path d="M500,60 L520,60" class="wire dash"/>
+    <path d="M488,120 L520,120" class="wire dash"/>
+    <text x="640" y="36" class="small">后处理/网关按 epoch_us 找最近样本或插值</text>
+    <text x="640" y="56" class="small">同步精度取决于 PPS 映射、INT1 捕获、FIFO 反推和两节点采样相位</text>
+  </g>
+
+  <g transform="translate(70,690)">
+    <rect x="0" y="0" width="960" height="105" class="box soft-g"/>
+    <text x="18" y="27" class="label">简化后处理：原始双节点时间戳 -> 公共 UTC 网格 -> 对齐数据</text>
+    <rect x="25" y="47" width="205" height="40" class="box soft-a"/>
+    <text x="44" y="72" class="small">节点 A/B 四列原始 CSV</text>
+    <rect x="365" y="47" width="220" height="40" class="box window"/>
+    <text x="390" y="72" class="small">51.2 Hz UTC 公共网格</text>
+    <rect x="720" y="47" width="210" height="40" class="box soft-b"/>
+    <text x="747" y="72" class="small">aligned_common_grid.csv</text>
+    <path d="M230,67 L365,67" class="wire"/>
+    <path d="M585,67 L720,67" class="wire"/>
+    <text x="248" y="52" class="tiny">一对一误差统计</text>
+    <text x="605" y="52" class="tiny">相邻样本线性插值</text>
+  </g>
+</svg>

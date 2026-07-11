@@ -23,9 +23,6 @@ using SensorDriver = ADXL345Driver;
 #include "board_pins.h"
 #include "config.h"
 #include "lora_transport.h"
-#if defined(APP_LORAWAN_TX)
-#include "lorawan_transport.h"
-#endif
 #include "protocol.h"
 
 #if !defined(APP_IIM42352_INT1_INPUT_PULLUP_VALUE)
@@ -497,19 +494,11 @@ uint64_t alignStartEpochToGpsSecond(uint64_t requestedEpochUs) {
 }
 
 bool txTimestampBeforeRunStart(uint32_t timestampUs) {
-#if defined(APP_LORAWAN_TX)
-  (void)timestampUs;
-  return false;
-#else
   return txRunArmed && static_cast<int32_t>(timestampUs - txRunStartLocalUs) < 0;
-#endif
 }
 
 bool txBatchStartOffsetUs(uint32_t batchStartUs, uint32_t& outOffsetUs) {
-#if defined(APP_LORAWAN_TX)
-  outOffsetUs = batchStartUs;
-  return true;
-#elif defined(APP_REQUIRE_GPS_TIMEBASE)
+#if defined(APP_REQUIRE_GPS_TIMEBASE)
   uint64_t sampleEpochUs = 0;
   if (!gpsTimebase.localMicrosToEpoch(batchStartUs, sampleEpochUs)) {
     return false;
@@ -600,9 +589,7 @@ void markDisplayDirty() { displayDirty = true; }
 
 void printRoleInfo() {
 #if defined(ROLE_TX)
-#if defined(APP_LORAWAN_TX)
-  Serial.println("ROLE=TX_LORAWAN");
-#elif defined(APP_TX_USB_STREAM_TEST)
+#if defined(APP_TX_USB_STREAM_TEST)
   Serial.println("ROLE=TX_USB_STREAM_TEST");
 #else
   Serial.println("ROLE=TX");
@@ -621,7 +608,7 @@ void printRoleInfo() {
 #else
   Serial.println("USB stream timebase=PC_START_AT");
 #endif
-#elif !defined(APP_LORAWAN_TX)
+#else
   Serial.printf("P2P cfg: nodes=%u,burst=%u,queue=%u,packet_samples=%u\r\n",
                 AppConfig::P2P_NODE_COUNT,
                 p2pBurstPacketsPerNode(),
@@ -932,11 +919,6 @@ void drawTxScreen() {
                 AppConfig::MAX_SAMPLES_PER_PACKET);
     if (overloadActive()) {
       oled.printf("OVERLOAD\r\n");
-#if defined(APP_LORAWAN_TX)
-    } else {
-      oled.printf("RADIO READY\r\n");
-    }
-#else
 #if defined(APP_SENSOR_IIM42352)
     } else if (!txTimebaseReady()) {
       oled.printf("WAIT GPS/PPS\r\n");
@@ -950,7 +932,6 @@ void drawTxScreen() {
     } else {
       oled.printf("RADIO READY\r\n");
     }
-#endif
     oled.printf("Click: Menu\r\n");
     oled.printf("Hold in menu\r\n");
   }
@@ -1031,8 +1012,6 @@ void showBootScreen() {
               experimentalTag(activeRateProfile()));
 #if defined(APP_TX_USB_STREAM_TEST)
   oled.printf("USB STREAM\r\n");
-#elif defined(APP_LORAWAN_TX)
-  oled.printf("LoRaWAN CN470\r\n");
 #else
   oled.printf("LoRa %.1f MHz\r\n", AppConfig::LORA_FREQUENCY_MHZ);
 #endif
@@ -1260,18 +1239,6 @@ void updateGpsTimebase() {}
 #endif
 
 bool initLoRa() {
-#if defined(APP_LORAWAN_TX)
-  if (!LoRaWanTransport::begin()) {
-    Serial.printf("LoRaWAN init failed: %s (%d)\r\n",
-                  LoRaWanTransport::stateToString(LoRaWanTransport::lastState()),
-                  LoRaWanTransport::lastState());
-    return false;
-  }
-
-  Serial.println("LoRaWAN init ok");
-  LoRaWanTransport::printConfig(Serial);
-  return true;
-#else
   if (!LoRaTransport::begin()) {
     Serial.println("LoRa init failed");
     return false;
@@ -1280,7 +1247,6 @@ bool initLoRa() {
   Serial.println("LoRa init ok");
   LoRaTransport::printConfig(Serial);
   return true;
-#endif
 }
 
 bool sendControlFrame(uint8_t frameType,
@@ -1439,7 +1405,7 @@ bool sendCurrentBatch() {
   }
 
   size_t packetLength = 0;
-#if defined(APP_LORAWAN_TX) || defined(APP_TX_USB_STREAM_TEST)
+#if defined(APP_TX_USB_STREAM_TEST)
   const uint32_t batchStartUs = currentBatchStartUs;
 #else
   uint32_t batchStartUs = currentBatchStartUs;
@@ -1577,60 +1543,6 @@ bool sendCurrentBatch() {
   clearPendingBatch();
   markDisplayDirty();
   return true;
-#elif defined(APP_LORAWAN_TX)
-  const uint32_t packetJitterMs = randomDelayMs(AppConfig::TX_PACKET_JITTER_MAX_MS);
-  if (packetJitterMs > 0) {
-    delay(packetJitterMs);
-  }
-
-  bool sent = false;
-#if defined(APP_LORAWAN_TX)
-  sent = LoRaWanTransport::sendUplink(txPacketBuffer, packetLength);
-#else
-  sent = LoRaTransport::sendPacket(txPacketBuffer, packetLength);
-#endif
-  if (!sent) {
-#if defined(APP_LORAWAN_TX)
-    Serial.printf("TX LoRaWAN uplink failed: %s (%d)\r\n",
-                  LoRaWanTransport::stateToString(LoRaWanTransport::lastState()),
-                  LoRaWanTransport::lastState());
-#else
-    Serial.println("TX LoRa send failed");
-#endif
-    return false;
-  }
-
-#if defined(APP_LORAWAN_TX)
-  const LoRaWanTransport::UplinkMeta& meta = LoRaWanTransport::lastUplinkMeta();
-  Serial.printf("TX dev=%u,seq=%u,count=%u,fs=%.1f%s,t0=%lu,len=%u,jitter=%lu,fcnt=%lu,dr=%u,freq=%.3f,toa=%lu\r\n",
-                AppConfig::DEVICE_ID,
-                packetSeq,
-                pendingSamples,
-                sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
-                experimentalTag(activeRateProfile()),
-                static_cast<unsigned long>(batchStartUs),
-                static_cast<unsigned>(packetLength),
-                static_cast<unsigned long>(packetJitterMs),
-                static_cast<unsigned long>(meta.frameCounter),
-                meta.dataRate,
-                meta.frequencyMHz,
-                static_cast<unsigned long>(meta.timeOnAirMs));
-#else
-  Serial.printf("TX dev=%u,seq=%u,count=%u,fs=%.1f%s,t0=%lu,len=%u,jitter=%lu\r\n",
-                AppConfig::DEVICE_ID,
-                packetSeq,
-                pendingSamples,
-                sampleRateHzFloat(activeRateProfile().sampleRateX10Hz),
-                experimentalTag(activeRateProfile()),
-                static_cast<unsigned long>(batchStartUs),
-                static_cast<unsigned>(packetLength),
-                static_cast<unsigned long>(packetJitterMs));
-#endif
-  ++packetSeq;
-  clearPendingBatch();
-  markDisplayDirty();
-  delay(AppConfig::TX_IDLE_DELAY_MS);
-  return true;
 #else
   const bool queued =
       pushTxQueue(txPacketBuffer, packetLength, packetSeq, batchStartUs, pendingSamples);
@@ -1728,7 +1640,6 @@ void processFifoSamples() {
     const uint32_t sampleTimestampUs =
         burstStartUs + static_cast<uint32_t>(static_cast<uint64_t>(i) * samplePeriodUs);
 #endif
-#if !defined(APP_LORAWAN_TX)
     if (txTimestampBeforeRunStart(sampleTimestampUs)) {
       Serial.printf("TX dropped pre-run sample: dev=%u,t_us=%lu,start_us=%lu\r\n",
                     AppConfig::DEVICE_ID,
@@ -1736,7 +1647,6 @@ void processFifoSamples() {
                     static_cast<unsigned long>(txRunStartLocalUs));
       continue;
     }
-#endif
 #if defined(APP_SENSOR_IIM42352) && APP_IIM42352_GPS_DISCIPLINED_CLKIN
     if (!txFirstInt1OffsetValid) {
       txFirstInt1OffsetUs =
@@ -2058,7 +1968,6 @@ void handleTxSerial() {
 #endif
 
 void startTxCaptureIfDue() {
-#if !defined(APP_LORAWAN_TX)
   if (!txRunArmed || txCaptureStarted || !timeReachedUs(txRunStartLocalUs)) {
     return;
   }
@@ -2096,7 +2005,6 @@ void startTxCaptureIfDue() {
 #endif
                 );
   markDisplayDirty();
-#endif
 }
 
 bool sendTxQueueHead() {
@@ -2235,7 +2143,7 @@ void handleTxControlFrame(const Protocol::ControlFrame& frame) {
 }
 
 void handleTxRadio() {
-#if !defined(APP_LORAWAN_TX) && !defined(APP_TX_USB_STREAM_TEST)
+#if !defined(APP_TX_USB_STREAM_TEST)
   if (txWaitingAck && timeReachedMs(txAckDeadlineMs)) {
     Serial.printf("TX ack timeout retired: dev=%u,seq=%u,q=%u/%u\r\n",
                   AppConfig::DEVICE_ID,
@@ -2308,13 +2216,9 @@ void txLoop() {
     (void)sendCurrentBatch();
   }
 
-#if defined(APP_LORAWAN_TX)
-  processFifoSamples();
-#else
   if (txCaptureStarted) {
     processFifoSamples();
   }
-#endif
   refreshTxScreen(nowMs);
 }
 
@@ -2774,7 +2678,7 @@ void setup() {
 #if defined(ROLE_TX)
   (void)initOled();
   showBootScreen();
-#if !defined(APP_LORAWAN_TX) && !defined(APP_TX_USB_STREAM_TEST)
+#if !defined(APP_TX_USB_STREAM_TEST)
   if (!LoRaTransport::startReceive()) {
     Serial.printf("LoRa TX listen arm failed: %s (%d)\r\n",
                   LoRaTransport::stateToString(LoRaTransport::lastState()),

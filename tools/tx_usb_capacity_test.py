@@ -74,6 +74,14 @@ DEFAULT_RANGE_G = 4
 SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 SUPPORTED_RANGE_G = (4, 8, 16)
 CSV_TIMEBASE_CHOICES = ("auto", "raw", "aligned")
+GUI_PROFILE_CHOICES = ("usb-gps-sync", "indoor-cayd")
+USB_GPS_SYNC_OUTPUT = Path("data1")
+USB_GPS_SYNC_FIRMWARE_NOTE = (
+    "USB+GPS sync test defaults for the current bench: COM6->1001, COM12->1002. "
+    "Use firmware heltec_wifi_lora_32_V3_iim_gps_tx_1001_usb_gps_sync_test on COM6 "
+    "and heltec_wifi_lora_32_V3_iim_gps_tx_1002_usb_gps_sync_test on COM12. "
+    "Defaults: Range g=4, GPS sync=on, CSV timebase=raw, Output=data1."
+)
 INDOOR_CAYD_OUTPUT = Path("data_mems_cayd_no_gps_16g")
 INDOOR_CAYD_FIRMWARE_NOTE = (
     "Indoor MEMS-CAYD uses heltec_wifi_lora_32_V3_iim_gps_tx_1001_usb_test "
@@ -553,6 +561,33 @@ def indoor_cayd_gui_defaults() -> argparse.Namespace:
     )
 
 
+def usb_gps_sync_gui_defaults() -> argparse.Namespace:
+    range_g = DEFAULT_RANGE_G
+    return argparse.Namespace(
+        ports="COM6,COM12",
+        device_ids="1001,1002",
+        baud=DEFAULT_BAUD,
+        sample_rate_hz=50.0,
+        range_g=range_g,
+        duration_seconds=60.0,
+        start_delay_seconds=5.0,
+        samples_per_packet=24,
+        serial_startup_delay_seconds=2.0,
+        gps_sync_wait_seconds=60.0,
+        scale=scale_for_range_g(range_g),
+        output=USB_GPS_SYNC_OUTPUT,
+        gps_sync=True,
+        csv_timebase="raw",
+        firmware_note=USB_GPS_SYNC_FIRMWARE_NOTE,
+    )
+
+
+def gui_defaults_for_profile(profile: str | None) -> argparse.Namespace:
+    if profile == "indoor-cayd":
+        return indoor_cayd_gui_defaults()
+    return usb_gps_sync_gui_defaults()
+
+
 def apply_range_scale_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if getattr(args, "scale", None) is None:
         args.scale = scale_for_range_g(int(getattr(args, "range_g", DEFAULT_RANGE_G)))
@@ -916,6 +951,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open a local desktop GUI; this is the default when no arguments are given",
     )
+    parser.add_argument(
+        "--gui-profile",
+        choices=GUI_PROFILE_CHOICES,
+        default="usb-gps-sync",
+        help="GUI defaults profile: usb-gps-sync uses COM6/COM12 GPS test; indoor-cayd keeps the no-GPS indoor profile",
+    )
     parser.set_defaults(gps_sync=True)
     gps_group = parser.add_mutually_exclusive_group()
     gps_group.add_argument(
@@ -1085,14 +1126,15 @@ def run_gui(config: argparse.Namespace) -> int:
             return completed.returncode
         raise SystemExit(format_tkinter_missing_message()) from exc
 
-    root = tk.Tk()
-    root.title("TX USB Capacity Test")
-    root.geometry("980x620")
-
     log_queue: queue.Queue[str] = queue.Queue()
     worker_thread: threading.Thread | None = None
     stop_event: threading.Event | None = None
-    gui_defaults = indoor_cayd_gui_defaults()
+    gui_profile = getattr(config, "gui_profile", "usb-gps-sync")
+    gui_defaults = gui_defaults_for_profile(gui_profile)
+
+    root = tk.Tk()
+    root.title(f"TX USB Capacity Test - {gui_profile}")
+    root.geometry("980x620")
 
     ports_var = tk.StringVar(value=gui_defaults.ports)
     device_ids_var = tk.StringVar(value=gui_defaults.device_ids)
