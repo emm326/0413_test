@@ -223,6 +223,14 @@ class TxUsbCapacityTest(unittest.TestCase):
         self.assertIn("+/-4g: 0.000122070312 g/count", text)
         self.assertIn("+/-16g: 0.000488281250 g/count", text)
 
+    def test_gui_source_makes_scale_read_only_and_derives_it_from_range(self):
+        source = (PROJECT_ROOT / "tools" / "tx_usb_capacity_test.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("scale=scale_for_range_g(range_g)", source)
+        self.assertIn('textvariable=scale_var, width=14, state="readonly"', source)
+
     def test_explicit_scale_overrides_range_g_scale(self):
         args = parse_args(
             [

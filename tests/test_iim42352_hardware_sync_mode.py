@@ -72,6 +72,18 @@ class Iim42352HardwareSyncModeTest(unittest.TestCase):
         self.assertIn("rxRunIimRangeG))", main)
         self.assertIn("START_AT epoch_us sample_rate_hz [delay_ms] [range_g]", main)
 
+    def test_iim_range_is_read_back_before_firmware_accepts_it(self):
+        main = read_text("src/main.cpp")
+        iim_header = read_text("lib/IIM42352Driver/src/IIM42352Driver.h")
+        iim_cpp = read_text("lib/IIM42352Driver/src/IIM42352Driver.cpp")
+
+        self.assertIn("accelConfig0", iim_header)
+        self.assertIn("rangeConfigured", iim_header)
+        self.assertIn("MASK_ACCEL_FS_SEL", iim_header)
+        self.assertIn("IIM42352Driver::rangeConfigured", iim_cpp)
+        self.assertIn("range verify failed", main)
+        self.assertIn("ACCEL_CONFIG0=0x%02X,verified=1", main)
+
 
 if __name__ == "__main__":
     unittest.main()

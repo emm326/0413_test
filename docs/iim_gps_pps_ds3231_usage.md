@@ -1,5 +1,7 @@
 # HTIT-WB32LA + IIM-42352 + LC76G + DS3231 多节点同步采集说明
 
+功耗、LoRa airtime、USB/无线模式逐模块估算见 `docs/power_consumption_estimate.md`。
+
 ## GPS-disciplined CLKIN 硬件采样同步模式
 
 当前 IIM-42352 GPS 同步 TX 固件新增 `APP_IIM42352_GPS_DISCIPLINED_CLKIN=1` 模式，用于把 raw 模式真实采样边沿尽量同步到 GPS 秒边界。

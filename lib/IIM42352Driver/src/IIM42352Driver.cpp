@@ -83,6 +83,14 @@ void IIM42352Driver::setRange(Range range) {
   writeRegister(REG_ACCEL_CONFIG0, value);
 }
 
+uint8_t IIM42352Driver::accelConfig0() { return readRegister(REG_ACCEL_CONFIG0); }
+
+bool IIM42352Driver::rangeConfigured(Range range) {
+  const uint8_t expected =
+      static_cast<uint8_t>(static_cast<uint8_t>(range) << 5) & MASK_ACCEL_FS_SEL;
+  return (accelConfig0() & MASK_ACCEL_FS_SEL) == expected;
+}
+
 void IIM42352Driver::setFullResolution(bool) {}
 
 void IIM42352Driver::setDataRate(DataRate rate) {

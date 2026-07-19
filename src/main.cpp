@@ -426,12 +426,21 @@ bool applyIimRangeG(uint16_t rangeG, bool printLog) {
     Serial.printf("IIM-42352 unsupported range_g=%u; supported=4,8,16\r\n", rangeG);
     return false;
   }
+  const SensorDriver::Range requestedRange = iimRangeFromG(rangeG);
+  adxl.setRange(requestedRange);
+  const uint8_t accelConfig0 = adxl.accelConfig0();
+  if (!adxl.rangeConfigured(requestedRange)) {
+    Serial.printf("IIM-42352 range verify failed: requested=+-%ug,ACCEL_CONFIG0=0x%02X\r\n",
+                  rangeG,
+                  accelConfig0);
+    return false;
+  }
   activeIimRangeG = rangeG;
-  adxl.setRange(iimRangeFromG(activeIimRangeG));
   if (printLog) {
-    Serial.printf("IIM-42352 range=+-%ug,scale_g_per_count=%.12f\r\n",
+    Serial.printf("IIM-42352 range=+-%ug,scale_g_per_count=%.12f,ACCEL_CONFIG0=0x%02X,verified=1\r\n",
                   activeIimRangeG,
-                  iimScaleGPerCount(activeIimRangeG));
+                  iimScaleGPerCount(activeIimRangeG),
+                  accelConfig0);
   }
   return true;
 }

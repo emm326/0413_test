@@ -1186,19 +1186,22 @@ def run_gui(config: argparse.Namespace) -> int:
             output_var.set(selected)
 
     def build_config_from_form() -> argparse.Namespace:
+        range_g = int(range_g_var.get().strip())
         args = argparse.Namespace(
             gui=False,
             ports=ports_var.get(),
             device_ids=device_ids_var.get(),
             baud=int(baud_var.get().strip()),
             sample_rate_hz=float(sample_rate_var.get().strip()),
-            range_g=int(range_g_var.get().strip()),
+            range_g=range_g,
             duration_seconds=float(duration_var.get().strip()),
             start_delay_seconds=float(start_delay_var.get().strip()),
             samples_per_packet=int(samples_per_packet_var.get().strip()),
             serial_startup_delay_seconds=float(serial_delay_var.get().strip()),
             gps_sync_wait_seconds=float(gps_sync_wait_var.get().strip()),
-            scale=float(scale_var.get().strip()),
+            # Derive CSV conversion from the same range sent to the firmware.
+            # An editable GUI scale could silently make START_AT and CSV units disagree.
+            scale=scale_for_range_g(range_g),
             output=Path(output_var.get().strip() or "data_tx_usb"),
             gps_sync=bool(gps_sync_var.get()),
             csv_timebase=csv_timebase_var.get().strip() or "raw",
@@ -1293,7 +1296,9 @@ def run_gui(config: argparse.Namespace) -> int:
     ttk.Label(form, text="GPS wait s").grid(row=2, column=2, sticky="w", padx=(16, 0), pady=4)
     ttk.Entry(form, textvariable=gps_sync_wait_var, width=10).grid(row=2, column=3, sticky="ew", pady=4)
     ttk.Label(form, text="Scale").grid(row=2, column=4, sticky="w", padx=(16, 0), pady=4)
-    ttk.Entry(form, textvariable=scale_var, width=14).grid(row=2, column=5, sticky="ew", pady=4)
+    ttk.Entry(form, textvariable=scale_var, width=14, state="readonly").grid(
+        row=2, column=5, sticky="ew", pady=4
+    )
     ttk.Label(form, text="Output").grid(row=2, column=6, sticky="w", padx=(16, 0), pady=4)
     ttk.Entry(form, textvariable=output_var).grid(row=2, column=7, sticky="ew", pady=4)
 

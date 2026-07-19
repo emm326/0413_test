@@ -50,6 +50,8 @@ class IIM42352Driver {
   uint8_t regIntfConfig1() const;
   uint8_t regIntfConfig5() const;
   void setRange(Range range);
+  uint8_t accelConfig0();
+  bool rangeConfigured(Range range);
   void setFullResolution(bool en);
   void setDataRate(DataRate rate);
   bool configureExternalClockAndDataReady();
@@ -95,6 +97,7 @@ class IIM42352Driver {
   static constexpr uint8_t BIT_RTC_MODE = 0x04;
   static constexpr uint8_t MASK_PIN9_FUNCTION = 0x06;
   static constexpr uint8_t PIN9_FUNCTION_CLKIN = 0x04;
+  static constexpr uint8_t MASK_ACCEL_FS_SEL = 0x60;
 
   bool readMulti(uint8_t startReg, uint8_t* buffer, size_t length);
   bool readFifoPacket(RawSample& outSample);
