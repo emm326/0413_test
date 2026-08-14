@@ -327,6 +327,11 @@ bool txRunWarmupActive = false;
 bool txRunWarmupDropLogged = false;
 bool txFirstInt1OffsetValid = false;
 int32_t txFirstInt1OffsetUs = 0;
+bool iimSensorConfigured = false;
+uint64_t lastSensorReadyLogEpochUs = 0;
+uint64_t lastSensorHealthCheckEpochUs = 0;
+uint32_t lastSensorHealthEdgeCount = 0;
+bool iimInt1EdgesGrowing = false;
 #endif
 
 bool txRunArmed = false;
@@ -334,6 +339,7 @@ bool txCaptureStarted = false;
 uint16_t txRunId = 0;
 uint64_t txRunStartEpochUs = 0;
 uint32_t txRunStartLocalUs = 0;
+constexpr uint32_t kPpsStartFifoGuardUs = 100000UL;
 bool txWaitingAck = false;
 uint16_t txWaitingAckSeq = 0;
 uint32_t txAckDeadlineMs = 0;
@@ -381,6 +387,7 @@ constexpr uint32_t kBootScreenMs = 1500;
 
 #if defined(APP_SENSOR_IIM42352)
 bool txTimebaseReady();
+bool txSensorReady();
 #endif
 
 float sampleRateHzFloat(uint16_t sampleRateX10Hz) { return sampleRateX10Hz / 10.0f; }
@@ -1081,22 +1088,38 @@ bool initAdxl() {
   }
 
   if (!applyIimRangeG(activeIimRangeG, false)) {
-    activeIimRangeG = 4;
-    (void)applyIimRangeG(activeIimRangeG, false);
+    Serial.println("IIM-42352 init validation failed: range register readback");
+    return false;
   }
   adxl.setFullResolution(true);
   adxl.setDataRate(activeRateProfile().sensorRate);
-  const bool iimClkinOk = adxl.externalClockConfigured();
-  const bool iimInt1Ok = adxl.dataReadyInt1Configured();
-  delay(5);
-  discardSensorFifo(false);
-  clearIimInt1Timestamps();
   attachInterrupt(digitalPinToInterrupt(PIN_IIM42352_INT1),
                   onIimInt1,
                   iimInt1InterruptMode());
 
+  const uint32_t initialInt1Edges = iimInt1RawEdgeCount();
+  delay(100);
+  const uint8_t finalWho = adxl.readRegister(0x75);
+  const bool iimWhoOk = finalWho == adxl.expectedDeviceId() &&
+                        adxl.checkDeviceIdConsecutive(2);
+  const bool iimClkinOk = adxl.externalClockConfigured();
+  const bool iimInt1Ok = adxl.dataReadyInt1Configured();
+  const uint32_t verifiedInt1Edges = iimInt1RawEdgeCount();
+  const bool iimInt1Active = verifiedInt1Edges > initialInt1Edges;
+  if (!iimWhoOk || !iimClkinOk || !iimInt1Ok || !iimInt1Active) {
+    Serial.printf("IIM-42352 init validation failed: who=0x%02X,clk_in=%u,int1_drdy=%u,int1_edges=%lu\r\n",
+                  finalWho,
+                  iimClkinOk ? 1U : 0U,
+                  iimInt1Ok ? 1U : 0U,
+                  static_cast<unsigned long>(verifiedInt1Edges));
+    return false;
+  }
+  iimSensorConfigured = true;
+  discardSensorFifo(false);
+  clearIimInt1Timestamps();
+
   Serial.println("IIM-42352 init ok");
-  Serial.printf("IIM-42352 who_am_i=0x%02X\r\n", adxl.readRegister(0x75));
+  Serial.printf("IIM-42352 who_am_i=0x%02X\r\n", finalWho);
   Serial.printf("IIM-42352 clk_in=%u,int1_drdy=%u,INTF_CONFIG1=0x%02X,INTF_CONFIG5=0x%02X,INT_SOURCE0=0x%02X,INT_CONFIG1=0x%02X,INT_CONFIG=0x%02X,INT_STATUS=0x%02X\r\n",
                 iimClkinOk ? 1 : 0,
                 iimInt1Ok ? 1 : 0,
@@ -1210,6 +1233,26 @@ void updateGpsTimebase() {
                   static_cast<unsigned long>(gpsTimebase.localTimerJumpCount()));
   }
 
+  if (!txRunArmed && ppsEpochUs != 0 &&
+      ppsEpochUs != lastSensorHealthCheckEpochUs) {
+    const uint32_t currentEdges = iimInt1RawEdgeCount();
+    iimInt1EdgesGrowing = currentEdges > lastSensorHealthEdgeCount;
+    lastSensorHealthEdgeCount = currentEdges;
+    lastSensorHealthCheckEpochUs = ppsEpochUs;
+  }
+
+  if (!txRunArmed && ppsEpochUs != 0 &&
+      ppsEpochUs != lastSensorReadyLogEpochUs && txSensorReady() &&
+      gpsTimebase.healthy()) {
+    lastSensorReadyLogEpochUs = ppsEpochUs;
+    Serial.printf("SENSOR_READY,%u,0x%02X,%u,%u,%lu\r\n",
+                  AppConfig::DEVICE_ID,
+                  adxl.readRegister(0x75),
+                  adxl.externalClockConfigured() ? 1U : 0U,
+                  adxl.dataReadyInt1Configured() ? 1U : 0U,
+                  static_cast<unsigned long>(iimInt1RawEdgeCount()));
+  }
+
   const uint32_t ageMs = gpsTimebase.timebaseAgeMs();
   const uint32_t nowMs = millis();
   if (txRunArmed && ageMs != UINT32_MAX && ageMs > 3000UL &&
@@ -1222,11 +1265,22 @@ void updateGpsTimebase() {
   }
 }
 
+bool txSensorReady() {
+  const uint32_t lastEdgeUs = iimInt1LastEdgeTimestampUs();
+  const bool int1EdgeRecent =
+      lastEdgeUs != 0 && static_cast<uint32_t>(micros() - lastEdgeUs) <= 250000UL;
+  return iimSensorConfigured && iimInt1EdgesGrowing &&
+         iimInt1RawEdgeCount() > 0 && int1EdgeRecent &&
+         adxl.readRegister(0x75) == adxl.expectedDeviceId() &&
+         adxl.externalClockConfigured() && adxl.dataReadyInt1Configured();
+}
+
 bool txTimebaseReady() {
 #if APP_IIM42352_GPS_DISCIPLINED_CLKIN
-  return gpsTimebase.timeValid() && clkSync.started();
+  return txSensorReady() && gpsTimebase.healthy() && clkSync.started();
 #else
-  return ds3231Ready && ds3231_32k_valid && gpsTimebase.timeValid();
+  return txSensorReady() && ds3231Ready && ds3231_32k_valid &&
+         gpsTimebase.healthy();
 #endif
 }
 
@@ -1828,6 +1882,15 @@ void armTxRunUsb(uint64_t startEpochUs,
     Serial.printf("TX USB START_AT unsupported range_g=%u\r\n", rangeG);
     return;
   }
+  if (!txSensorReady()) {
+    Serial.printf("TX USB ignored START_AT sensor not ready: dev=%u,who=0x%02X,clk_in=%u,int1_drdy=%u,int1_edges=%lu\r\n",
+                  AppConfig::DEVICE_ID,
+                  adxl.readRegister(0x75),
+                  adxl.externalClockConfigured() ? 1U : 0U,
+                  adxl.dataReadyInt1Configured() ? 1U : 0U,
+                  static_cast<unsigned long>(iimInt1RawEdgeCount()));
+    return;
+  }
 #endif
 
   ++txRunId;
@@ -1977,9 +2040,30 @@ void handleTxSerial() {
 #endif
 
 void startTxCaptureIfDue() {
-  if (!txRunArmed || txCaptureStarted || !timeReachedUs(txRunStartLocalUs)) {
+  if (!txRunArmed || txCaptureStarted) {
     return;
   }
+
+#if defined(APP_REQUIRE_GPS_TIMEBASE) && !defined(APP_TX_USB_STREAM_TEST)
+  // The radio START_AT frame only arms the node.  The actual acquisition gate is
+  // the first locally observed GPS PPS at or after that shared UTC second.
+  const uint64_t ppsEpochUs = gpsTimebase.epochUsAtLastPps();
+  const uint32_t ppsLocalUs = gpsTimebase.localUsAtLastPps();
+  if (!gpsTimebase.healthy() || ppsEpochUs < txRunStartEpochUs || ppsLocalUs == 0) {
+    return;
+  }
+  txRunStartLocalUs = ppsLocalUs;
+  Serial.printf("TX PPS gate opened: dev=%u,run=%u,target_epoch_us=%llu,pps_epoch_us=%llu,pps_local_us=%lu\r\n",
+                AppConfig::DEVICE_ID,
+                txRunId,
+                static_cast<unsigned long long>(txRunStartEpochUs),
+                static_cast<unsigned long long>(ppsEpochUs),
+                static_cast<unsigned long>(txRunStartLocalUs));
+#else
+  if (!timeReachedUs(txRunStartLocalUs)) {
+    return;
+  }
+#endif
 
 #if defined(APP_SENSOR_IIM42352) && APP_IIM42352_GPS_DISCIPLINED_CLKIN
   const bool clkRestarted = clkSync.restart();
@@ -1990,10 +2074,14 @@ void startTxCaptureIfDue() {
                 accelRestarted ? 1U : 0U,
                 static_cast<unsigned long long>(txRunStartEpochUs));
 #endif
+#if !defined(APP_REQUIRE_GPS_TIMEBASE) || defined(APP_TX_USB_STREAM_TEST)
   discardSensorFifo(false);
+#endif
   clearPendingBatch();
 #if defined(APP_SENSOR_IIM42352)
+#if !defined(APP_REQUIRE_GPS_TIMEBASE) || defined(APP_TX_USB_STREAM_TEST)
   clearIimInt1Timestamps();
+#endif
   txRunWarmupUntilLocalUs =
       txRunStartLocalUs + AppConfig::IIM42352_SYNC_WARMUP_MS * 1000UL;
   txRunWarmupActive = AppConfig::IIM42352_SYNC_WARMUP_MS > 0;
@@ -2209,6 +2297,18 @@ void txLoop() {
   handleTxRadio();
 #endif
   startTxCaptureIfDue();
+
+#if defined(APP_SENSOR_IIM42352) && defined(APP_REQUIRE_GPS_TIMEBASE) && \
+    !defined(APP_TX_USB_STREAM_TEST)
+  // Keep the FIFO empty while waiting for the scheduled PPS, but preserve the
+  // short interval immediately before it so the first post-PPS sample can be
+  // reconstructed and filtered by txTimestampBeforeRunStart().
+  if (txRunArmed && !txCaptureStarted &&
+      !timeReachedUs(txRunStartLocalUs - kPpsStartFifoGuardUs)) {
+    discardSensorFifo(false);
+    clearIimInt1Timestamps();
+  }
+#endif
 
   if (!txRunArmed || !txCaptureStarted) {
     updateTxButton(nowMs);

@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=export PATH=\"$PATH:$USERPROFILE/.platformio/penv/Scripts\"; pio run -e heltec_wifi_lora_32_V3_iim_gps_tx_1001_usb_gps_clk_sync_test -e heltec_wifi_lora_32_V3_iim_gps_tx_1002_usb_gps_clk_sync_test 2>&1 | tail -25"]

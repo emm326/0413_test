@@ -9,6 +9,7 @@ Expected TX USB test firmware lines:
   TIMEBASE,dev_id,healthy,pps_epoch_us,pps_local_us64,pps_interval_us,age_ms,pps_bad_count,local_timer_jump_count
   CLKSYNC,dev_id,pps_epoch_us,clk_hz,pps_interval_us,phase_error_us,first_int1_offset_us,healthy[,dpll_ppm,expected_cycles,stable]
   TXS,dev_id,packets,samples,int1_missing,int1_overflow,fifo_read_fail[,int1_edges,int1_pin]
+  SENSOR_READY,dev_id,who_am_i,clk_in,int1_drdy,int1_edges
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import threading
 import time
 import queue
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TextIO
 
@@ -66,6 +67,7 @@ GPS_SYNC_LOG_RE = re.compile(
     r"pps_interval_us=(\d+),age_ms=(\d+)(?:,.*)?$"
 )
 TX_STATS_RE = re.compile(r"^TXS,(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)(?:,(\d+),([01]))?$")
+SENSOR_READY_RE = re.compile(r"^SENSOR_READY,(\d+),0x([0-9A-Fa-f]{2}),([01]),([01]),(\d+)$")
 SAMPLE_RE = re.compile(r"^(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)$")
 
 DEFAULT_BAUD = 460800
@@ -73,14 +75,15 @@ DEFAULT_SCALE_G = 0.0001220703125
 DEFAULT_RANGE_G = 4
 SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 SUPPORTED_RANGE_G = (4, 8, 16)
-CSV_TIMEBASE_CHOICES = ("auto", "raw", "aligned")
+CSV_TIMEBASE_CHOICES = ("auto", "raw", "aligned", "raw+pps-aligned")
 GUI_PROFILE_CHOICES = ("usb-gps-sync", "indoor-cayd")
-USB_GPS_SYNC_OUTPUT = Path("data1")
+PPS_ALIGN_REORDER_WINDOW_SECONDS = 5
+USB_GPS_SYNC_OUTPUT = Path("data_usb_pps_sync")
 USB_GPS_SYNC_FIRMWARE_NOTE = (
-    "USB+GPS sync test defaults for the current bench: COM6->1001, COM12->1002. "
-    "Use firmware heltec_wifi_lora_32_V3_iim_gps_tx_1001_usb_gps_sync_test on COM6 "
-    "and heltec_wifi_lora_32_V3_iim_gps_tx_1002_usb_gps_sync_test on COM12. "
-    "Defaults: Range g=4, GPS sync=on, CSV timebase=raw, Output=data1."
+    "USB+GPS PPS calibration defaults: COM5->1001, COM6->1002. "
+    "Use the ordinary usb_gps_sync_test firmware with DS3231 32K connected to "
+    "IIM CLKIN; do not use the GPIO3 clk_sync firmware. Defaults: Range g=4, "
+    "GPS sync=on, CSV timebase=raw+pps-aligned, Output=data_usb_pps_sync."
 )
 INDOOR_CAYD_OUTPUT = Path("data_mems_cayd_no_gps_16g")
 INDOOR_CAYD_FIRMWARE_NOTE = (
@@ -190,6 +193,30 @@ class TxUsbLine:
     dpll_ppm: int | None = None
     expected_cycles: int | None = None
     clk_stable: int | None = None
+    sensor_who: int | None = None
+    sensor_clk_in: int | None = None
+    sensor_int1_drdy: int | None = None
+    sensor_int1_edges: int | None = None
+
+
+@dataclass(frozen=True)
+class UsbEpochSample:
+    device_id: str
+    epoch_us: int
+    ax_raw: int
+    ay_raw: int
+    az_raw: int
+
+
+@dataclass
+class PpsAlignedSecond:
+    pps_epoch_us: int
+    anchor_epoch_us: int | None
+    paired: dict[str, list[tuple[int, UsbEpochSample]]]
+    paired_count: int
+    dropped_by_device: dict[str, int]
+    missing_slots: int
+    missing_device_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -236,6 +263,11 @@ class PortStats:
     dpll_ppm: int | None = None
     expected_cycles: int | None = None
     clk_stable: int | None = None
+    sensor_ready_seen: bool = False
+    sensor_who: int | None = None
+    sensor_clk_in: int | None = None
+    sensor_int1_drdy: int | None = None
+    sensor_int1_edges: int = 0
 
     def expected_interval_us(self) -> int:
         actual_rate_hz = self.sample_rate_hz * 1.024
@@ -329,6 +361,21 @@ class PortStats:
         self.expected_cycles = line.expected_cycles
         self.clk_stable = line.clk_stable
 
+    def record_sensor_ready(self, line: TxUsbLine) -> None:
+        if line.device_id != self.expected_device_id:
+            self.bad_device_lines += 1
+            return
+        self.sensor_who = line.sensor_who
+        self.sensor_clk_in = line.sensor_clk_in
+        self.sensor_int1_drdy = line.sensor_int1_drdy
+        self.sensor_int1_edges = line.sensor_int1_edges or 0
+        self.sensor_ready_seen = (
+            self.sensor_who == 0x6D
+            and self.sensor_clk_in == 1
+            and self.sensor_int1_drdy == 1
+            and self.sensor_int1_edges > 0
+        )
+
     def capture_ratio(self, duration_seconds: float) -> float:
         expected_rows = self.expected_rows(duration_seconds)
         if expected_rows <= 0:
@@ -364,6 +411,7 @@ class StartCoordinator:
         start_delay_seconds: float,
         gps_sync: bool,
         gps_sync_wait_seconds: float,
+        require_sensor_ready: bool = False,
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -371,26 +419,56 @@ class StartCoordinator:
         self.start_delay_seconds = start_delay_seconds
         self.gps_sync = gps_sync
         self.gps_sync_wait_seconds = gps_sync_wait_seconds
+        self.require_sensor_ready = require_sensor_ready
         self.wall_clock = wall_clock
         self.monotonic_clock = monotonic_clock
         self.ready_device_ids: set[str] = set()
+        self.latest_pps_epoch_us: dict[str, int] = {}
+        self.sensor_ready_device_ids: set[str] = set()
         self.start_epoch_us: int | None = (
-            None if gps_sync else int((self.wall_clock() + start_delay_seconds) * 1_000_000)
+            None
+            if gps_sync or require_sensor_ready
+            else int((self.wall_clock() + start_delay_seconds) * 1_000_000)
         )
         self.started_at_monotonic = self.monotonic_clock()
         self.condition = threading.Condition()
 
-    def mark_gps_ready(self, device_id: str) -> None:
+    def mark_gps_ready(self, device_id: str, pps_epoch_us: int | None = None) -> None:
         if not self.gps_sync or device_id not in self.device_ids:
             return
         with self.condition:
             self.ready_device_ids.add(device_id)
-            if self.start_epoch_us is None and self.ready_device_ids >= self.device_ids:
+            if pps_epoch_us is not None and pps_epoch_us > 0:
+                self.latest_pps_epoch_us[device_id] = max(
+                    pps_epoch_us, self.latest_pps_epoch_us.get(device_id, pps_epoch_us)
+                )
+            self._set_start_if_ready()
+            self.condition.notify_all()
+
+    def mark_sensor_ready(self, device_id: str) -> None:
+        if device_id not in self.device_ids:
+            return
+        with self.condition:
+            self.sensor_ready_device_ids.add(device_id)
+            self._set_start_if_ready()
+            self.condition.notify_all()
+
+    def _set_start_if_ready(self) -> None:
+        gps_ready = not self.gps_sync or self.ready_device_ids >= self.device_ids
+        sensor_ready = (
+            not self.require_sensor_ready
+            or self.sensor_ready_device_ids >= self.device_ids
+        )
+        if self.start_epoch_us is None and gps_ready and sensor_ready:
+            if self.gps_sync and self.latest_pps_epoch_us.keys() >= self.device_ids:
+                requested_epoch_us = max(self.latest_pps_epoch_us.values()) + int(
+                    self.start_delay_seconds * 1_000_000
+                )
+            else:
                 requested_epoch_us = int(
                     (self.wall_clock() + self.start_delay_seconds) * 1_000_000
                 )
-                self.start_epoch_us = align_epoch_to_next_second_us(requested_epoch_us)
-            self.condition.notify_all()
+            self.start_epoch_us = align_epoch_to_next_second_us(requested_epoch_us)
 
     def wait_for_start_epoch(self, stop_event: threading.Event) -> int | None:
         with self.condition:
@@ -402,6 +480,127 @@ class StartCoordinator:
                     break
                 self.condition.wait(timeout=min(0.2, remaining))
             return self.start_epoch_us
+
+    def current_start_epoch(self) -> int | None:
+        with self.condition:
+            return self.start_epoch_us
+
+
+class UsbPpsAligner:
+    """Align two raw GPS/PPS timestamp streams one UTC second at a time."""
+
+    def __init__(self, device_ids: tuple[str, str], sample_rate_hz: float) -> None:
+        if len(device_ids) != 2 or device_ids[0] == device_ids[1]:
+            raise ValueError("raw+pps-aligned requires exactly two distinct device ids")
+        self.device_ids = device_ids
+        self.period_us = aligned_grid_period_us(sample_rate_hz)
+        self._buckets: dict[int, dict[str, list[UsbEpochSample]]] = {}
+        self._latest_second: dict[str, int] = {}
+        self._finalized_through: int | None = None
+        self.late_samples = 0
+
+    def add(self, sample: UsbEpochSample) -> list[PpsAlignedSecond]:
+        if sample.device_id not in self.device_ids:
+            return []
+        second = sample.epoch_us // 1_000_000
+        if self._finalized_through is not None and second <= self._finalized_through:
+            self.late_samples += 1
+            return []
+        self._buckets.setdefault(second, {}).setdefault(sample.device_id, []).append(sample)
+        self._latest_second[sample.device_id] = max(
+            second, self._latest_second.get(sample.device_id, second)
+        )
+        latest_seconds = tuple(self._latest_second.values())
+        normal_cutoff = (
+            min(latest_seconds) if len(latest_seconds) == len(self.device_ids) else 0
+        )
+        # If one port disappears, do not retain every following second forever.
+        # Five seconds still permits normal cross-thread arrival/reordering; older
+        # seconds are finalized as missing and late packets for them are rejected.
+        expiry_cutoff = max(latest_seconds) - PPS_ALIGN_REORDER_WINDOW_SECONDS
+        return self._finalize_before(max(normal_cutoff, expiry_cutoff))
+
+    def flush(self) -> list[PpsAlignedSecond]:
+        results = [
+            self._build_second(second, self._buckets[second])
+            for second in sorted(self._buckets)
+        ]
+        if self._buckets:
+            self._finalized_through = max(self._buckets)
+        self._buckets.clear()
+        self._latest_second.clear()
+        return results
+
+    def _finalize_before(self, cutoff_second: int) -> list[PpsAlignedSecond]:
+        results: list[PpsAlignedSecond] = []
+        for second in sorted(value for value in self._buckets if value < cutoff_second):
+            results.append(self._build_second(second, self._buckets.pop(second)))
+            self._finalized_through = second
+        return results
+
+    def _build_second(
+        self, second: int, bucket: dict[str, list[UsbEpochSample]]
+    ) -> PpsAlignedSecond:
+        per_device = {
+            device_id: sorted(bucket.get(device_id, []), key=lambda item: item.epoch_us)
+            for device_id in self.device_ids
+        }
+        missing = tuple(device_id for device_id, values in per_device.items() if not values)
+        dropped = {device_id: len(values) for device_id, values in per_device.items()}
+        if missing:
+            return PpsAlignedSecond(
+                pps_epoch_us=second * 1_000_000,
+                anchor_epoch_us=None,
+                paired={device_id: [] for device_id in self.device_ids},
+                paired_count=0,
+                dropped_by_device=dropped,
+                missing_slots=0,
+                missing_device_ids=missing,
+            )
+
+        anchor_epoch_us = max(values[0].epoch_us for values in per_device.values())
+        next_pps_epoch_us = (second + 1) * 1_000_000
+        grid_slots = max(
+            0,
+            int(math.ceil((next_pps_epoch_us - anchor_epoch_us) / self.period_us - 1e-12)),
+        )
+        slots_by_device: dict[str, dict[int, UsbEpochSample]] = {}
+        for device_id, values in per_device.items():
+            selected: dict[int, UsbEpochSample] = {}
+            for sample in values:
+                if sample.epoch_us < anchor_epoch_us:
+                    continue
+                slot = int(round((sample.epoch_us - anchor_epoch_us) / self.period_us))
+                if slot < 0 or slot >= grid_slots:
+                    continue
+                target_epoch_us = int(round(anchor_epoch_us + slot * self.period_us))
+                previous = selected.get(slot)
+                if previous is None or abs(sample.epoch_us - target_epoch_us) < abs(
+                    previous.epoch_us - target_epoch_us
+                ):
+                    selected[slot] = sample
+            slots_by_device[device_id] = selected
+
+        common_slots = sorted(set.intersection(*(set(values) for values in slots_by_device.values())))
+        paired = {
+            device_id: [
+                (int(round(anchor_epoch_us + slot * self.period_us)), slots_by_device[device_id][slot])
+                for slot in common_slots
+            ]
+            for device_id in self.device_ids
+        }
+        paired_count = len(common_slots)
+        return PpsAlignedSecond(
+            pps_epoch_us=second * 1_000_000,
+            anchor_epoch_us=anchor_epoch_us,
+            paired=paired,
+            paired_count=paired_count,
+            dropped_by_device={
+                device_id: len(per_device[device_id]) - paired_count
+                for device_id in self.device_ids
+            },
+            missing_slots=max(0, grid_slots - paired_count),
+        )
 
 
 def parse_ports(text: str) -> list[str]:
@@ -491,6 +690,7 @@ def parse_tx_usb_line(line: str) -> TxUsbLine | None:
         )
     match = GPS_SYNC_LOG_RE.match(line)
     if match:
+        healthy_match = re.search(r"(?:^|,)healthy=([01])(?:,|$)", line)
         return TxUsbLine(
             kind="gps",
             device_id=match.group(1),
@@ -498,6 +698,9 @@ def parse_tx_usb_line(line: str) -> TxUsbLine | None:
             pps_local_us=int(match.group(3)),
             pps_interval_us=int(match.group(4)),
             gps_age_ms=int(match.group(5)),
+            timebase_healthy=(
+                int(healthy_match.group(1)) if healthy_match is not None else None
+            ),
         )
     match = TX_STATS_RE.match(line)
     if match:
@@ -512,11 +715,22 @@ def parse_tx_usb_line(line: str) -> TxUsbLine | None:
             int1_edges=int(match.group(7)) if match.group(7) is not None else None,
             int1_pin=int(match.group(8)) if match.group(8) is not None else None,
         )
+    match = SENSOR_READY_RE.match(line)
+    if match:
+        return TxUsbLine(
+            kind="sensor_ready",
+            device_id=match.group(1),
+            sensor_who=int(match.group(2), 16),
+            sensor_clk_in=int(match.group(3)),
+            sensor_int1_drdy=int(match.group(4)),
+            sensor_int1_edges=int(match.group(5)),
+        )
     return None
 
 
 def epoch_us_to_datetime(epoch_us: int) -> datetime:
-    return datetime.fromtimestamp(epoch_us / 1_000_000)
+    """Convert a GPS-calibrated Unix epoch to a timezone-independent UTC datetime."""
+    return datetime.fromtimestamp(epoch_us / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
 
 
 def format_datetime_4(dt: datetime) -> str:
@@ -564,12 +778,12 @@ def indoor_cayd_gui_defaults() -> argparse.Namespace:
 def usb_gps_sync_gui_defaults() -> argparse.Namespace:
     range_g = DEFAULT_RANGE_G
     return argparse.Namespace(
-        ports="COM6,COM12",
+        ports="COM5,COM6",
         device_ids="1001,1002",
         baud=DEFAULT_BAUD,
         sample_rate_hz=50.0,
         range_g=range_g,
-        duration_seconds=60.0,
+        duration_seconds=600.0,
         start_delay_seconds=5.0,
         samples_per_packet=24,
         serial_startup_delay_seconds=2.0,
@@ -577,7 +791,7 @@ def usb_gps_sync_gui_defaults() -> argparse.Namespace:
         scale=scale_for_range_g(range_g),
         output=USB_GPS_SYNC_OUTPUT,
         gps_sync=True,
-        csv_timebase="raw",
+        csv_timebase="raw+pps-aligned",
         firmware_note=USB_GPS_SYNC_FIRMWARE_NOTE,
     )
 
@@ -642,6 +856,101 @@ def open_sensor_csv(output: Path, device_id: str) -> tuple[Path, TextIO]:
     return path, path.open("w", newline="", encoding="utf-8")
 
 
+class LazyCsvWriters:
+    """Create sensor CSV files only when the first valid sample is written."""
+
+    def __init__(self, output: Path, scale: float) -> None:
+        self.output = output
+        self.scale = scale
+        self._files: dict[str, TextIO] = {}
+        self.paths: dict[str, Path] = {}
+
+    def write(self, sample: UsbEpochSample, output_epoch_us: int | None = None) -> Path:
+        fp = self._files.get(sample.device_id)
+        include_header = fp is None
+        if fp is None:
+            path, fp = open_sensor_csv(self.output, sample.device_id)
+            self.paths[sample.device_id] = path
+            self._files[sample.device_id] = fp
+        write_sample_csv(
+            fp,
+            include_header=include_header,
+            device_id=sample.device_id,
+            epoch_us=sample.epoch_us,
+            ax_raw=sample.ax_raw,
+            ay_raw=sample.ay_raw,
+            az_raw=sample.az_raw,
+            scale=self.scale,
+            csv_epoch_us=output_epoch_us,
+        )
+        fp.flush()
+        return self.paths[sample.device_id]
+
+    def close(self) -> None:
+        for fp in self._files.values():
+            fp.close()
+        self._files.clear()
+
+
+class RawAndPpsAlignedOutput:
+    def __init__(
+        self,
+        output: Path,
+        device_ids: tuple[str, str],
+        sample_rate_hz: float,
+        scale: float,
+        log: Callable[[str], None] | None,
+    ) -> None:
+        self.device_ids = device_ids
+        self.raw = LazyCsvWriters(output / "raw", scale)
+        self.aligned = LazyCsvWriters(output / "pps_aligned", scale)
+        self.aligner = UsbPpsAligner(device_ids, sample_rate_hz)
+        self.log = log
+        self.lock = threading.Lock()
+        self.report_lines: list[str] = []
+        self.closed = False
+
+    def add(self, sample: UsbEpochSample) -> None:
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("raw+pps-aligned output is already closed")
+            self.raw.write(sample)
+            self._write_aligned(self.aligner.add(sample))
+
+    def _write_aligned(self, results: list[PpsAlignedSecond]) -> None:
+        for result in results:
+            line = (
+                "PPS_ALIGN,pps_epoch_us={pps},anchor_epoch_us={anchor},paired={paired},"
+                "dropped_{a}={dropped_a},dropped_{b}={dropped_b},missing_slots={missing}"
+            ).format(
+                pps=result.pps_epoch_us,
+                anchor="NA" if result.anchor_epoch_us is None else result.anchor_epoch_us,
+                paired=result.paired_count,
+                a=self.device_ids[0],
+                b=self.device_ids[1],
+                dropped_a=result.dropped_by_device.get(self.device_ids[0], 0),
+                dropped_b=result.dropped_by_device.get(self.device_ids[1], 0),
+                missing=result.missing_slots,
+            )
+            self.report_lines.append(line)
+            emit(line, self.log)
+            if result.paired_count == 0:
+                continue
+            for index in range(result.paired_count):
+                for device_id in self.device_ids:
+                    logical_epoch_us, sample = result.paired[device_id][index]
+                    self.aligned.write(sample, output_epoch_us=logical_epoch_us)
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self._write_aligned(self.aligner.flush())
+            self.raw.close()
+            self.aligned.close()
+            self.closed = True
+
+
 def find_latest_sensor_csv(output: Path, device_id: str) -> Path:
     sensor_dir = output / f"sensor{device_id}"
     candidates = list(sensor_dir.glob("*/tx_usb_capacity.csv"))
@@ -694,8 +1003,10 @@ def serial_worker(
     stop_event: threading.Event,
     stats: PortStats,
     log: Callable[[str], None] | None = None,
+    combined_output: RawAndPpsAlignedOutput | None = None,
 ) -> None:
-    csv_path, csv_fp = open_sensor_csv(config.output, device_id)
+    csv_path: Path | None = None
+    csv_fp: TextIO | None = None
     wrote_header = False
     command_sent = False
     csv_timebase = resolve_csv_timebase(config)
@@ -704,10 +1015,13 @@ def serial_worker(
     try:
         with serial.Serial(port, config.baud, timeout=0.2) as ser:
             time.sleep(config.serial_startup_delay_seconds)
-            emit(f"[info] {port}: writing {csv_path}", log)
+            emit(f"[info] {port}: waiting for SENSOR_READY and GPS/PPS", log)
 
             while not stop_event.is_set():
-                if not command_sent and (not config.gps_sync or stats.gps_sync_seen):
+                if not command_sent and (
+                    not config.gps_sync
+                    or (stats.gps_sync_seen and stats.sensor_ready_seen)
+                ):
                     start_epoch_us = coordinator.wait_for_start_epoch(stop_event)
                     if start_epoch_us is not None:
                         command = (
@@ -744,15 +1058,29 @@ def serial_worker(
                         current_packet_samples_seen = 0
                 elif parsed.kind == "gps":
                     stats.record_gps(parsed)
-                    coordinator.mark_gps_ready(parsed.device_id)
+                    if (
+                        parsed.pps_epoch_us is not None
+                        and parsed.timebase_healthy != 0
+                        and (parsed.gps_age_ms is None or parsed.gps_age_ms <= 3000)
+                    ):
+                        coordinator.mark_gps_ready(parsed.device_id, parsed.pps_epoch_us)
                     if line.startswith("GPS sync:"):
                         emit(f"[{port} serial] {line}", log)
                 elif parsed.kind == "clksync":
                     stats.record_clksync(parsed)
-                    coordinator.mark_gps_ready(parsed.device_id)
+                    if parsed.pps_epoch_us is not None and parsed.clk_healthy == 1:
+                        coordinator.mark_gps_ready(parsed.device_id, parsed.pps_epoch_us)
+                elif parsed.kind == "sensor_ready":
+                    stats.record_sensor_ready(parsed)
+                    if stats.sensor_ready_seen:
+                        coordinator.mark_sensor_ready(parsed.device_id)
+                        emit(f"[{port} serial] {line}", log)
                 elif parsed.kind == "stats":
                     stats.record_stats(parsed)
                 elif parsed.kind == "sample":
+                    if parsed.device_id != device_id or parsed.epoch_us is None:
+                        stats.record_sample(parsed)
+                        continue
                     csv_epoch_us: int | None = None
                     if (
                         csv_timebase == "aligned"
@@ -772,23 +1100,38 @@ def serial_worker(
                     if parsed.device_id == device_id:
                         current_packet_samples_seen += 1
                     stats.record_sample(parsed, csv_epoch_us=csv_epoch_us)
-                    write_sample_csv(
-                        csv_fp,
-                        include_header=not wrote_header,
+                    sample = UsbEpochSample(
                         device_id=parsed.device_id,
-                        epoch_us=parsed.epoch_us or 0,
+                        epoch_us=parsed.epoch_us,
                         ax_raw=parsed.ax_raw or 0,
                         ay_raw=parsed.ay_raw or 0,
                         az_raw=parsed.az_raw or 0,
-                        scale=config.scale,
-                        csv_epoch_us=csv_epoch_us,
                     )
-                    wrote_header = True
+                    if combined_output is not None:
+                        combined_output.add(sample)
+                    else:
+                        if csv_fp is None:
+                            csv_path, csv_fp = open_sensor_csv(config.output, device_id)
+                            emit(f"[info] {port}: writing {csv_path}", log)
+                        write_sample_csv(
+                            csv_fp,
+                            include_header=not wrote_header,
+                            device_id=parsed.device_id,
+                            epoch_us=parsed.epoch_us,
+                            ax_raw=sample.ax_raw,
+                            ay_raw=sample.ay_raw,
+                            az_raw=sample.az_raw,
+                            scale=config.scale,
+                            csv_epoch_us=csv_epoch_us,
+                        )
+                        csv_fp.flush()
+                        wrote_header = True
     except SerialException as exc:
         stats.serial_errors += 1
         emit(f"[error] {port}: serial open failed: {exc}", log)
     finally:
-        csv_fp.close()
+        if csv_fp is not None:
+            csv_fp.close()
 
 
 def emit(message: str, log: Callable[[str], None] | None = None) -> None:
@@ -829,9 +1172,13 @@ def format_report_lines(
     if scale is None:
         scale = scale_for_range_g(range_g)
     meaning = (
-        "common analysis grid"
-        if csv_timebase == "aligned"
-        else "GPS-calibrated INT1 edge time"
+        "raw GPS timestamps plus per-PPS common grid"
+        if csv_timebase == "raw+pps-aligned"
+        else (
+            "common analysis grid"
+            if csv_timebase == "aligned"
+            else "GPS-calibrated INT1 edge time"
+        )
     )
     lines = [
         "[info] TX USB capacity report "
@@ -849,7 +1196,9 @@ def format_report_lines(
             "parse_errors={parse_errors} serial_errors={serial_errors} "
             "int1_missing={int1_missing} int1_overflow={int1_overflow} "
             "fifo_read_fail={fifo_read_fail} int1_edges={int1_edges} "
-            "int1_pin={int1_pin}".format(
+            "int1_pin={int1_pin} sensor_ready={sensor_ready} "
+            "sensor_who={sensor_who} sensor_clk_in={sensor_clk_in} "
+            "sensor_int1_drdy={sensor_int1_drdy}".format(
                 port=stats.port,
                 dev=stats.expected_device_id,
                 rows=stats.rows,
@@ -868,6 +1217,16 @@ def format_report_lines(
                 fifo_read_fail=stats.fifo_read_fail,
                 int1_edges=stats.int1_edges,
                 int1_pin="NA" if stats.int1_pin is None else stats.int1_pin,
+                sensor_ready=1 if stats.sensor_ready_seen else 0,
+                sensor_who=(
+                    "NA" if stats.sensor_who is None else f"0x{stats.sensor_who:02X}"
+                ),
+                sensor_clk_in=(
+                    "NA" if stats.sensor_clk_in is None else stats.sensor_clk_in
+                ),
+                sensor_int1_drdy=(
+                    "NA" if stats.sensor_int1_drdy is None else stats.sensor_int1_drdy
+                ),
             )
         )
         if gps_sync:
@@ -975,7 +1334,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--csv-timebase",
         choices=CSV_TIMEBASE_CHOICES,
         default="raw",
-        help="CSV datetime source: raw writes GPS/PPS-calibrated TX sample times; aligned writes a common analysis grid",
+        help=(
+            "CSV output mode: raw writes GPS/PPS timestamps; aligned writes the legacy "
+            "run grid; raw+pps-aligned keeps raw and writes a new common grid each UTC second"
+        ),
     )
     parser.add_argument("--ports", help="Comma-separated ports, e.g. COM7,COM8")
     parser.add_argument("--device-ids", help="Comma-separated ids, e.g. 1001,1002")
@@ -1020,6 +1382,11 @@ def validate_capture_args(args: argparse.Namespace) -> argparse.Namespace:
     if getattr(args, "csv_timebase", "auto") not in CSV_TIMEBASE_CHOICES:
         allowed = ", ".join(CSV_TIMEBASE_CHOICES)
         raise SystemExit(f"--csv-timebase must be one of: {allowed}")
+    if args.csv_timebase == "raw+pps-aligned":
+        if not args.gps_sync:
+            raise SystemExit("--csv-timebase raw+pps-aligned requires --gps-sync")
+        if len(args.device_ids) != 2 or args.device_ids[0] == args.device_ids[1]:
+            raise SystemExit("--csv-timebase raw+pps-aligned requires two distinct device ids")
     return args
 
 
@@ -1048,7 +1415,17 @@ def run_capture(
         start_delay_seconds=config.start_delay_seconds,
         gps_sync=config.gps_sync,
         gps_sync_wait_seconds=config.gps_sync_wait_seconds,
+        require_sensor_ready=config.gps_sync,
     )
+    combined_output = None
+    if resolve_csv_timebase(config) == "raw+pps-aligned":
+        combined_output = RawAndPpsAlignedOutput(
+            output=config.output,
+            device_ids=(config.device_ids[0], config.device_ids[1]),
+            sample_rate_hz=config.sample_rate_hz,
+            scale=config.scale,
+            log=log,
+        )
 
     emit(
         f"[info] Starting TX USB capacity test ports={','.join(config.ports)} "
@@ -1061,7 +1438,16 @@ def run_capture(
     threads = [
         threading.Thread(
             target=serial_worker,
-            args=(stats.port, stats.expected_device_id, config, coordinator, stop_event, stats, log),
+            args=(
+                stats.port,
+                stats.expected_device_id,
+                config,
+                coordinator,
+                stop_event,
+                stats,
+                log,
+                combined_output,
+            ),
             name=f"tx-usb-{stats.port}",
             daemon=True,
         )
@@ -1070,10 +1456,30 @@ def run_capture(
     for thread in threads:
         thread.start()
 
-    startup_budget = config.gps_sync_wait_seconds if config.gps_sync else 0.0
-    stop_after = time.monotonic() + startup_budget + config.start_delay_seconds + config.duration_seconds
+    startup_deadline = (
+        coordinator.started_at_monotonic + config.gps_sync_wait_seconds
+        if config.gps_sync
+        else None
+    )
+    capture_deadline: float | None = None
     try:
-        while time.monotonic() < stop_after and not stop_event.is_set():
+        while not stop_event.is_set():
+            now_monotonic = time.monotonic()
+            start_epoch_us = coordinator.current_start_epoch()
+            if start_epoch_us is not None and capture_deadline is None:
+                # START_AT is derived from device GPS/PPS, so the PC wall clock
+                # may be wrong.  The requested delay is a safe upper bound here.
+                seconds_until_start = config.start_delay_seconds + 1.0
+                capture_deadline = now_monotonic + seconds_until_start + config.duration_seconds
+            if capture_deadline is not None and now_monotonic >= capture_deadline:
+                break
+            if (
+                capture_deadline is None
+                and startup_deadline is not None
+                and now_monotonic >= startup_deadline
+            ):
+                emit("[error] Timed out waiting for both SENSOR_READY and GPS/PPS", log)
+                break
             time.sleep(0.2)
     except KeyboardInterrupt:
         emit("[info] Interrupted, stopping capture", log)
@@ -1081,23 +1487,36 @@ def run_capture(
         stop_event.set()
 
     for thread in threads:
-        thread.join(timeout=3.0)
+        thread.join()
+    if combined_output is not None:
+        combined_output.close()
     csv_timebase = resolve_csv_timebase(config)
-    for line in format_report_lines(
+    report_lines = format_report_lines(
         stats_items,
         config.duration_seconds,
         gps_sync=config.gps_sync,
         csv_timebase=csv_timebase,
         range_g=config.range_g,
         scale=config.scale,
-    ):
+    )
+    for line in report_lines:
         emit(line, log)
+
+    if combined_output is not None and all(stats.rows > 0 for stats in stats_items):
+        config.output.mkdir(parents=True, exist_ok=True)
+        report_path = config.output / "capture_report.txt"
+        report_path.write_text(
+            "\n".join([*combined_output.report_lines, *report_lines]) + "\n",
+            encoding="utf-8",
+        )
+        emit(f"[info] wrote {report_path}", log)
 
     failed = any(
         stats.serial_errors > 0
         or stats.rows == 0
         or not math.isfinite(stats.capture_ratio(config.duration_seconds))
         or (config.gps_sync and not stats.gps_sync_seen)
+        or (config.gps_sync and not stats.sensor_ready_seen)
         for stats in stats_items
     )
     return (1 if failed else 0), stats_items
@@ -1241,10 +1660,15 @@ def run_gui(config: argparse.Namespace) -> int:
     def analyze_time_error() -> None:
         try:
             args = build_config_from_form()
+            analysis_output = (
+                args.output / "raw"
+                if resolve_csv_timebase(args) == "raw+pps-aligned"
+                else args.output
+            )
             report = format_gui_time_error_analysis(
-                output=args.output,
+                output=analysis_output,
                 device_ids=args.device_ids,
-                csv_timebase=resolve_csv_timebase(args),
+                csv_timebase="raw",
                 window_seconds=1.0,
             )
         except (SystemExit, ValueError, FileNotFoundError, OSError) as exc:
@@ -1315,12 +1739,12 @@ def run_gui(config: argparse.Namespace) -> int:
     stop_button = ttk.Button(form, text="Stop", command=stop_capture, state="disabled")
     stop_button.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(10, 0))
     ttk.Checkbutton(form, text="GPS sync", variable=gps_sync_var).grid(row=4, column=2, sticky="w", padx=(16, 0), pady=(10, 0))
-    ttk.Label(form, text="CSV timebase raw/aligned").grid(row=4, column=3, sticky="w", padx=(16, 0), pady=(10, 0))
+    ttk.Label(form, text="CSV output mode").grid(row=4, column=3, sticky="w", padx=(16, 0), pady=(10, 0))
     ttk.Combobox(
         form,
         textvariable=csv_timebase_var,
         values=list(CSV_TIMEBASE_CHOICES),
-        width=10,
+        width=18,
         state="readonly",
     ).grid(row=4, column=4, sticky="ew", padx=(8, 0), pady=(10, 0))
     ttk.Button(form, text="Analyze time error", command=analyze_time_error).grid(row=4, column=5, sticky="ew", padx=(8, 0), pady=(10, 0))

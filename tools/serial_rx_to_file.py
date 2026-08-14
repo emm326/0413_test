@@ -85,6 +85,12 @@ EPOCH_PLAUSIBILITY_FUTURE_SECONDS = 300.0
 SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 EPOCH_US_THRESHOLD = 1_000_000_000_000
 TK_RELAUNCH_ENV = "SERIAL_RX_TO_FILE_TK_RELAUNCHED"
+CSV_TIMEBASE_CHOICES = ("raw", "pps-aligned")
+DEFAULT_PPS_ALIGNED_DEVICE_IDS = ("1001", "1002")
+# P2P packets can arrive in bursts, so keep a small bounded UTC-second window
+# for out-of-order packets.  A node that falls more than this behind is treated
+# as missing for the old second; later packets for that second are discarded.
+PPS_ALIGNED_REORDER_WINDOW_SECONDS = 5
 
 
 @dataclass
@@ -106,6 +112,8 @@ class CaptureConfig:
     start_delay_seconds: float
     sample_rate_hz: float
     serial_startup_delay_seconds: float
+    csv_timebase: str
+    pps_aligned_device_ids: tuple[str, str]
     gap_csv_files: list[Path]
     gap_factor: float
     gap_samples_per_packet: int
@@ -129,6 +137,120 @@ class ParsedSample:
     az_raw: int
     from_legacy_line: bool
     time_is_epoch_us: bool
+
+
+@dataclass(frozen=True)
+class EpochSample:
+    device_id: str
+    epoch_us: int
+    ax_raw: int
+    ay_raw: int
+    az_raw: int
+
+
+@dataclass
+class PpsAlignedSecond:
+    pps_epoch_us: int
+    anchor_epoch_us: int | None
+    paired_count: int
+    samples_by_device: dict[str, list[EpochSample]]
+    dropped_by_device: dict[str, int]
+    missing_device_ids: tuple[str, ...]
+
+
+class PpsAlignedBatcher:
+    """Buffer two GPS-timestamped streams and align them one UTC second at a time."""
+
+    def __init__(self, device_ids: tuple[str, str], sample_rate_hz: float) -> None:
+        if len(device_ids) != 2 or device_ids[0] == device_ids[1]:
+            raise ValueError("pps-aligned requires exactly two distinct device ids")
+        self.device_ids = device_ids
+        self.period_us = 1_000_000.0 / actual_iim_sample_rate_hz(sample_rate_hz)
+        self._buckets: dict[int, dict[str, list[EpochSample]]] = {}
+        self._latest_second: dict[str, int] = {}
+        self._finalized_through: int | None = None
+        self.late_samples = 0
+        self.ignored_samples = 0
+
+    def add(self, sample: EpochSample) -> list[PpsAlignedSecond]:
+        if sample.device_id not in self.device_ids:
+            self.ignored_samples += 1
+            return []
+
+        second = sample.epoch_us // 1_000_000
+        if self._finalized_through is not None and second <= self._finalized_through:
+            self.late_samples += 1
+            return []
+
+        bucket = self._buckets.setdefault(second, {})
+        bucket.setdefault(sample.device_id, []).append(sample)
+        self._latest_second[sample.device_id] = max(
+            second, self._latest_second.get(sample.device_id, second)
+        )
+
+        # Normally a second is complete after both streams have advanced past
+        # it.  Keep the buffer bounded as well: when one stream is absent or
+        # severely delayed, expire old seconds after a modest P2P reordering
+        # window instead of retaining data indefinitely.
+        latest_seconds = tuple(self._latest_second.values())
+        normal_cutoff = (
+            min(latest_seconds) if len(latest_seconds) == len(self.device_ids) else 0
+        )
+        expiry_cutoff = max(latest_seconds) - PPS_ALIGNED_REORDER_WINDOW_SECONDS
+        return self._finalize_before(max(normal_cutoff, expiry_cutoff))
+
+    def flush(self) -> list[PpsAlignedSecond]:
+        results: list[PpsAlignedSecond] = []
+        for second in sorted(self._buckets):
+            results.append(self._build_second(second, self._buckets[second]))
+            self._finalized_through = second
+        self._buckets.clear()
+        return results
+
+    def _finalize_before(self, cutoff_second: int) -> list[PpsAlignedSecond]:
+        results: list[PpsAlignedSecond] = []
+        for second in sorted(value for value in self._buckets if value < cutoff_second):
+            results.append(self._build_second(second, self._buckets.pop(second)))
+            self._finalized_through = second
+        return results
+
+    def _build_second(
+        self, second: int, bucket: dict[str, list[EpochSample]]
+    ) -> PpsAlignedSecond:
+        per_device = {
+            device_id: sorted(bucket.get(device_id, []), key=lambda sample: sample.epoch_us)
+            for device_id in self.device_ids
+        }
+        missing = tuple(device_id for device_id, samples in per_device.items() if not samples)
+        dropped = {device_id: len(samples) for device_id, samples in per_device.items()}
+        if missing:
+            return PpsAlignedSecond(
+                pps_epoch_us=second * 1_000_000,
+                anchor_epoch_us=None,
+                paired_count=0,
+                samples_by_device={device_id: [] for device_id in self.device_ids},
+                dropped_by_device=dropped,
+                missing_device_ids=missing,
+            )
+
+        anchor_epoch_us = max(samples[0].epoch_us for samples in per_device.values())
+        remaining_us = (second + 1) * 1_000_000 - anchor_epoch_us
+        grid_slots = max(0, int(math.ceil(remaining_us / self.period_us - 1e-12)))
+        paired_count = min(grid_slots, *(len(samples) for samples in per_device.values()))
+        paired = {
+            device_id: samples[:paired_count] for device_id, samples in per_device.items()
+        }
+        dropped = {
+            device_id: len(samples) - paired_count for device_id, samples in per_device.items()
+        }
+        return PpsAlignedSecond(
+            pps_epoch_us=second * 1_000_000,
+            anchor_epoch_us=anchor_epoch_us,
+            paired_count=paired_count,
+            samples_by_device=paired,
+            dropped_by_device=dropped,
+            missing_device_ids=(),
+        )
 
 
 @dataclass
@@ -193,6 +315,13 @@ def parse_ports_text(text: str) -> list[str]:
             unique_ports.append(port)
             seen.add(key)
     return unique_ports
+
+
+def parse_pps_aligned_device_ids(text: str) -> tuple[str, str]:
+    values = tuple(item.strip() for item in re.split(r"[,;\s]+", text) if item.strip())
+    if len(values) != 2 or values[0] == values[1] or any(not value.isdigit() for value in values):
+        raise ValueError("pps-aligned device ids must be two distinct numeric ids, for example 1001,1002")
+    return values[0], values[1]
 
 
 def parse_gap_csv_paths_text(text: str) -> list[Path]:
@@ -335,6 +464,20 @@ def parse_args() -> CaptureConfig | None:
         help="Optional anchor time. Example: 2026/3/13 1:27:28.0320",
     )
     parser.add_argument(
+        "--csv-timebase",
+        choices=CSV_TIMEBASE_CHOICES,
+        default="raw",
+        help=(
+            "CSV time source: raw writes received UTC timestamps; pps-aligned buffers both "
+            "nodes by UTC second and writes a common logical grid"
+        ),
+    )
+    parser.add_argument(
+        "--pps-aligned-device-ids",
+        default=",".join(DEFAULT_PPS_ALIGNED_DEVICE_IDS),
+        help="Two node ids used by --csv-timebase pps-aligned. Default: 1001,1002",
+    )
+    parser.add_argument(
         "--append",
         action="store_true",
         help="Append to the output file instead of overwriting it",
@@ -418,6 +561,11 @@ def parse_args() -> CaptureConfig | None:
         allowed = ", ".join(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ)
         raise SystemExit(f"--sample-rate-hz must be one of: {allowed}")
 
+    try:
+        pps_aligned_device_ids = parse_pps_aligned_device_ids(args.pps_aligned_device_ids)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     if args.analyze_gaps:
         if args.gap_factor <= 0:
             raise SystemExit("--gap-factor must be greater than 0")
@@ -443,6 +591,8 @@ def parse_args() -> CaptureConfig | None:
             start_delay_seconds=float(args.start_delay_seconds),
             sample_rate_hz=float(args.sample_rate_hz),
             serial_startup_delay_seconds=float(args.serial_startup_delay_seconds),
+            csv_timebase=str(args.csv_timebase),
+            pps_aligned_device_ids=pps_aligned_device_ids,
             gap_csv_files=[Path(item) for item in args.analyze_gaps],
             gap_factor=float(args.gap_factor),
             gap_samples_per_packet=int(args.samples_per_packet),
@@ -482,6 +632,8 @@ def parse_args() -> CaptureConfig | None:
         start_delay_seconds=float(args.start_delay_seconds),
         sample_rate_hz=float(args.sample_rate_hz),
         serial_startup_delay_seconds=float(args.serial_startup_delay_seconds),
+        csv_timebase=str(args.csv_timebase),
+        pps_aligned_device_ids=pps_aligned_device_ids,
         gap_csv_files=[],
         gap_factor=float(args.gap_factor),
         gap_samples_per_packet=int(args.samples_per_packet),
@@ -823,12 +975,68 @@ class CsvWriterManager:
         return active_file
 
 
+def build_csv_row(config: CaptureConfig, sample: EpochSample, sample_time: datetime) -> list[str]:
+    row: list[str] = []
+    if config.include_id:
+        row.append(sample.device_id)
+    row.extend(
+        [
+            format_datetime_4(sample_time),
+            f"{convert_value(sample.ax_raw, config.scale):.6f}",
+            f"{convert_value(sample.ay_raw, config.scale):.6f}",
+            f"{convert_value(sample.az_raw, config.scale):.6f}",
+        ]
+    )
+    return row
+
+
+def write_pps_aligned_results(
+    results: list[PpsAlignedSecond],
+    config: CaptureConfig,
+    writer_manager: CsvWriterManager,
+    log: Callable[[str], None] | None,
+) -> None:
+    for result in results:
+        missing = ",".join(result.missing_device_ids) or "-"
+        dropped = ",".join(
+            f"{device_id}:{result.dropped_by_device.get(device_id, 0)}"
+            for device_id in config.pps_aligned_device_ids
+        )
+        anchor = "-" if result.anchor_epoch_us is None else str(result.anchor_epoch_us)
+        emit(
+            "PPS_ALIGN,pps_epoch_us={pps},anchor_epoch_us={anchor},paired={paired},"
+            "dropped={dropped},missing={missing}".format(
+                pps=result.pps_epoch_us,
+                anchor=anchor,
+                paired=result.paired_count,
+                dropped=dropped,
+                missing=missing,
+            ),
+            log,
+        )
+        if result.anchor_epoch_us is None:
+            continue
+
+        period_us = 1_000_000.0 / actual_iim_sample_rate_hz(config.sample_rate_hz)
+        for index in range(result.paired_count):
+            logical_epoch_us = int(round(result.anchor_epoch_us + index * period_us))
+            logical_time = epoch_us_to_datetime(logical_epoch_us)
+            for device_id in config.pps_aligned_device_ids:
+                sample = result.samples_by_device[device_id][index]
+                row = build_csv_row(config, sample, logical_time)
+                writer_manager.write_row(device_id, logical_time, row)
+                if config.echo_data:
+                    emit("[pps-aligned] " + ",".join(row), log)
+
+
 def read_serial_port(
     port: str,
     config: CaptureConfig,
     anchors: dict[str, TimeAnchor],
     anchor_lock: threading.Lock,
     writer_manager: CsvWriterManager,
+    pps_aligner: PpsAlignedBatcher | None,
+    pps_align_lock: threading.Lock,
     stop_event: threading.Event,
     log: Callable[[str], None] | None = None,
 ) -> int:
@@ -899,18 +1107,27 @@ def read_serial_port(
                 )
                 omitted_id_warned = True
 
-            row = []
-            if config.include_id:
-                row.append(sample.device_id)
-            row.extend(
-                [
-                    format_datetime_4(sample_time),
-                    f"{convert_value(sample.ax_raw, config.scale):.6f}",
-                    f"{convert_value(sample.ay_raw, config.scale):.6f}",
-                    f"{convert_value(sample.az_raw, config.scale):.6f}",
-                ]
+            epoch_sample = EpochSample(
+                device_id=sample.device_id,
+                epoch_us=sample.sensor_ms if sample.time_is_epoch_us else 0,
+                ax_raw=sample.ax_raw,
+                ay_raw=sample.ay_raw,
+                az_raw=sample.az_raw,
             )
+            if config.csv_timebase == "pps-aligned":
+                if not sample.time_is_epoch_us:
+                    emit(
+                        f"[warn] {port}: pps-aligned dropped non-UTC sample from {sample.device_id}",
+                        log,
+                    )
+                    continue
+                assert pps_aligner is not None
+                with pps_align_lock:
+                    results = pps_aligner.add(epoch_sample)
+                    write_pps_aligned_results(results, config, writer_manager, log)
+                continue
 
+            row = build_csv_row(config, epoch_sample, sample_time)
             writer_manager.write_row(sample.device_id, sample_time, row)
 
             if config.echo_data:
@@ -933,6 +1150,12 @@ def capture(
     results: dict[str, int] = {}
     results_lock = threading.Lock()
     writer_manager = CsvWriterManager(config, log)
+    pps_aligner = (
+        PpsAlignedBatcher(config.pps_aligned_device_ids, config.sample_rate_hz)
+        if config.csv_timebase == "pps-aligned"
+        else None
+    )
+    pps_align_lock = threading.Lock()
 
     emit(f"[info] Listening ports: {', '.join(config.ports)}", log)
     if config.rotate_minutes > 0:
@@ -948,6 +1171,18 @@ def capture(
     else:
         emit(f"[info] Output file: {config.output}", log)
     emit(f"[info] Scale: {config.scale}", log)
+    emit(
+        f"[info] CSV timebase: {config.csv_timebase}",
+        log,
+    )
+    if pps_aligner is not None:
+        emit(
+            "[info] PPS aligned devices: {devices}; actual_iim_fs={rate:g}Hz".format(
+                devices=",".join(config.pps_aligned_device_ids),
+                rate=actual_iim_sample_rate_hz(config.sample_rate_hz),
+            ),
+            log,
+        )
     emit(f"[info] Include id column: {config.include_id}", log)
     if config.send_start_at:
         emit(
@@ -958,7 +1193,13 @@ def capture(
         )
     else:
         emit("[info] START_AT disabled", log)
-    if config.base_time is None:
+    if pps_aligner is not None:
+        emit(
+            "[info] PPS aligned timestamps use UTC epochs reconstructed by RX; "
+            "PC base time is ignored",
+            log,
+        )
+    elif config.base_time is None:
         emit("[info] The first sample from each device will anchor to current PC time", log)
     else:
         emit(
@@ -974,6 +1215,8 @@ def capture(
             anchors,
             anchor_lock,
             writer_manager,
+            pps_aligner,
+            pps_align_lock,
             stop_event,
             log,
         )
@@ -1001,6 +1244,17 @@ def capture(
         stop_event.set()
         for thread in threads:
             thread.join(timeout=2)
+        if pps_aligner is not None:
+            with pps_align_lock:
+                write_pps_aligned_results(pps_aligner.flush(), config, writer_manager, log)
+                if pps_aligner.late_samples or pps_aligner.ignored_samples:
+                    emit(
+                        "[info] PPS aligned discarded late_samples={late},ignored_samples={ignored}".format(
+                            late=pps_aligner.late_samples,
+                            ignored=pps_aligner.ignored_samples,
+                        ),
+                        log,
+                    )
         writer_manager.close()
 
     with results_lock:
@@ -1124,6 +1378,7 @@ def run_gui() -> int:
     start_delay_var = tk.StringVar(value=str(DEFAULT_START_DELAY_SECONDS))
     sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
     serial_startup_delay_var = tk.StringVar(value=str(DEFAULT_SERIAL_STARTUP_DELAY_SECONDS))
+    csv_timebase_var = tk.StringVar(value="raw")
     gap_files_var = tk.StringVar()
     gap_sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
     gap_samples_per_packet_var = tk.StringVar(value=str(DEFAULT_GAP_SAMPLES_PER_PACKET))
@@ -1198,6 +1453,7 @@ def run_gui() -> int:
             start_delay_seconds = float(start_delay_var.get().strip())
             sample_rate_hz = float(sample_rate_var.get().strip())
             serial_startup_delay_seconds = float(serial_startup_delay_var.get().strip())
+            csv_timebase = csv_timebase_var.get().strip()
         except ValueError as exc:
             messagebox.showerror("Invalid option", f"Numeric option is invalid: {exc}")
             return None
@@ -1218,6 +1474,9 @@ def run_gui() -> int:
         if not is_supported_sample_rate(sample_rate_hz):
             allowed = ", ".join(f"{rate:g}" for rate in SUPPORTED_SAMPLE_RATES_HZ)
             messagebox.showerror("Invalid sample rate", f"Sample Hz must be one of: {allowed}")
+            return None
+        if csv_timebase not in CSV_TIMEBASE_CHOICES:
+            messagebox.showerror("Invalid CSV timebase", "CSV timebase must be raw or pps-aligned")
             return None
 
         ports = parse_ports_text(port_var.get())
@@ -1255,6 +1514,8 @@ def run_gui() -> int:
             start_delay_seconds=start_delay_seconds,
             sample_rate_hz=sample_rate_hz,
             serial_startup_delay_seconds=serial_startup_delay_seconds,
+            csv_timebase=csv_timebase,
+            pps_aligned_device_ids=DEFAULT_PPS_ALIGNED_DEVICE_IDS,
             gap_csv_files=[],
             gap_factor=DEFAULT_GAP_FACTOR,
             gap_samples_per_packet=DEFAULT_GAP_SAMPLES_PER_PACKET,
@@ -1423,6 +1684,14 @@ def run_gui() -> int:
     sample_rate_combo.grid(row=5, column=4, sticky="ew", pady=4)
     ttk.Label(form, text="Boot Wait s").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Entry(form, textvariable=serial_startup_delay_var, width=8).grid(row=6, column=1, sticky="ew", pady=4)
+    ttk.Label(form, text="CSV timebase").grid(row=6, column=3, sticky="w", padx=(8, 8), pady=4)
+    ttk.Combobox(
+        form,
+        textvariable=csv_timebase_var,
+        values=CSV_TIMEBASE_CHOICES,
+        width=12,
+        state="readonly",
+    ).grid(row=6, column=4, sticky="ew", pady=4)
 
     ttk.Label(form, text="CSV Gap Files").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Entry(form, textvariable=gap_files_var).grid(row=7, column=1, columnspan=3, sticky="ew", pady=4)

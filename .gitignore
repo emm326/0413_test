@@ -6,6 +6,9 @@ __pycache__/
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.reasonix
+tmp
+data_usb_pps_sync
 data/
 data1
 data2

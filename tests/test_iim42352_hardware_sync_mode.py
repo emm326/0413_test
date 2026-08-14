@@ -22,8 +22,9 @@ class Iim42352HardwareSyncModeTest(unittest.TestCase):
         self.assertIn("APP_IIM42352_CLKOUT_HZ_VALUE 32768UL", config)
         self.assertIn("IIM42352_CLKOUT_HZ", config)
         self.assertIn("IIM42352_SYNC_WARMUP_MS", config)
-        self.assertNotIn("-D APP_IIM42352_GPS_DISCIPLINED_CLKIN=1", platformio)
-        self.assertNotIn("-D APP_IIM42352_CLKOUT_DPLL=1", platformio)
+        default_block = platformio.split("[common]", 1)[0]
+        self.assertNotIn("clk_sync", default_block)
+        self.assertNotIn("APP_IIM42352_GPS_DISCIPLINED_CLKIN", default_block)
 
     def test_firmware_emits_clksync_and_aligns_start_to_gps_second(self):
         main = read_text("src/main.cpp")
@@ -83,6 +84,21 @@ class Iim42352HardwareSyncModeTest(unittest.TestCase):
         self.assertIn("IIM42352Driver::rangeConfigured", iim_cpp)
         self.assertIn("range verify failed", main)
         self.assertIn("ACCEL_CONFIG0=0x%02X,verified=1", main)
+
+    def test_iim_startup_self_check_is_strict_and_uses_slow_spi(self):
+        config = read_text("include/config.h")
+        iim_header = read_text("lib/IIM42352Driver/src/IIM42352Driver.h")
+        iim_cpp = read_text("lib/IIM42352Driver/src/IIM42352Driver.cpp")
+        main = read_text("src/main.cpp")
+
+        self.assertIn("IIM42352_SPI_CLOCK_HZ = 1000000UL", config)
+        self.assertIn("uint32_t spiClockHz = 1000000UL", iim_header)
+        self.assertGreaterEqual(iim_cpp.count("checkDeviceIdConsecutive(2)"), 3)
+        self.assertIn("delay(50);", iim_cpp)
+        self.assertIn("iimInt1EdgesGrowing", main)
+        self.assertIn("int1EdgeRecent", main)
+        self.assertIn("SENSOR_READY,%u,0x%02X,%u,%u,%lu", main)
+        self.assertIn("TX USB ignored START_AT sensor not ready", main)
 
 
 if __name__ == "__main__":

@@ -281,6 +281,29 @@ T = 1 / 51.2 Hz = 19.53125 ms
 
 如果两个传感器安装在结构的不同位置，冲击峰值、互相关峰值或相位差还可能包含真实的振动传播时间。只有把两个传感器同位置、同方向安装并施加同一激励，或者使用示波器/公共电触发，才能把信号延迟主要解释为测量同步误差。
 
+## PPS 每秒软件拉回（无线 `pps-aligned`）
+
+无线软件版本不修改 DS3231、IIM 或 GPS 的物理接线。每个 TX 仍以本地 GPS PPS 建立 UTC 时间，并由 DS3231 32.768 kHz 连续驱动 IIM。PC 下发的 P2P `START_AT` 会由 RX 向上对齐到下一个 UTC 整秒并广播；各 TX 在该目标秒或之后的首个本地 PPS 开始本轮采集。RX 不接收物理 PPS 电平，也不使用无线包到达时刻作为时间基准。
+
+RX 串口采集工具新增 `--csv-timebase pps-aligned`。它根据无线包重建的 UTC 时间将两个节点按整秒缓存；每秒取两节点 PPS 后首条样本中较晚的 UTC 时间为共同锚点 `G`，然后把第 `k` 对样本写为：
+
+```text
+datetime(k) = G + k * T
+```
+
+其中 `T` 是实际 IIM 采样周期。到下一个 UTC 秒时重新计算 `G`，所以软件时间网格每秒都会拉回。若任一节点该秒缺样、乱序过晚或两节点样本数不同，则仅输出可一对一配对的部分，并在控制台输出 `PPS_ALIGN` 统计；P2P 乱序缓存最多保留 5 个 UTC 秒，超过该窗口的迟到样本会丢弃。不插值补造样本，也不保存 PPS sidecar 或额外 metadata 文件。
+
+运行无线接收保存时使用：
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" tools\serial_rx_to_file.py `
+  --port COMx --output data_pps_aligned --rotate-minutes 30 --with-header `
+  --csv-timebase pps-aligned --pps-aligned-device-ids 1001,1002 `
+  --sample-rate-hz 50 --start-delay-seconds 10
+```
+
+`pps-aligned` 中两份 CSV 的逻辑 `datetime` 会一致，但这只证明软件公共网格一致；真实 INT1 相位差仍须用 `raw` 模式和示波器的 `PPS1001/PPS1002/INT1-1001/INT1-1002` 四通道测量验证。
+
 ## 参考文献
 
 1. K. Y. Koo, D. Hester, and S. Kim, “Time Synchronization for Wireless Sensors Using Low-Cost GPS Module and Arduino,” *Frontiers in Built Environment*, vol. 4, art. 82, 2018. https://doi.org/10.3389/fbuil.2018.00082

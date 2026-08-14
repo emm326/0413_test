@@ -10,8 +10,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.tx_usb_capacity_test import (
     DEFAULT_BAUD,
+    PPS_ALIGN_REORDER_WINDOW_SECONDS,
     PortStats,
+    RawAndPpsAlignedOutput,
     StartCoordinator,
+    UsbEpochSample,
+    UsbPpsAligner,
     aligned_grid_period_us,
     csv_epoch_for_sample,
     format_gui_time_error_analysis,
@@ -90,6 +94,16 @@ class TxUsbCapacityTest(unittest.TestCase):
         self.assertEqual(diag.first_int1_offset_us, 412)
         self.assertEqual(diag.clk_healthy, 1)
 
+    def test_parse_sensor_ready_line(self):
+        ready = parse_tx_usb_line("SENSOR_READY,1001,0x6D,1,1,123")
+
+        self.assertEqual(ready.kind, "sensor_ready")
+        self.assertEqual(ready.device_id, "1001")
+        self.assertEqual(ready.sensor_who, 0x6D)
+        self.assertEqual(ready.sensor_clk_in, 1)
+        self.assertEqual(ready.sensor_int1_drdy, 1)
+        self.assertEqual(ready.sensor_int1_edges, 123)
+
     def test_parse_clksync_dpll_diagnostic_line(self):
         diag = parse_tx_usb_line(
             "CLKSYNC,1001,1782723038000000,32767,1000004,-8,412,1,-31,32767,1"
@@ -141,6 +155,41 @@ class TxUsbCapacityTest(unittest.TestCase):
     def test_gps_sync_start_epoch_aligns_to_future_integer_second(self):
         self.assertEqual(align_epoch_to_next_second_us(120_000_001), 121_000_000)
         self.assertEqual(align_epoch_to_next_second_us(120_000_000), 120_000_000)
+
+    def test_start_coordinator_requires_gps_and_sensor_ready(self):
+        coordinator = StartCoordinator(
+            device_ids=["1001", "1002"],
+            start_delay_seconds=5.0,
+            gps_sync=True,
+            gps_sync_wait_seconds=30.0,
+            require_sensor_ready=True,
+            wall_clock=lambda: 100.2,
+            monotonic_clock=lambda: 10.0,
+        )
+        for device_id in ("1001", "1002"):
+            coordinator.mark_gps_ready(device_id)
+        self.assertIsNone(coordinator.start_epoch_us)
+        coordinator.mark_sensor_ready("1001")
+        self.assertIsNone(coordinator.start_epoch_us)
+        coordinator.mark_sensor_ready("1002")
+        self.assertEqual(coordinator.start_epoch_us, 106_000_000)
+
+    def test_start_coordinator_uses_device_gps_pps_instead_of_pc_clock(self):
+        coordinator = StartCoordinator(
+            device_ids=["1001", "1002"],
+            start_delay_seconds=5.0,
+            gps_sync=True,
+            gps_sync_wait_seconds=30.0,
+            require_sensor_ready=True,
+            wall_clock=lambda: 1.0,
+            monotonic_clock=lambda: 10.0,
+        )
+        coordinator.mark_gps_ready("1001", 1_786_000_000_000_000)
+        coordinator.mark_gps_ready("1002", 1_786_000_001_000_000)
+        coordinator.mark_sensor_ready("1001")
+        coordinator.mark_sensor_ready("1002")
+
+        self.assertEqual(coordinator.start_epoch_us, 1_786_000_006_000_000)
 
     def test_port_stats_detects_seq_gap_and_sample_gap(self):
         stats = PortStats(port="COM7", expected_device_id="1001", sample_rate_hz=50.0)
@@ -284,7 +333,7 @@ class TxUsbCapacityTest(unittest.TestCase):
 
             lines = path.read_text(encoding="utf-8").splitlines()
 
-        self.assertIn("18:57:16.7997", lines[1])
+        self.assertIn("10:57:16.7997", lines[1])
 
     def test_gui_mode_does_not_require_ports_on_cli(self):
         parser = build_arg_parser()
@@ -321,26 +370,26 @@ class TxUsbCapacityTest(unittest.TestCase):
     def test_usb_gps_sync_gui_defaults_use_current_com_ports(self):
         defaults = usb_gps_sync_gui_defaults()
 
-        self.assertEqual(defaults.ports, "COM6,COM12")
+        self.assertEqual(defaults.ports, "COM5,COM6")
         self.assertEqual(defaults.device_ids, "1001,1002")
         self.assertEqual(defaults.baud, DEFAULT_BAUD)
         self.assertEqual(defaults.sample_rate_hz, 50.0)
         self.assertEqual(defaults.range_g, 4)
         self.assertAlmostEqual(defaults.scale, 4 / 32768.0)
-        self.assertEqual(defaults.duration_seconds, 60.0)
+        self.assertEqual(defaults.duration_seconds, 600.0)
         self.assertEqual(defaults.start_delay_seconds, 5.0)
         self.assertEqual(defaults.serial_startup_delay_seconds, 2.0)
         self.assertTrue(defaults.gps_sync)
-        self.assertEqual(defaults.csv_timebase, "raw")
-        self.assertEqual(defaults.output, Path("data1"))
+        self.assertEqual(defaults.csv_timebase, "raw+pps-aligned")
+        self.assertEqual(defaults.output, Path("data_usb_pps_sync"))
         self.assertIn("usb_gps_sync_test", defaults.firmware_note)
-        self.assertIn("COM6->1001", defaults.firmware_note)
-        self.assertIn("COM12->1002", defaults.firmware_note)
+        self.assertIn("COM5->1001", defaults.firmware_note)
+        self.assertIn("COM6->1002", defaults.firmware_note)
         self.assertIn("GPS sync=on", defaults.firmware_note)
 
     def test_gui_defaults_profile_selects_usb_gps_by_default(self):
-        self.assertEqual(gui_defaults_for_profile(None).ports, "COM6,COM12")
-        self.assertEqual(gui_defaults_for_profile("usb-gps-sync").ports, "COM6,COM12")
+        self.assertEqual(gui_defaults_for_profile(None).ports, "COM5,COM6")
+        self.assertEqual(gui_defaults_for_profile("usb-gps-sync").ports, "COM5,COM6")
         self.assertEqual(gui_defaults_for_profile("indoor-cayd").ports, "COM6,COM16")
 
     def test_no_args_defaults_to_gui_mode(self):
@@ -510,6 +559,129 @@ class TxUsbCapacityTest(unittest.TestCase):
         self.assertEqual(stats.max_gap_us, 0)
         self.assertEqual(stats.first_epoch_us, 1782036104000000)
         self.assertEqual(stats.last_epoch_us, 1782036104039062)
+
+    def test_pps_aligner_drops_samples_before_common_anchor_and_pairs_slots(self):
+        aligner = UsbPpsAligner(("1001", "1002"), 50.0)
+        values = [
+            UsbEpochSample("1001", 1_010_000, 11, 12, 13),
+            UsbEpochSample("1001", 1_030_000, 14, 15, 16),
+            UsbEpochSample("1002", 1_015_000, 21, 22, 23),
+            UsbEpochSample("1002", 1_034_000, 24, 25, 26),
+        ]
+        for value in values:
+            aligner.add(value)
+        results = []
+        results.extend(aligner.add(UsbEpochSample("1001", 2_010_000, 0, 0, 0)))
+        results.extend(aligner.add(UsbEpochSample("1002", 2_010_000, 0, 0, 0)))
+
+        result = results[0]
+        self.assertEqual(result.anchor_epoch_us, 1_015_000)
+        self.assertEqual(result.paired_count, 1)
+        self.assertEqual(result.paired["1001"][0][1].ax_raw, 14)
+        self.assertEqual(result.paired["1002"][0][1].ax_raw, 24)
+        self.assertEqual(result.paired["1001"][0][0], result.paired["1002"][0][0])
+
+    def test_pps_aligner_skips_slot_missing_on_one_device(self):
+        aligner = UsbPpsAligner(("1001", "1002"), 50.0)
+        for item in (
+            UsbEpochSample("1001", 1_010_000, 1, 0, 0),
+            UsbEpochSample("1001", 1_029_531, 2, 0, 0),
+            UsbEpochSample("1002", 1_010_000, 3, 0, 0),
+        ):
+            aligner.add(item)
+        result = aligner.flush()[0]
+
+        self.assertEqual(result.paired_count, 1)
+        self.assertGreater(result.missing_slots, 0)
+        self.assertEqual(len(result.paired["1001"]), len(result.paired["1002"]))
+
+    def test_pps_aligner_handles_out_of_order_and_duplicate_samples(self):
+        aligner = UsbPpsAligner(("1001", "1002"), 50.0)
+        for item in (
+            UsbEpochSample("1001", 1_049_531, 12, 0, 0),
+            UsbEpochSample("1001", 1_010_000, 10, 0, 0),
+            UsbEpochSample("1001", 1_030_500, 99, 0, 0),
+            UsbEpochSample("1001", 1_029_531, 11, 0, 0),
+            UsbEpochSample("1002", 1_010_000, 20, 0, 0),
+            UsbEpochSample("1002", 1_029_531, 21, 0, 0),
+            UsbEpochSample("1002", 1_049_531, 22, 0, 0),
+        ):
+            aligner.add(item)
+
+        result = aligner.flush()[0]
+
+        self.assertEqual(result.paired_count, 3)
+        self.assertEqual(
+            [sample.ax_raw for _, sample in result.paired["1001"]],
+            [10, 11, 12],
+        )
+        self.assertEqual(result.dropped_by_device["1001"], 1)
+
+    def test_pps_aligner_expires_old_seconds_when_one_device_disappears(self):
+        aligner = UsbPpsAligner(("1001", "1002"), 50.0)
+        aligner.add(UsbEpochSample("1001", 1_010_000, 1, 0, 0))
+        aligner.add(UsbEpochSample("1002", 1_010_000, 2, 0, 0))
+
+        results = []
+        for second in range(2, PPS_ALIGN_REORDER_WINDOW_SECONDS + 4):
+            results.extend(
+                aligner.add(UsbEpochSample("1001", second * 1_000_000 + 10_000, 1, 0, 0))
+            )
+
+        self.assertTrue(any(result.pps_epoch_us == 1_000_000 for result in results))
+        missing = next(result for result in results if result.pps_epoch_us == 2_000_000)
+        self.assertEqual(missing.missing_device_ids, ("1002",))
+
+    def test_pps_aligner_discards_late_sample_after_second_is_finalized(self):
+        aligner = UsbPpsAligner(("1001", "1002"), 50.0)
+        for device_id in ("1001", "1002"):
+            aligner.add(UsbEpochSample(device_id, 1_010_000, 1, 0, 0))
+            aligner.add(UsbEpochSample(device_id, 2_010_000, 1, 0, 0))
+
+        self.assertEqual(aligner.add(UsbEpochSample("1002", 1_020_000, 3, 0, 0)), [])
+        self.assertEqual(aligner.late_samples, 1)
+
+    def test_raw_and_pps_aligned_output_preserves_values_and_shared_times(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = RawAndPpsAlignedOutput(
+                Path(tmp_dir), ("1001", "1002"), 50.0, 1.0, log=lambda _line: None
+            )
+            for item in (
+                UsbEpochSample("1001", 1_010_000, 11, 12, 13),
+                UsbEpochSample("1002", 1_010_000, 21, 22, 23),
+                UsbEpochSample("1001", 2_010_000, 0, 0, 0),
+                UsbEpochSample("1002", 2_010_000, 0, 0, 0),
+            ):
+                output.add(item)
+            output.close()
+
+            raw_1001 = next((Path(tmp_dir) / "raw" / "sensor1001").rglob("*.csv"))
+            aligned_1001 = next((Path(tmp_dir) / "pps_aligned" / "sensor1001").rglob("*.csv"))
+            aligned_1002 = next((Path(tmp_dir) / "pps_aligned" / "sensor1002").rglob("*.csv"))
+            raw_text = raw_1001.read_text(encoding="utf-8")
+            rows_1001 = aligned_1001.read_text(encoding="utf-8").splitlines()
+            rows_1002 = aligned_1002.read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("11.000000,12.000000,13.000000", raw_text)
+        self.assertEqual([row.split(",", 1)[0] for row in rows_1001],
+                         [row.split(",", 1)[0] for row in rows_1002])
+
+    def test_raw_and_pps_aligned_output_close_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = RawAndPpsAlignedOutput(
+                Path(tmp_dir), ("1001", "1002"), 50.0, 1.0, log=lambda _line: None
+            )
+            output.close()
+            output.close()
+
+        self.assertTrue(output.closed)
+
+    def test_raw_and_pps_aligned_cli_requires_two_gps_devices(self):
+        with self.assertRaises(SystemExit):
+            parse_args([
+                "--ports", "COM5", "--device-ids", "1001",
+                "--csv-timebase", "raw+pps-aligned",
+            ])
 
     def test_find_latest_sensor_csv_uses_newest_date_folder(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

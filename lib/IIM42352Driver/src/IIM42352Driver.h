@@ -34,10 +34,11 @@ class IIM42352Driver {
                  int8_t misoPin,
                  int8_t mosiPin,
                  int8_t csPin,
-                 uint32_t spiClockHz = 8000000UL);
+                 uint32_t spiClockHz = 1000000UL);
 
   bool begin();
   bool checkDeviceId();
+  bool checkDeviceIdConsecutive(uint8_t count, uint32_t delayMs = 1);
   uint8_t lastDeviceId() const;
   uint8_t expectedDeviceId() const;
   uint8_t regDataFormat() const;

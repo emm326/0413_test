@@ -23,14 +23,14 @@ bool IIM42352Driver::begin() {
   delay(5);
 
   writeRegister(REG_BANK_SEL, 0x00);
-  if (!checkDeviceId()) {
+  if (!checkDeviceIdConsecutive(2)) {
     return false;
   }
 
   writeRegister(REG_DEVICE_CONFIG, 0x01);
-  delay(20);
+  delay(50);
   writeRegister(REG_BANK_SEL, 0x00);
-  if (!checkDeviceId()) {
+  if (!checkDeviceIdConsecutive(2)) {
     return false;
   }
 
@@ -46,12 +46,28 @@ bool IIM42352Driver::begin() {
   setDataRate(dataRate_);
   writeRegister(REG_PWR_MGMT0, 0x03);
   delay(20);
-  return true;
+  return checkDeviceIdConsecutive(2) && externalClockConfigured() &&
+         dataReadyInt1Configured();
 }
 
 bool IIM42352Driver::checkDeviceId() {
   lastDeviceId_ = readRegister(REG_WHO_AM_I);
   return lastDeviceId_ == WHO_AM_I_EXPECTED;
+}
+
+bool IIM42352Driver::checkDeviceIdConsecutive(uint8_t count, uint32_t delayMs) {
+  if (count == 0) {
+    return false;
+  }
+  for (uint8_t i = 0; i < count; ++i) {
+    if (!checkDeviceId()) {
+      return false;
+    }
+    if (delayMs > 0 && i + 1U < count) {
+      delay(delayMs);
+    }
+  }
+  return true;
 }
 
 uint8_t IIM42352Driver::lastDeviceId() const { return lastDeviceId_; }

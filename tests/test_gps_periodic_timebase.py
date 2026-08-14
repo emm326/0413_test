@@ -176,6 +176,18 @@ class GpsPeriodicTimebaseTest(unittest.TestCase):
         self.assertIn("gpsTimebase.ppsBadCount()", send_batch_fn)
         self.assertIn("gpsTimebase.localTimerJumpCount()", send_batch_fn)
 
+    def test_p2p_capture_waits_for_target_pps_and_preserves_pre_gate_fifo_window(self):
+        main_text = (PROJECT_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+        start_fn = self._function_body(main_text, "void startTxCaptureIfDue()")
+        loop_fn = self._function_body(main_text, "void txLoop()")
+
+        self.assertIn("TX PPS gate opened", start_fn)
+        self.assertIn("ppsEpochUs < txRunStartEpochUs", start_fn)
+        self.assertIn("txRunStartLocalUs = ppsLocalUs", start_fn)
+        self.assertIn("kPpsStartFifoGuardUs", main_text)
+        self.assertIn("discardSensorFifo(false);", loop_fn)
+        self.assertIn("clearIimInt1Timestamps();", loop_fn)
+
     @staticmethod
     def _function_body(source: str, signature: str) -> str:
         start = source.index(signature)

@@ -154,7 +154,9 @@ constexpr uint8_t ADXL345_FIFO_WATERMARK = 16;
 constexpr uint8_t ADXL345_FIFO_OVERLOAD_LEVEL = 28;
 constexpr uint8_t SENSOR_FIFO_WATERMARK = 16;
 constexpr uint8_t SENSOR_FIFO_OVERLOAD_LEVEL = 28;
-constexpr uint32_t IIM42352_SPI_CLOCK_HZ = 8000000UL;
+// The IIM module is connected with loose jumper wires.  Keep SPI conservative;
+// 1 MHz is still far above the bandwidth required by the supported ODRs.
+constexpr uint32_t IIM42352_SPI_CLOCK_HZ = 1000000UL;
 constexpr bool IIM42352_GPS_DISCIPLINED_CLKIN =
     (APP_IIM42352_GPS_DISCIPLINED_CLKIN != 0);
 constexpr uint32_t IIM42352_CLKOUT_HZ = APP_IIM42352_CLKOUT_HZ_VALUE;
