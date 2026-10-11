@@ -222,7 +222,7 @@ class TxUsbCapacityTest(unittest.TestCase):
             lines = path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(lines[0], "datetime,ax,ay,az")
-        self.assertIn("2026/", lines[1])
+        self.assertTrue(lines[1].startswith("2026/6/21 18:01:44.5261,"))
         self.assertIn("0.012207", lines[1])
 
     def test_csv_epoch_for_sample_uses_actual_iim_rate_grid(self):
@@ -333,7 +333,7 @@ class TxUsbCapacityTest(unittest.TestCase):
 
             lines = path.read_text(encoding="utf-8").splitlines()
 
-        self.assertIn("10:57:16.7997", lines[1])
+        self.assertIn("18:57:16.7997", lines[1])
 
     def test_gui_mode_does_not_require_ports_on_cli(self):
         parser = build_arg_parser()

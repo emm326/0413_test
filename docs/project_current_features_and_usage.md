@@ -89,6 +89,20 @@ datetime,ax,ay,az
 以 `19.53125 ms` 周期映射最近槽位。它不插值、不修改加速度值；某一节点缺少的
 槽位会在两份校准 CSV 中同时跳过，因此两份文件的时间列和数据行数一致。
 
+## PPS 秒内样本序号同步模式
+
+除最近槽位模式外，USB 采集工具还提供独立的多节点秒内序号同步模式：
+
+```powershell
+python tools\tx_usb_capacity_test.py --ports COM5,COM6 --device-ids 1001,1002 --gps-sync --csv-timebase raw+pps-index-aligned --output data_usb_pps_index_sync --duration-seconds 600 --sample-rate-hz 50 --range-g 4
+```
+
+该模式在每个 PPS 后重新从 1 编号，按实际 ODR 自动计算每秒容量；配置 50 Hz、实际
+51.2 Hz 时每秒最多使用 51 个样本，第 51 个之后到下一 PPS 之前的样本不进入同步输出。
+多个节点按 `(PPS绝对秒, 秒内样本序号)` 取交集，输出到 `pps_index_aligned`，所有节点
+CSV 的时间列和行数保持一致。详细规则、限制和验收方法见
+`docs/pps_second_sample_index_sync_plan.md`。
+
 ## P2P 无线采集
 
 默认 RX 与 IIM GPS TX 环境：
