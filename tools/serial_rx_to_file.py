@@ -71,7 +71,7 @@ SUPPORTED_RANGE_G = (4, 8, 16)
 DEFAULT_DEVICE_ID = "1001"
 DEFAULT_ROTATE_MINUTES = 0
 DEFAULT_START_DELAY_SECONDS = 5.0
-DEFAULT_SAMPLE_RATE_HZ = 100.0
+DEFAULT_SAMPLE_RATE_HZ = 50.0
 DEFAULT_SERIAL_BAUD = 460800
 DEFAULT_SERIAL_STARTUP_DELAY_SECONDS = 2.0
 DEFAULT_GAP_FACTOR = 2.0
@@ -86,7 +86,7 @@ SUPPORTED_SAMPLE_RATES_HZ = (50.0, 100.0, 200.0, 400.0)
 EPOCH_US_THRESHOLD = 1_000_000_000_000
 TK_RELAUNCH_ENV = "SERIAL_RX_TO_FILE_TK_RELAUNCHED"
 CSV_TIMEBASE_CHOICES = ("raw", "pps-aligned")
-DEFAULT_PPS_ALIGNED_DEVICE_IDS = ("1001", "1002")
+DEFAULT_PPS_ALIGNED_DEVICE_IDS = ("1001",)
 # P2P packets can arrive in bursts, so keep a small bounded UTC-second window
 # for out-of-order packets.  A node that falls more than this behind is treated
 # as missing for the old second; later packets for that second are discarded.
@@ -113,7 +113,7 @@ class CaptureConfig:
     sample_rate_hz: float
     serial_startup_delay_seconds: float
     csv_timebase: str
-    pps_aligned_device_ids: tuple[str, str]
+    pps_aligned_device_ids: tuple[str, ...]
     gap_csv_files: list[Path]
     gap_factor: float
     gap_samples_per_packet: int
@@ -159,11 +159,11 @@ class PpsAlignedSecond:
 
 
 class PpsAlignedBatcher:
-    """Buffer two GPS-timestamped streams and align them one UTC second at a time."""
+    """Buffer one or two GPS-timestamped streams by UTC second."""
 
-    def __init__(self, device_ids: tuple[str, str], sample_rate_hz: float) -> None:
-        if len(device_ids) != 2 or device_ids[0] == device_ids[1]:
-            raise ValueError("pps-aligned requires exactly two distinct device ids")
+    def __init__(self, device_ids: tuple[str, ...], sample_rate_hz: float) -> None:
+        if len(device_ids) not in (1, 2) or len(set(device_ids)) != len(device_ids):
+            raise ValueError("pps-aligned requires one or two distinct device ids")
         self.device_ids = device_ids
         self.period_us = 1_000_000.0 / actual_iim_sample_rate_hz(sample_rate_hz)
         self._buckets: dict[int, dict[str, list[EpochSample]]] = {}
@@ -188,7 +188,7 @@ class PpsAlignedBatcher:
             second, self._latest_second.get(sample.device_id, second)
         )
 
-        # Normally a second is complete after both streams have advanced past
+        # Normally a second is complete after all configured streams have advanced past
         # it.  Keep the buffer bounded as well: when one stream is absent or
         # severely delayed, expire old seconds after a modest P2P reordering
         # window instead of retaining data indefinitely.
@@ -317,11 +317,12 @@ def parse_ports_text(text: str) -> list[str]:
     return unique_ports
 
 
-def parse_pps_aligned_device_ids(text: str) -> tuple[str, str]:
+def parse_pps_aligned_device_ids(text: str) -> tuple[str, ...]:
     values = tuple(item.strip() for item in re.split(r"[,;\s]+", text) if item.strip())
-    if len(values) != 2 or values[0] == values[1] or any(not value.isdigit() for value in values):
-        raise ValueError("pps-aligned device ids must be two distinct numeric ids, for example 1001,1002")
-    return values[0], values[1]
+    if (len(values) not in (1, 2) or len(set(values)) != len(values)
+            or any(not value.isdigit() for value in values)):
+        raise ValueError("pps-aligned device ids must be one or two distinct numeric ids, for example 1001 or 1001,1002")
+    return values
 
 
 def parse_gap_csv_paths_text(text: str) -> list[Path]:
@@ -412,6 +413,11 @@ def parse_args() -> CaptureConfig | None:
         help="Open a simple GUI for selecting serial and CSV options",
     )
     parser.add_argument(
+        "--simple-gui",
+        action="store_true",
+        help="Open the simple wireless GUI: COM6, 460800, 4g, raw, no START_AT",
+    )
+    parser.add_argument(
         "--analyze-gaps",
         nargs="+",
         metavar="CSV",
@@ -468,14 +474,14 @@ def parse_args() -> CaptureConfig | None:
         choices=CSV_TIMEBASE_CHOICES,
         default="raw",
         help=(
-            "CSV time source: raw writes received UTC timestamps; pps-aligned buffers both "
+            "CSV time source: raw writes received UTC timestamps; pps-aligned buffers configured "
             "nodes by UTC second and writes a common logical grid"
         ),
     )
     parser.add_argument(
         "--pps-aligned-device-ids",
         default=",".join(DEFAULT_PPS_ALIGNED_DEVICE_IDS),
-        help="Two node ids used by --csv-timebase pps-aligned. Default: 1001,1002",
+        help="One or two node ids used by --csv-timebase pps-aligned. Default: 1001",
     )
     parser.add_argument(
         "--append",
@@ -520,7 +526,7 @@ def parse_args() -> CaptureConfig | None:
         "--sample-rate-hz",
         type=float,
         default=DEFAULT_SAMPLE_RATE_HZ,
-        help="Sample rate announced in START_AT. Supported: 50, 100, 200, 400. Default: 100",
+        help="Sample rate announced in START_AT. Supported: 50, 100, 200, 400. Default: 50",
     )
     parser.add_argument(
         "--serial-startup-delay-seconds",
@@ -552,7 +558,7 @@ def parse_args() -> CaptureConfig | None:
     )
     args = parser.parse_args()
 
-    if args.gui or len(sys.argv) == 1:
+    if args.gui or args.simple_gui or len(sys.argv) == 1:
         return None
 
     if args.sample_rate_hz <= 0:
@@ -1338,7 +1344,7 @@ def relaunch_gui_with_desktop_python(reason: str) -> int | None:
     return None
 
 
-def run_gui() -> int:
+def run_gui(*, simple_wireless: bool = False) -> int:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -1355,8 +1361,8 @@ def run_gui() -> int:
         ) from exc
 
     root = tk.Tk()
-    root.title("LoRa RX CSV Capture")
-    root.geometry("820x580")
+    root.title("Simple LoRa Capture - RX COM6 / TX COM7" if simple_wireless else "LoRa RX CSV Capture - TX 1001")
+    root.geometry("900x620" if simple_wireless else "820x580")
     root.minsize(760, 540)
 
     log_queue: "queue.Queue[object]"
@@ -1366,15 +1372,15 @@ def run_gui() -> int:
     worker_thread: threading.Thread | None = None
     stop_event: threading.Event | None = None
 
-    port_var = tk.StringVar()
+    port_var = tk.StringVar(value="COM6" if simple_wireless else "")
     baud_var = tk.StringVar(value=str(DEFAULT_SERIAL_BAUD))
-    output_var = tk.StringVar(value=str(Path.cwd() / "data"))
-    rotate_var = tk.StringVar(value="30")
+    output_var = tk.StringVar(value=str(Path.cwd() / ("data_simple_wireless" if simple_wireless else "data")))
+    rotate_var = tk.StringVar(value="5" if simple_wireless else "30")
     range_g_var = tk.StringVar(value=str(DEFAULT_RANGE_G))
     scale_var = tk.StringVar(value=f"{scale_for_range_g(DEFAULT_RANGE_G):.12f}")
     base_time_var = tk.StringVar()
     device_id_var = tk.StringVar(value=DEFAULT_DEVICE_ID)
-    start_at_var = tk.BooleanVar(value=True)
+    start_at_var = tk.BooleanVar(value=not simple_wireless)
     start_delay_var = tk.StringVar(value=str(DEFAULT_START_DELAY_SECONDS))
     sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE_HZ))
     serial_startup_delay_var = tk.StringVar(value=str(DEFAULT_SERIAL_STARTUP_DELAY_SECONDS))
@@ -1386,7 +1392,8 @@ def run_gui() -> int:
     header_var = tk.BooleanVar(value=True)
     include_id_var = tk.BooleanVar(value=False)
     append_var = tk.BooleanVar(value=False)
-    echo_var = tk.BooleanVar(value=False)
+    echo_var = tk.BooleanVar(value=simple_wireless)
+    sample_count = 0
     range_scale_text_var = tk.StringVar(value=format_range_scale_text(DEFAULT_RANGE_G))
 
     def sync_scale_from_range(*_args: object) -> None:
@@ -1400,8 +1407,23 @@ def run_gui() -> int:
     range_g_var.trace_add("write", sync_scale_from_range)
 
     def append_log(message: str) -> None:
+        nonlocal sample_count
+        if simple_wireless:
+            if message.startswith("[" + port_var.get().strip() + "] "):
+                sample_count += 1
+                status_var.set(f"Receiving: {sample_count} samples")
+            elif "RX_SENSOR_ERROR" in message:
+                status_var.set("Radio connected / sensor error")
+            elif "RX_DATA " in message:
+                status_var.set(f"Receiving: {sample_count} samples")
+            elif "RX_WAITING" in message:
+                status_var.set("Waiting for wireless packets")
+            elif "[error]" in message:
+                status_var.set("Error - see log")
         log_text.configure(state="normal")
         log_text.insert("end", message + "\n")
+        if simple_wireless and int(log_text.index("end-1c").split(".")[0]) > 2000:
+            log_text.delete("1.0", "501.0")
         log_text.see("end")
         log_text.configure(state="disabled")
 
@@ -1417,11 +1439,11 @@ def run_gui() -> int:
     def refresh_ports() -> None:
         ports = [port.device for port in list_ports.comports()]
         values = ports[:]
-        if len(ports) > 1:
+        if len(ports) > 1 and not simple_wireless:
             values.insert(0, ",".join(ports))
         port_combo.configure(values=values)
         if ports and not port_var.get():
-            port_var.set(",".join(ports) if len(ports) > 1 else ports[0])
+            port_var.set(ports[0] if simple_wireless else (",".join(ports) if len(ports) > 1 else ports[0]))
         append_log(
             "[info] Available ports: "
             f"{', '.join(ports) if ports else '(none)'}"
@@ -1485,6 +1507,10 @@ def run_gui() -> int:
                 "Missing port",
                 "Please select or enter serial ports, for example COM6,COM7",
             )
+            return None
+
+        if simple_wireless and len(ports) != 1:
+            messagebox.showerror("Receiver port", "Select only the receiver port, normally COM6.")
             return None
 
         output_root = Path(output_var.get().strip() or "data")
@@ -1562,7 +1588,7 @@ def run_gui() -> int:
             append_log("")
 
     def start_capture() -> None:
-        nonlocal worker_thread, stop_event
+        nonlocal worker_thread, stop_event, sample_count
         if worker_thread is not None and worker_thread.is_alive():
             return
 
@@ -1571,10 +1597,13 @@ def run_gui() -> int:
             return
 
         stop_event = threading.Event()
+        sample_count = 0
         log_text.configure(state="normal")
         log_text.delete("1.0", "end")
         log_text.configure(state="disabled")
         set_running(True)
+        if simple_wireless:
+            append_log("[info] Simple wireless: TX 1001 auto-starts; RX only; internal 50Hz, +/-4g; no START_AT.")
 
         def gui_log(message: str) -> None:
             log_queue.put(("log", message))
@@ -1733,6 +1762,26 @@ def run_gui() -> int:
     status_var = tk.StringVar(value="Stopped")
     ttk.Label(footer, textvariable=status_var).grid(row=0, column=2, sticky="e")
 
+    if simple_wireless:
+        # Fixed firmware settings cannot be changed by the capture GUI.
+        fixed_vars = {str(value) for value in (
+            range_g_var, scale_var, sample_rate_var, csv_timebase_var,
+            device_id_var, base_time_var, start_delay_var, serial_startup_delay_var,
+        )}
+        for widget in form.winfo_children():
+            if int(widget.grid_info().get("row", 0)) >= 7:
+                widget.grid_remove()  # GPS-specific gap analysis is not used here.
+            try:
+                if str(widget.cget("textvariable")) in fixed_vars:
+                    widget.configure(state="disabled")
+            except tk.TclError:
+                pass
+            try:
+                if str(widget.cget("variable")) == str(start_at_var):
+                    widget.configure(state="disabled")
+            except tk.TclError:
+                pass
+
     refresh_ports()
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(100, drain_log_queue)
@@ -1743,7 +1792,7 @@ def run_gui() -> int:
 def main() -> int:
     config = parse_args()
     if config is None:
-        return run_gui()
+        return run_gui(simple_wireless="--simple-gui" in sys.argv)
     if config.mode == "analyze_gaps":
         return analyze_gaps(config)
     return capture(config)

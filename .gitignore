@@ -11,6 +11,9 @@ tmp
 kaiti
 outputs
 ppt_editable_build
+.codex-ppt-inspect
+.codex-wang-ppt-build
+report-extract.txt
 data_usb_pps_sync
 data/
 data1

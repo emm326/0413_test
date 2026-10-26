@@ -14,12 +14,23 @@ namespace {
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 bool rxModeArmed = false;
 int16_t lastRadioState = RADIOLIB_ERR_NONE;
+uint32_t lastIrqPollMs = 0;
+constexpr uint32_t kIrqPollIntervalMs = 5;
 
 bool armReceiveMode() {
   const int16_t state = radio.startReceive();
   lastRadioState = state;
   rxModeArmed = (state == RADIOLIB_ERR_NONE);
+  lastIrqPollMs = millis();
   return rxModeArmed;
+}
+
+void recoverReceiveMode(int16_t receiveError) {
+  // Keep the packet error visible after a successful restart.  If restarting
+  // fails, report that failure and let the next receivePacket() retry it.
+  if (armReceiveMode()) {
+    lastRadioState = receiveError;
+  }
 }
 
 }  // namespace
@@ -82,21 +93,38 @@ bool receivePacket(uint8_t* buffer,
     return false;
   }
 
-  if (digitalRead(PIN_LORA_DIO1) == LOW) {
+  const uint32_t nowMs = millis();
+  if (digitalRead(PIN_LORA_DIO1) == LOW &&
+      static_cast<uint32_t>(nowMs - lastIrqPollMs) < kIrqPollIntervalMs) {
     lastRadioState = RADIOLIB_ERR_NONE;
+    return false;
+  }
+  lastIrqPollMs = nowMs;
+
+  // DIO1 normally signals RX_DONE only.  Read chip IRQ status periodically as
+  // well, so a receive timeout/header error cannot silently strand the link.
+  const uint32_t irq = radio.getIrqFlags();
+  if ((irq & RADIOLIB_SX126X_IRQ_RX_DONE) == 0) {
+    if (irq & RADIOLIB_SX126X_IRQ_TIMEOUT) {
+      recoverReceiveMode(RADIOLIB_ERR_RX_TIMEOUT);
+    } else if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
+      recoverReceiveMode(RADIOLIB_ERR_LORA_HEADER_DAMAGED);
+    } else if (irq & RADIOLIB_SX126X_IRQ_CRC_ERR) {
+      recoverReceiveMode(RADIOLIB_ERR_CRC_MISMATCH);
+    } else {
+      lastRadioState = RADIOLIB_ERR_NONE;
+    }
     return false;
   }
 
   const size_t packetLength = radio.getPacketLength();
   if (packetLength == 0) {
-    lastRadioState = RADIOLIB_ERR_PACKET_TOO_SHORT;
-    (void)armReceiveMode();
+    recoverReceiveMode(RADIOLIB_ERR_PACKET_TOO_SHORT);
     return false;
   }
 
   if (packetLength > capacity) {
-    lastRadioState = RADIOLIB_ERR_PACKET_TOO_LONG;
-    (void)armReceiveMode();
+    recoverReceiveMode(RADIOLIB_ERR_PACKET_TOO_LONG);
     return false;
   }
 
@@ -104,7 +132,7 @@ bool receivePacket(uint8_t* buffer,
   lastRadioState = state;
 
   if (state != RADIOLIB_ERR_NONE) {
-    (void)armReceiveMode();
+    recoverReceiveMode(state);
     return false;
   }
 

@@ -37,7 +37,12 @@ bool GpsTimebase::begin(int8_t rxPin, int8_t txPin, int8_t ppsPin, uint32_t baud
 }
 
 void GpsTimebase::update() {
-  while (serial_.available() > 0) {
+  // Bound each update so UART backlog cannot monopolize the TX loop while
+  // the receiver is waiting for a POLL response.  Partial NMEA lines persist.
+  constexpr size_t kMaxBytesPerUpdate = 512;
+  size_t processedBytes = 0;
+  while (processedBytes < kMaxBytesPerUpdate && serial_.available() > 0) {
+    ++processedBytes;
     const char c = static_cast<char>(serial_.read());
     if (c == '\r') {
       continue;

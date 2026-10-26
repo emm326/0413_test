@@ -14,9 +14,11 @@ IIM42352Driver::IIM42352Driver(SPIClass& spi,
       csPin_(csPin),
       lastDeviceId_(0x00),
       range_(Range::Range4G),
-      dataRate_(DataRate::Hz100) {}
+      dataRate_(DataRate::Hz100),
+      useExternalClock_(true) {}
 
-bool IIM42352Driver::begin() {
+bool IIM42352Driver::begin(bool useExternalClock) {
+  useExternalClock_ = useExternalClock;
   pinMode(csPin_, OUTPUT);
   deselect();
   spi_.begin(sckPin_, misoPin_, mosiPin_, csPin_);
@@ -41,12 +43,13 @@ bool IIM42352Driver::begin() {
   writeRegister(REG_FIFO_CONFIG2, 0x80);
   writeRegister(REG_FIFO_CONFIG3, 0x00);
   writeRegister(REG_INT_CONFIG, 0x18);
-  configureExternalClockAndDataReady();
+  configureClockAndDataReady(useExternalClock_);
   setRange(range_);
   setDataRate(dataRate_);
   writeRegister(REG_PWR_MGMT0, 0x03);
   delay(20);
-  return checkDeviceIdConsecutive(2) && externalClockConfigured() &&
+  return checkDeviceIdConsecutive(2) &&
+         (useExternalClock_ ? externalClockConfigured() : internalClockConfigured()) &&
          dataReadyInt1Configured();
 }
 
@@ -117,14 +120,25 @@ void IIM42352Driver::setDataRate(DataRate rate) {
 }
 
 bool IIM42352Driver::configureExternalClockAndDataReady() {
+  return configureClockAndDataReady(true);
+}
+
+bool IIM42352Driver::configureClockAndDataReady(bool useExternalClock) {
+  useExternalClock_ = useExternalClock;
   uint8_t intConfig1 = readRegister(REG_INT_CONFIG1);
   intConfig1 &= static_cast<uint8_t>(~BIT_INT_ASYNC_RESET);
   writeRegister(REG_INT_CONFIG1, intConfig1);
 
   uint8_t intfConfig1 = readRegister(REG_INTF_CONFIG1);
-  intfConfig1 |= BIT_RTC_MODE;
+  if (useExternalClock_) {
+    intfConfig1 |= BIT_RTC_MODE;
+  } else {
+    intfConfig1 &= static_cast<uint8_t>(~BIT_RTC_MODE);
+  }
   writeRegister(REG_INTF_CONFIG1, intfConfig1);
 
+  // Keep pin 9 as an input even in internal-clock mode, so an attached
+  // DS3231 clock output never contends with the sensor's INT2 output.
   uint8_t intfConfig5 = readBankedRegister(1, REG_BANK1_INTF_CONFIG5);
   intfConfig5 &= static_cast<uint8_t>(~MASK_PIN9_FUNCTION);
   intfConfig5 |= PIN9_FUNCTION_CLKIN;
@@ -134,24 +148,33 @@ bool IIM42352Driver::configureExternalClockAndDataReady() {
   intSource0 |= BIT_UI_DRDY_INT1_EN;
   writeRegister(REG_INT_SOURCE0, intSource0);
 
-  return externalClockConfigured() && dataReadyInt1Configured();
+  return (useExternalClock_ ? externalClockConfigured() : internalClockConfigured()) &&
+         dataReadyInt1Configured();
 }
 
 bool IIM42352Driver::restartAccel() {
   writeRegister(REG_PWR_MGMT0, 0x00);
   delay(2);
-  configureExternalClockAndDataReady();
+  configureClockAndDataReady(useExternalClock_);
   setRange(range_);
   setDataRate(dataRate_);
   writeRegister(REG_PWR_MGMT0, 0x03);
   delay(20);
-  return externalClockConfigured() && dataReadyInt1Configured();
+  return (useExternalClock_ ? externalClockConfigured() : internalClockConfigured()) &&
+         dataReadyInt1Configured();
 }
 
 bool IIM42352Driver::externalClockConfigured() {
   const uint8_t intfConfig1 = readRegister(REG_INTF_CONFIG1);
   const uint8_t intfConfig5 = readBankedRegister(1, REG_BANK1_INTF_CONFIG5);
   return (intfConfig1 & BIT_RTC_MODE) != 0 &&
+         (intfConfig5 & MASK_PIN9_FUNCTION) == PIN9_FUNCTION_CLKIN;
+}
+
+bool IIM42352Driver::internalClockConfigured() {
+  const uint8_t intfConfig1 = readRegister(REG_INTF_CONFIG1);
+  const uint8_t intfConfig5 = readBankedRegister(1, REG_BANK1_INTF_CONFIG5);
+  return (intfConfig1 & BIT_RTC_MODE) == 0 &&
          (intfConfig5 & MASK_PIN9_FUNCTION) == PIN9_FUNCTION_CLKIN;
 }
 

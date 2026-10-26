@@ -36,7 +36,7 @@ class IIM42352Driver {
                  int8_t csPin,
                  uint32_t spiClockHz = 1000000UL);
 
-  bool begin();
+  bool begin(bool useExternalClock = true);
   bool checkDeviceId();
   bool checkDeviceIdConsecutive(uint8_t count, uint32_t delayMs = 1);
   uint8_t lastDeviceId() const;
@@ -58,6 +58,7 @@ class IIM42352Driver {
   bool configureExternalClockAndDataReady();
   bool restartAccel();
   bool externalClockConfigured();
+  bool internalClockConfigured();
   bool dataReadyInt1Configured();
   uint8_t readBankedRegister(uint8_t bank, uint8_t reg);
   void writeBankedRegister(uint8_t bank, uint8_t reg, uint8_t value);
@@ -100,6 +101,7 @@ class IIM42352Driver {
   static constexpr uint8_t PIN9_FUNCTION_CLKIN = 0x04;
   static constexpr uint8_t MASK_ACCEL_FS_SEL = 0x60;
 
+  bool configureClockAndDataReady(bool useExternalClock);
   bool readMulti(uint8_t startReg, uint8_t* buffer, size_t length);
   bool readFifoPacket(RawSample& outSample);
   uint16_t fifoByteCount();
@@ -115,4 +117,5 @@ class IIM42352Driver {
   uint8_t lastDeviceId_;
   Range range_;
   DataRate dataRate_;
+  bool useExternalClock_;
 };

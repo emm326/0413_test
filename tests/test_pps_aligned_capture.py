@@ -2,6 +2,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.serial_rx_to_file import (
     CaptureConfig,
@@ -10,6 +11,8 @@ from tools.serial_rx_to_file import (
     PpsAlignedBatcher,
     PPS_ALIGNED_REORDER_WINDOW_SECONDS,
     scale_for_range_g,
+    parse_args,
+    parse_pps_aligned_device_ids,
     write_pps_aligned_results,
 )
 
@@ -24,6 +27,46 @@ class PpsAlignedBatcherTest(unittest.TestCase):
         results.extend(batcher.add(sample("1001", 2_000_100)))
         results.extend(batcher.add(sample("1002", 2_000_100)))
         return results
+
+    def test_single_node_defaults_write_csv_without_waiting_for_1002(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            argv = [
+                "serial_rx_to_file.py", "--port", "COM6", "--output", temp_dir,
+                "--rotate-minutes", "5", "--csv-timebase", "pps-aligned", "--with-header",
+            ]
+            with patch("sys.argv", argv):
+                config = parse_args()
+            self.assertEqual(config.pps_aligned_device_ids, ("1001",))
+            self.assertEqual(config.sample_rate_hz, 50.0)
+            batcher = PpsAlignedBatcher(config.pps_aligned_device_ids, config.sample_rate_hz)
+            batcher.add(sample("1001", 1_010_000, 11))
+            batcher.add(sample("1001", 1_029_531, 12))
+            results = batcher.add(sample("1001", 2_010_000, 13))
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].paired_count, 2)
+            self.assertEqual(results[0].missing_device_ids, ())
+            results.extend(batcher.flush())
+            writer = CsvWriterManager(config, log=lambda _message: None)
+            try:
+                write_pps_aligned_results(results, config, writer, log=lambda _message: None)
+            finally:
+                writer.close()
+            paths = list(Path(temp_dir).rglob("*.csv"))
+            self.assertEqual(len(paths), 1)
+            self.assertIn("sensor1001", paths[0].parts)
+            self.assertFalse((Path(temp_dir) / "sensor1002").exists())
+            with paths[0].open(newline="", encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(len({row["datetime"] for row in rows}), 3)
+            self.assertAlmostEqual(float(rows[0]["ax"]), 11 * scale_for_range_g(4), places=6)
+
+    def test_parse_single_or_dual_node_ids(self):
+        self.assertEqual(parse_pps_aligned_device_ids("1001"), ("1001",))
+        self.assertEqual(parse_pps_aligned_device_ids("1001,1002"), ("1001", "1002"))
+        for text in ("", "1001,1001", "invalid", "1001,1002,1003"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_pps_aligned_device_ids(text)
 
     def test_uses_later_first_sample_as_common_anchor(self):
         batcher = PpsAlignedBatcher(("1001", "1002"), 50.0)

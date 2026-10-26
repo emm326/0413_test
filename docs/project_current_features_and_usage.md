@@ -1,6 +1,8 @@
 # 当前项目功能与使用说明
 
-当前工程保留两条采集路径：
+当前默认使用简化一发一收方案：IIM-42352 内部时钟采样 → LoRa → USB 串口。烧录与采集命令见 `docs/simple_wireless_usage.md`。
+
+除默认简化链路外，工程还保留两条采集路径：
 
 1. `USB + GPS/PPS`：用于双节点时间戳同步验证和采集容量测试。
 2. `P2P LoRa`：用于后续无线采集，多个 TX 由一个 HTIT-WB32LA RX 轮询接收。
@@ -105,13 +107,14 @@ CSV 的时间列和行数保持一致。详细规则、限制和验收方法见
 
 ## P2P 无线采集
 
-默认 RX 与 IIM GPS TX 环境：
+保留的 GPS/PPS 无线方案使用一个发送节点 1001 和一个接收端，RX 只轮询 1001；需显式选择以下环境：
 
 ```text
 heltec_wifi_lora_32_V3_rx
 heltec_wifi_lora_32_V3_iim_gps_tx_1001
-heltec_wifi_lora_32_V3_iim_gps_tx_1002
 ```
+
+GPS/PPS 单节点版本的烧录与上位机启动命令见 `docs/single_node_wireless_usage.md`。
 
 无线协议使用 polling、ACK/grant、burst 和 TX 队列控制。RX/TX 必须烧录同一版本固件，详细流程见：
 

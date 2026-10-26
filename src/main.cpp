@@ -295,6 +295,7 @@ uint32_t samplePeriodUs = 10000UL;
 uint32_t currentBatchStartUs = 0;
 uint8_t pendingSamples = 0;
 int16_t lastRxRadioStateLogged = 0;
+int16_t lastTxRadioStateLogged = 0;
 uint32_t queueOverflowCount = 0;
 uint32_t txUsbPackets = 0;
 uint32_t txUsbSamples = 0;
@@ -2258,8 +2259,15 @@ void handleTxRadio() {
                                     sizeof(rxPacketBuffer),
                                     packetLength,
                                     meta)) {
+    const int16_t radioState = LoRaTransport::lastState();
+    if (radioState != 0 && radioState != lastTxRadioStateLogged) {
+      Serial.printf("TX radio event: %s (%d)\r\n",
+                    LoRaTransport::stateToString(radioState), radioState);
+    }
+    lastTxRadioStateLogged = radioState;
     return;
   }
+  lastTxRadioStateLogged = 0;
 
   uint8_t frameType = 0;
   if (!Protocol::peekFrameType(rxPacketBuffer, packetLength, frameType) ||
@@ -2283,6 +2291,10 @@ void handleTxRadio() {
 
 void txLoop() {
   const uint32_t nowMs = millis();
+#if !defined(APP_TX_USB_STREAM_TEST)
+  // Answer radio control frames before GPS parsing, health checks and OLED work.
+  handleTxRadio();
+#endif
 #if !defined(APP_TX_USB_STREAM_TEST) || defined(APP_TX_USB_GPS_SYNC_TEST)
   updateGpsTimebase();
 #endif
@@ -2293,8 +2305,6 @@ void txLoop() {
 #endif
 #if defined(APP_TX_USB_STREAM_TEST)
   handleTxSerial();
-#else
-  handleTxRadio();
 #endif
   startTxCaptureIfDue();
 
@@ -2746,6 +2756,11 @@ void setup() {
   Serial.printf("DEV_ID=%u (0x%04X)\r\n", AppConfig::DEVICE_ID, AppConfig::DEVICE_ID);
 
 #if defined(ROLE_TX)
+  // VEXT must be on before probing external sensors, not only when OLED starts.
+  pinMode(PIN_VEXT_CTRL, OUTPUT);
+  digitalWrite(PIN_VEXT_CTRL, LOW);
+  delay(100);
+  Serial.printf("TX peripheral power on: VEXT=%d\r\n", PIN_VEXT_CTRL);
   seedTxRandom();
   pinMode(PIN_USER_BUTTON, INPUT_PULLUP);
   Serial.printf("TX user_button=%d, oled_sda=%d, oled_scl=%d, oled_rst=%d\r\n",
@@ -2803,6 +2818,7 @@ void setup() {
                 experimentalTag(activeRateProfile()));
   markDisplayDirty();
   refreshTxScreen(millis());
+  Serial.println("TX setup complete: single-node radio recovery build");
 #endif
 
 #if defined(ROLE_RX)
