@@ -5,6 +5,8 @@ import copy
 import json
 from pathlib import Path
 
+CONTROL_FREQUENCY_HZ = 470300000
+
 
 def strip_comments(text):
     out = []
@@ -52,6 +54,26 @@ def merge(target, source):
             target[key] = copy.deepcopy(value)
 
 
+def supports_control_tx(config):
+    rf = config.get("SX130x_conf", {}).get("radio_0", {})
+    return bool(
+        rf.get("tx_enable")
+        and rf.get("tx_freq_min", float("inf"))
+        <= CONTROL_FREQUENCY_HZ
+        <= rf.get("tx_freq_max", 0)
+    )
+
+
+def verify_gateway_file(path):
+    if not path:
+        return False
+    source = Path(path)
+    if not source.is_file():
+        return False
+    config = json.loads(strip_comments(source.read_text(encoding="utf-8-sig")))
+    return supports_control_tx(config)
+
+
 def configure(factory, server):
     result = copy.deepcopy(factory)
     if "SX130x_conf" not in result or "gateway_conf" not in result:
@@ -66,11 +88,7 @@ def configure(factory, server):
     )
     merge(result, overlay)
     result["gateway_conf"]["server_address"] = server
-    rf = result["SX130x_conf"]["radio_0"]
-    supports = bool(
-        rf.get("tx_enable")
-        and rf.get("tx_freq_min", float("inf")) <= 470300000 <= rf.get("tx_freq_max", 0)
-    )
+    supports = supports_control_tx(result)
     return result, supports
 
 
@@ -86,12 +104,14 @@ def main():
         parser.error("output must differ from the original backup")
     factory = json.loads(strip_comments(source.read_text(encoding="utf-8-sig")))
     result, supports = configure(factory, args.server)
+    if not supports:
+        parser.error(
+            "原配置的发射路径或频率范围不支持470.3MHz；未写入项目配置，请先确认E870硬件版本"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("已生成：", target)
     print("配置允许470.3MHz下发：", supports)
-    if not supports:
-        print("原配置的发射路径或频率范围不支持控制频点；请先完成厂家确认/实测，再部署双向采集。")
     print("本工具保留原发射限制和射频校准；配置允许仍需验证实际下发。")
 
 

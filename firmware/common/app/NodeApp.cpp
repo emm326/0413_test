@@ -46,8 +46,9 @@ void NodeApp::begin() {
   Serial.begin(Config::serialBaud);
   delay(1000);
   Board::begin();
-  Serial.printf("BOOT,version=%s,board=%s,sensor=%s,id=%u,clock=32000,packet=180\n",
-                APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId);
+  Serial.printf("BOOT,version=%s,board=%s,sensor=%s,id=%u,uplink=%.1f,clock=32000,packet=180\n",
+                APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId,
+                Config::uplinkMHz);
   const bool clockOk = clock_.begin(Board::clockOut);
   gps_.setPpsObserver(SampleClock::onPps);
   pinMode(Board::sensorInt, INPUT);
@@ -129,7 +130,7 @@ void NodeApp::tick() {
 void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   replyRun_ = h.run;
   replyPending_ = true;
-  replyAt_ = millis() + ((Config::nodeId - 1001) % 16) * 110;
+  replyAt_ = millis() + Config::responseDelayMs;
   if (h.run == run_ && run_) {
     result_ = Accepted;
     return;
@@ -144,8 +145,11 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   }
   if ((h.rate != 50 && h.rate != 100) ||
       (h.range != 2 && h.range != 4 && h.range != 8 && h.range != 16) || options.sf < 5 ||
-      options.sf > 7 ||
-      (options.uplinkMHz != 0 && (options.uplinkMHz < 470 || options.uplinkMHz > 493))) {
+      options.sf > 7 || (h.rate == 50 && options.sf != 6) ||
+      (h.rate == 100 && options.sf != 5) ||
+      (options.uplinkMHz != 0 &&
+       (options.uplinkMHz < Config::uplinkMHz - 0.01f ||
+        options.uplinkMHz > Config::uplinkMHz + 0.01f))) {
     result_ = BadSettings;
     return;
   }
@@ -162,7 +166,7 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   rate_ = h.rate;
   range_ = h.range;
   sf_ = options.sf;
-  uplink_ = options.uplinkMHz ? options.uplinkMHz : Config::uplinkMHz;
+  uplink_ = Config::uplinkMHz;
   startEpoch_ = h.epochUs;
   duration_ = options.durationSeconds;
   sequence_ = count_ = 0;
@@ -213,11 +217,11 @@ void NodeApp::process(const uint8_t* bytes, size_t length) {
     replyRun_ = h.run;
     result_ = Accepted;
     replyPending_ = true;
-    replyAt_ = millis() + ((Config::nodeId - 1001) % 16) * 110;
+    replyAt_ = millis() + Config::responseDelayMs;
   } else if (h.type == Discover) {
     replyRun_ = h.run;
     replyPending_ = true;
-    replyAt_ = millis() + ((Config::nodeId - 1001) % 16) * 110;
+    replyAt_ = millis() + Config::responseDelayMs;
   } else if (h.type == Ack && h.run == run_ && size % sizeof(AckEntry) == 0) {
     for (size_t i = 0; i < size; i += sizeof(AckEntry)) {
       AckEntry a;
@@ -260,7 +264,8 @@ void NodeApp::serialCommands() {
       h.epochUs = when;
       h.rate = rate;
       h.range = range;
-      StartOptions options = {Config::uplinkMHz, uint32_t(duration), 6, 0, 0xffff};
+      const uint8_t sf = rate == 100 ? 5 : 6;
+      StartOptions options = {Config::uplinkMHz, uint32_t(duration), sf, 0, 0xffff};
       acceptStart(h, options);
     } else
       Serial.println(
@@ -374,30 +379,41 @@ void NodeApp::communicate() {
   const uint64_t now = epoch(esp_timer_get_time());
   uint32_t phase = 0;
   if ((state_ == Capturing || state_ == Draining) && now >= startEpoch_)
-    phase = (now - startEpoch_) % 5000000;
+    phase = (now - startEpoch_) % Config::cycleUs;
   const bool active = state_ == Capturing || state_ == Draining;
-  const bool control = !active || (phase >= 4000000 && phase < 4500000);
-  if (control) {
-    if (!Radio::channel(Config::controlMHz, Config::spreadingFactor))
-      return;
-    if (replyPending_ && int32_t(millis() - replyAt_) >= 0)
-      report(Confirm);
-    else if (!active && int32_t(millis() - lastStatus_) >= 10000) {
+  if (!active) {
+    if (replyPending_ && int32_t(millis() - replyAt_) >= 0) {
+      if (Radio::channel(uplink_, sf_))
+        report(Confirm);
+    } else if (int32_t(millis() - lastStatus_) >= 10000) {
       replyRun_ = run_;
-      report(Status);
+      if (Radio::channel(uplink_, sf_))
+        report(Status);
       lastStatus_ = millis();
+    } else {
+      Radio::channel(Config::controlMHz, Config::spreadingFactor);
     }
     return;
   }
-  const bool retry = phase >= 4500000;
+  if (phase >= Config::normalUplinkEndUs && phase < Config::downlinkEndUs) {
+    if (!Radio::channel(Config::controlMHz, Config::spreadingFactor))
+      return;
+    return;
+  }
+  if (phase >= Config::downlinkEndUs && phase < Config::responseEndUs) {
+    if (replyPending_ && int32_t(millis() - replyAt_) >= 0 && Radio::channel(uplink_, sf_))
+      report(Confirm);
+    return;
+  }
+  const bool retry = phase >= Config::responseEndUs;
   auto* item = queue_.next(millis(), retry);
   if (!item)
     return;
   // Leave enough airtime before the common control window.
   const uint32_t airtimeUs = sf_ == 5 ? 120000 : sf_ == 6 ? 190000 : 330000;
-  if (!retry && phase + airtimeUs >= 4000000)
+  if (!retry && phase + airtimeUs >= Config::normalUplinkEndUs)
     return;
-  if (retry && phase + airtimeUs >= 5000000)
+  if (retry && phase + airtimeUs >= Config::cycleUs)
     return;
   if (Radio::channel(uplink_, sf_) && Radio::send(item->bytes, item->length)) {
     item->sent = true;

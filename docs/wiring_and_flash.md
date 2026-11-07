@@ -112,7 +112,15 @@ pio device monitor -p COM5 -b 460800
 ```
 
 按上表更换环境名；COM5换成实际设备端口。先核对BOOT日志中的板型、传感器、节点和版本。
-新增同组合节点时，在该环境的build_flags中设置唯一`APP_DEVICE_ID_VALUE`（1001..1010），烧录记录保存环境、端口、节点和提交号。
+同一硬件组合可部署为任一节点 `1001–1008`。不要为每个节点复制 PlatformIO 环境；烧录前通过 `APP_NODE_ID` 指定唯一节点，未设置时才使用环境内的默认值：
+
+```powershell
+$env:APP_NODE_ID="1005"
+pio run -e heltec_v32_iim42352_tx -t upload --upload-port COM5
+Remove-Item Env:APP_NODE_ID
+```
+
+`APP_NODE_ID` 非整数或超出 `1001–1008` 时构建会停止。烧录前检查没有重复节点，烧录后核对 BOOT 日志中的 `id` 和 `uplink`。节点与频率固定映射为 1001/470.3、1002/470.5、1003/470.7、1004/470.9、1005/471.1、1006/471.3、1007/471.5、1008/471.7 MHz。
 EoRa使用4MB Flash和2MB Quad PSRAM配置；Heltec沿用其8MB板型。两者都使用原生USB CDC。
 
 ## USB时钟/采样验证

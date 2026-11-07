@@ -9,7 +9,7 @@ import socket
 import statistics
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass
 from .wire import (
     ACK,
@@ -18,6 +18,7 @@ from .wire import (
     DATA,
     DISCOVER,
     GPS_HEALTHY,
+    NODE_FREQUENCIES,
     STATUS,
     STATUS_PAYLOAD,
     STOP,
@@ -35,6 +36,7 @@ from .recorder import Recorder
 @dataclass
 class Node:
     node: int
+    channel: float = 0
     state: int = 0
     flags: int = 0
     result: int = 0
@@ -47,21 +49,31 @@ class Node:
     samples: int = 0
     rssi: float = 0
     snr: float = 0
+    confirmed: bool = False
+    lost_samples: int = 0
+    lost_packets: int = 0
+    retransmissions: int = 0
 
 
 class GatewayServer:
     def __init__(
-        self, bind="0.0.0.0", port=1700, output="data/e870", nodes=(1001, 1002), emit=None
+        self,
+        bind="0.0.0.0",
+        port=1700,
+        output="data/e870",
+        nodes=tuple(range(1001, 1009)),
+        emit=None,
+        tx_range_verified=False,
     ):
         self.bind, self.port = bind, port
         self.targets = tuple(int(n) for n in nodes)
         if (
             not self.targets
             or len(set(self.targets)) != len(self.targets)
-            or not all(1001 <= n <= 1010 for n in self.targets)
+            or not all(n in NODE_FREQUENCIES for n in self.targets)
         ):
-            raise ValueError("use unique node ids 1001..1010")
-        self.nodes = {n: Node(n) for n in self.targets}
+            raise ValueError("use unique node ids 1001..1008")
+        self.nodes = {n: Node(n, channel=NODE_FREQUENCIES[n]) for n in self.targets}
         self.emit = emit or (lambda kind, payload: None)
         self.recorder = Recorder(output)
         self.requests = queue.Queue()
@@ -73,10 +85,13 @@ class GatewayServer:
         self.gateway_eui = None
         self.run_id = 0
         self.start_us = 0
+        self.active_targets = self.targets
         self.offsets = deque(maxlen=9)
-        self.pending_acks = OrderedDict()
+        self.pending_acks = {}
         self.downlinks = []
         self.pending_tokens = {}
+        self.unknown_nodes = {}
+        self.tx_range_verified = bool(tx_range_verified)
         self.ack_cycle = -1
         self.tx_ready = 0
         self.awaiting_start = set()
@@ -157,6 +172,11 @@ class GatewayServer:
                     raise ValueError("rxpk size mismatch")
                 frame = Frame.decode(payload)
                 if frame.node not in self.nodes:
+                    count = self.unknown_nodes.get(frame.node, 0) + 1
+                    self.unknown_nodes[frame.node] = count
+                    self.emit("unknown", {"node": frame.node, "count": count})
+                    if count == 1:
+                        self.emit("log", f"忽略非目标节点{frame.node}的数据")
                     continue
                 self._frame(frame, rx)
         elif kind == 5:
@@ -186,8 +206,13 @@ class GatewayServer:
                 node.result,
             ) = STATUS_PAYLOAD.unpack(frame.payload)
             node.run = frame.run
+            node.lost_samples = lost_samples
+            node.lost_packets = lost_packets
             if frame.kind == CONFIRM and frame.run == self.run_id and node.result == 0:
                 self.awaiting_start.discard(frame.node)
+                node.confirmed = True
+                if not self.awaiting_start:
+                    self.emit("log", f"run={self.run_id} 的全部目标节点已确认")
             if frame.epoch_us and frame.flags & GPS_HEALTHY:
                 datr = rx.get("datr", "SF6BW125")
                 sf = int(datr.split("BW")[0][2:])
@@ -199,6 +224,7 @@ class GatewayServer:
                 )
                 if math.isfinite(offset):
                     self.offsets.append(offset)
+            self._finish_run_if_idle()
             self.emit(
                 "log",
                 f"节点{frame.node}：{STATE_NAMES.get(node.state,node.state)}，{RESULT_NAMES.get(node.result,node.result)}，丢样{lost_samples}，丢包{lost_packets}",
@@ -207,21 +233,60 @@ class GatewayServer:
             if frame.run != self.run_id:
                 self.emit("log", f"忽略非当前运行数据：节点{frame.node} run={frame.run}")
                 return
+            if frame.node not in self.active_targets:
+                count = self.unknown_nodes.get(frame.node, 0) + 1
+                self.unknown_nodes[frame.node] = count
+                self.emit("unknown", {"node": frame.node, "count": count})
+                self.emit("log", f"忽略非本次目标节点{frame.node}的数据")
+                return
             node.run = frame.run
             node.state = 3
-            key = (frame.node, (frame.sequence // 32) * 32)
-            self.pending_acks[key] = self.pending_acks.get(key, 0) | (1 << (frame.sequence % 32))
+            self.pending_acks.setdefault(frame.node, set()).add(frame.sequence)
             rx = dict(rx, received_utc_us=self.gnss_now_us)
             if self.recorder.record(frame, rx):
                 node.packets += 1
                 node.samples += frame.count
+            else:
+                node.retransmissions += 1
         self.emit("node", dict(vars(node)))
+
+    def _finish_run_if_idle(self):
+        if not self.run_id or self.awaiting_start or not self.start_reported:
+            return
+        if not all(
+            self.nodes[n].run == self.run_id and self.nodes[n].state == 1
+            for n in self.active_targets
+        ):
+            return
+        finished_run = self.run_id
+        for n in self.active_targets:
+            self.nodes[n].confirmed = False
+        self.run_id = 0
+        self.start_us = 0
+        self.active_targets = self.targets
+        self.pending_acks.clear()
+        self.ack_cycle = -1
+        self.emit("log", f"run={finished_run} 的全部目标节点已回到待机，运行结束")
 
     def _request(self, action, options):
         if action == "discover":
             self._queue(Frame(DISCOVER, BROADCAST), "查询节点")
         elif action == "start":
+            if self.run_id:
+                raise ValueError(f"已有运行 run={self.run_id} 尚未结束，拒绝重复START")
             targets = tuple(options.get("nodes", self.targets))
+            if (
+                not targets
+                or len(set(targets)) != len(targets)
+                or any(n not in self.nodes for n in targets)
+            ):
+                raise ValueError("启动节点必须是当前配置中的唯一节点")
+            rate = options.get("rate", 50)
+            sf = options.get("sf", 6)
+            if (rate, sf) not in ((50, 6), (100, 5)):
+                raise ValueError("50Hz必须使用SF6；100Hz必须显式选择SF5")
+            if not self.tx_range_verified:
+                raise RuntimeError("尚未验证E870原厂配置支持470.3MHz下行，禁止启动采集")
             missing = [
                 n
                 for n in targets
@@ -237,9 +302,9 @@ class GatewayServer:
             start_frame(
                 1,
                 1,
-                options.get("rate", 100),
+                rate,
                 options.get("range_g", 4),
-                options.get("sf", 6),
+                sf,
                 options.get("duration", 0),
                 node_count=len(targets),
             )
@@ -247,18 +312,21 @@ class GatewayServer:
                 raise RuntimeError("网关下行未连接，不能发起采集")
             self.run_id = secrets.randbits(32) or 1
             self.start_us = ((self.gnss_now_us + 10_000_000 + 999999) // 1_000_000) * 1_000_000
+            self.active_targets = targets
             self.pending_acks.clear()
             self.ack_cycle = -1
             self.awaiting_start = set(targets)
+            for node in self.nodes.values():
+                node.confirmed = False
             self.start_reported = False
             mask = sum(1 << (n - 1001) for n in targets)
             for repeat in range(3):
                 f = start_frame(
                     self.run_id,
                     self.start_us,
-                    options.get("rate", 100),
+                    rate,
                     options.get("range_g", 4),
-                    options.get("sf", 6),
+                    sf,
                     options.get("duration", 0),
                     node_count=len(targets),
                     node_mask=mask,
@@ -280,6 +348,8 @@ class GatewayServer:
         )
 
     def _send(self, frame, purpose):
+        if not self.tx_range_verified:
+            raise RuntimeError("E870的470.3MHz下行范围尚未通过原厂配置验证")
         if not self.downlink_peer or time.monotonic() - self.peer_seen > 30:
             raise RuntimeError("尚未建立网关下行通道，请核对服务器下行端口1700")
         payload = frame.encode()
@@ -311,31 +381,51 @@ class GatewayServer:
         if now - self.last_report > 10:
             self.recorder.save_report()
             self.last_report = now
-        if self.start_us and not self.start_reported and self.gnss_now_us >= self.start_us:
-            self.start_reported = True
-            self.emit("log", f"到达启动时间，未确认节点：{sorted(self.awaiting_start)}")
+        if self.start_us and not self.start_reported:
+            if self.awaiting_start and self.gnss_now_us >= self.start_us - 2_000_000:
+                missing = sorted(self.awaiting_start)
+                cancelled_run = self.run_id
+                self.downlinks = [item for item in self.downlinks if item[1].kind != START]
+                self._queue(Frame(STOP, BROADCAST, run=cancelled_run), "取消未完整确认的启动")
+                self.emit("log", f"取消run={cancelled_run}：节点未确认 {missing}")
+                self.start_reported = True
+                self.start_us = 0
+                self.run_id = 0
+                self.active_targets = self.targets
+                self.awaiting_start.clear()
+                self.pending_acks.clear()
+            elif not self.awaiting_start and self.gnss_now_us >= self.start_us:
+                self.start_reported = True
+                self.emit("log", f"run={self.run_id} 已由全部目标节点确认并开始采集")
         if self.start_us and self.gnss_now_us >= self.start_us:
             elapsed = self.gnss_now_us - self.start_us
             phase = elapsed % 5_000_000
             cycle = elapsed // 5_000_000
         if phase is not None and 4_030_000 <= phase < 4_100_000 and self.ack_cycle != cycle:
             self.ack_cycle = cycle
-            for i in range(2):
-                entries = []
-                while self.pending_acks and len(entries) < 10:
-                    (node, first), bitmap = self.pending_acks.popitem(last=False)
-                    entries.append(ACK_ENTRY.pack(node, first, bitmap))
-                if entries:
-                    self._queue(
-                        Frame(ACK, BROADCAST, run=self.run_id, payload=b"".join(entries)),
-                        "批量确认",
-                        now + i * 0.15,
-                    )
+            entries = []
+            for node in self.active_targets:
+                sequences = self.pending_acks.get(node)
+                if not sequences:
+                    continue
+                first = min(sequences)
+                covered = {seq for seq in sequences if first <= seq < first + 32}
+                bitmap = sum(1 << (seq - first) for seq in covered)
+                entries.append(ACK_ENTRY.pack(node, first, bitmap))
+                sequences.difference_update(covered)
+                if not sequences:
+                    self.pending_acks.pop(node, None)
+            if entries:
+                self._queue(
+                    Frame(ACK, BROADCAST, run=self.run_id, payload=b"".join(entries)),
+                    "8节点批量确认",
+                    now,
+                )
         due = []
         remaining = []
         for item in self.downlinks:
             when, frame, purpose, control_only = item
-            in_window = phase is None or 4_000_000 <= phase < 4_270_000
+            in_window = phase is None or 4_000_000 <= phase < 4_250_000
             if when <= now and (not control_only or in_window):
                 due.append(item)
             else:

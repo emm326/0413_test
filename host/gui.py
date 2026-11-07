@@ -2,25 +2,38 @@
 
 import queue
 import tkinter as tk
+import time
 from tkinter import ttk, filedialog, messagebox
 from .gateway import GatewayServer
-from .wire import STATE_NAMES
+from .wire import NODE_FREQUENCIES, STATE_NAMES
 
 
 class App:
-    def __init__(self, root, bind, port, output, nodes):
+    def __init__(
+        self,
+        root,
+        bind,
+        port,
+        output,
+        nodes,
+        tx_range_verified=False,
+        gateway_config="gateway/e870.local.json",
+    ):
         self.root = root
         self.events = queue.Queue()
         self.server = None
+        self.tx_range_verified = tx_range_verified
+        self.gateway_config = gateway_config
         root.title("E870 三轴加速度采集")
-        root.geometry("1000x660")
+        root.geometry("1500x720")
         top = ttk.Frame(root, padding=10)
         top.pack(fill="x")
         self.bind = tk.StringVar(value=bind)
         self.port = tk.StringVar(value=str(port))
         self.output = tk.StringVar(value=output)
         self.ids = tk.StringVar(value=",".join(map(str, nodes)))
-        self.rate = tk.StringVar(value="100")
+        self.rate = tk.StringVar(value="50")
+        self.sf = tk.StringVar(value="6")
         self.range = tk.StringVar(value="4")
         self.duration = tk.StringVar(value="0")
         for label, var, width in [
@@ -36,6 +49,10 @@ class App:
         ttk.Label(settings, text="采样率Hz").pack(side="left")
         ttk.Combobox(
             settings, textvariable=self.rate, values=[50, 100], state="readonly", width=6
+        ).pack(side="left", padx=5)
+        ttk.Label(settings, text="扩频因子").pack(side="left")
+        ttk.Combobox(
+            settings, textvariable=self.sf, values=[5, 6], state="readonly", width=4
         ).pack(side="left", padx=5)
         ttk.Label(settings, text="量程±g").pack(side="left")
         ttk.Combobox(
@@ -54,16 +71,73 @@ class App:
         ttk.Label(paths, text="保存目录").pack(side="left")
         ttk.Entry(paths, textvariable=self.output).pack(side="left", fill="x", expand=True)
         ttk.Button(paths, text="选择", command=self.choose).pack(side="left")
-        self.gateway = tk.StringVar(value="网关未连接；先连接接收服务，再查询节点。")
+        verification = "下行范围已验证" if tx_range_verified else "下行范围未验证，仅接收"
+        self.gateway = tk.StringVar(
+            value=f"网关未连接；{verification}（{gateway_config}）。"
+        )
         ttk.Label(root, textvariable=self.gateway, padding=10).pack(fill="x")
-        cols = ("node", "state", "gps", "clock", "packets", "samples", "rssi", "snr")
+        cols = (
+            "node",
+            "channel",
+            "online",
+            "state",
+            "confirmed",
+            "gps",
+            "clock",
+            "queued",
+            "packets",
+            "samples",
+            "rssi",
+            "snr",
+            "lost",
+            "retransmissions",
+        )
         self.table = ttk.Treeview(root, columns=cols, show="headings", height=10)
         for key, text in zip(
-            cols, ["节点", "状态", "GNSS/PPS", "时钟ppm", "包数", "样本数", "RSSI", "SNR"]
+            cols,
+            [
+                "节点",
+                "上行MHz",
+                "在线",
+                "状态",
+                "已确认",
+                "GNSS/PPS",
+                "时钟ppm",
+                "队列",
+                "包数",
+                "样本数",
+                "RSSI",
+                "SNR",
+                "丢包/丢样",
+                "补传",
+            ],
         ):
             self.table.heading(key, text=text)
-            self.table.column(key, width=110, anchor="center")
+            self.table.column(key, width=92, anchor="center")
         self.table.pack(fill="both", expand=True, padx=10)
+        for node in nodes:
+            channel = NODE_FREQUENCIES.get(node)
+            self.table.insert(
+                "",
+                "end",
+                iid=str(node),
+                values=(
+                    node,
+                    f"{channel:.1f}" if channel is not None else "-",
+                    "否",
+                    "未发现",
+                    "否",
+                    "等待/失锁",
+                    "-",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "0/0",
+                    0,
+                ),
+            )
         self.log = tk.Text(root, height=10, state="disabled")
         self.log.pack(fill="both", padx=10, pady=10)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -85,6 +159,7 @@ class App:
                 self.output.get(),
                 [int(n.strip()) for n in self.ids.get().split(",")],
                 lambda k, p: self.events.put((k, p)),
+                tx_range_verified=self.tx_range_verified,
             )
             self.server.start()
         except (ValueError, OSError) as exc:
@@ -102,6 +177,7 @@ class App:
             self.command(
                 "start",
                 rate=int(self.rate.get()),
+                sf=int(self.sf.get()),
                 range_g=int(self.range.get()),
                 duration=int(self.duration.get()),
             )
@@ -117,13 +193,19 @@ class App:
             if kind == "node":
                 values = (
                     p["node"],
+                    f'{p["channel"]:.1f}',
+                    "是" if p["last_seen"] and time.monotonic() - p["last_seen"] <= 30 else "否",
                     STATE_NAMES.get(p["state"], p["state"]),
+                    "是" if p["confirmed"] else "否",
                     "正常" if p["flags"] & 1 else "等待/失锁",
                     f'{p["clock_ppm"]:.2f}',
+                    p["queued"],
                     p["packets"],
                     p["samples"],
                     p["rssi"],
                     p["snr"],
+                    f'{p["lost_packets"]}/{p["lost_samples"]}',
+                    p["retransmissions"],
                 )
                 key = str(p["node"])
                 if self.table.exists(key):
@@ -132,7 +214,8 @@ class App:
                     self.table.insert("", "end", iid=key, values=values)
             else:
                 if kind == "gateway":
-                    self.gateway.set(f'网关 {p["eui"]} 已建立下行通道 {p["peer"]}')
+                    mode = "双向已启用" if self.tx_range_verified else "仅接收"
+                    self.gateway.set(f'网关 {p["eui"]} 已连接 {p["peer"]}；{mode}')
                 self.log.configure(state="normal")
                 self.log.insert("end", str(p) + "\n")
                 self.log.see("end")

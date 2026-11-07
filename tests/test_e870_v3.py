@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from host.wire import *
 from host.gateway import GatewayServer
 from host.recorder import Recorder
@@ -117,7 +118,12 @@ class GatewayTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.events = []
         self.server = GatewayServer(
-            "127.0.0.1", 0, self.tmp.name, emit=lambda k, p: self.events.append((k, p))
+            "127.0.0.1",
+            0,
+            self.tmp.name,
+            nodes=(1001, 1002),
+            emit=lambda k, p: self.events.append((k, p)),
+            tx_range_verified=True,
         )
         self.server.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server.socket.bind(("127.0.0.1", 0))
@@ -207,7 +213,7 @@ class GatewayTests(unittest.TestCase):
         self.server._frame(f, {})
         self.server.pending_acks.clear()
         self.server._frame(f, {})
-        self.assertEqual(self.server.pending_acks[(1001, 32)], 8)
+        self.assertEqual(self.server.pending_acks[1001], {35})
         self.assertEqual(self.server.nodes[1001].samples, 1)
 
     def test_udp_worker_accepts_real_socket_packet(self):
@@ -263,6 +269,44 @@ class GatewayConfigurationTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             configure({"SX130x_conf": {}, "gateway_conf": {}}, "127.0.0.1")
+
+    def test_unsupported_tx_range_does_not_write_output(self):
+        from host.configure_gateway import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "factory.json"
+            target = Path(tmp) / "generated.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "SX130x_conf": {
+                            "radio_0": {
+                                "type": "SX1250",
+                                "tx_enable": True,
+                                "tx_freq_min": 500000000,
+                                "tx_freq_max": 510000000,
+                            }
+                        },
+                        "gateway_conf": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "sys.argv",
+                [
+                    "configure_gateway",
+                    "--input",
+                    str(source),
+                    "--output",
+                    str(target),
+                    "--server",
+                    "127.0.0.1",
+                ],
+            ):
+                with self.assertRaises(SystemExit):
+                    main()
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

@@ -1,105 +1,77 @@
-# E870-L470LG12-O 网关与上位机设置
+# E870 八节点网关与上位机
 
-## 1. 连接与登录
+## 1. 连接和备份
 
-1. LoRa天线接LoRa SMA接口，使用8–28V配套电源。
-2. WAN口与电脑接同一局域网。
-3. USB2为调试口，MobaXterm Serial=115200。默认账号/密码root/root，以交付设置为准。
-4. 执行`ifconfig eth0`查询地址，后续可SSH登录。电脑IP固定或在路由器做DHCP保留。
+1. 给 E870-L470LG12-O 接好 LoRa 天线和 8–28 V 电源，WAN 与电脑处于同一局域网。
+2. USB2 调试口使用 115200；账号密码以设备交付设置为准。
+3. 在网关执行 `gw status`、`gw --help`，查出实际 `global_conf.json` 软链接目标。
+4. 下载原配置和启动脚本，保存为不提交 Git 的 `gateway/factory.local.json`。配置前执行 `gw stop`。
 
-## 2. 备份实际配置
+本项目只使用一台 E870 接收 8 个上行信道并下发控制，不增加 ESP32 接收网关。
 
-在网关终端执行：
-
-```sh
-gw status
-gw --help
-readlink -f /root/lorawanopen/gateway/.gwsrc/global_conf.json
-```
-
-记录当前软链接目标，下载该配置和gw.sh到本机备份。手册中的目录为`/root/lorawanopen/gateway/.gwsrc/config/`，CN470通常为`470_CN470.json`。
-配置前运行`gw stop`。切换频段按`gw --help`的参数格式执行，并重新查询生效文件。
-
-## 3. 生成项目配置
-
-把原配置导出为`gateway/factory.local.json`，在项目根目录执行：
+## 2. 验证并生成配置
 
 ```powershell
-python -m host.configure_gateway --input gateway/factory.local.json --output gateway/project.local.json --server 192.168.1.100
+python -m host.configure_gateway `
+  --input gateway/factory.local.json `
+  --output gateway/project.local.json `
+  --server 192.168.1.100
 ```
 
-192.168.1.100替换为电脑实际IP。生成器保留射频类型、校准、功率表和原发射范围，允许输入带注释的JSON。
-输出检查项“配置允许470.3MHz下发”必须为True，并完成实机确认。若原TX范围是500–510MHz，先向厂家确认470.3MHz射频能力；不通过改范围数字冒充硬件支持。
+生成器保留原射频类型、校准、功率表和 TX 范围。只有原配置明确允许 `radio_0` 在 470.3 MHz 发射时才写出项目配置；若原范围不包含 470.3 MHz，命令会失败且不生成文件。不得只修改 JSON 的上下限冒充硬件支持，必须向厂家确认型号并完成射频实测。
 
-项目参数：
-
-| 配置 | 值 |
+| 项目 | 值 |
 |---|---|
-| 无线方式 | 原始LoRa，lorawan_public=false |
-| 同步字 | 0x12（SX1302私有模式） |
-| 上行信道 | 470.3/470.5/470.7/470.9/471.1/471.3/471.5/471.7MHz |
-| 带宽 | 125kHz |
-| 初期上行 | SF6，4/5，前导码12，物理CRC开启 |
-| 控制下行 | 470.3MHz、SF6BW125、4/5、前导码12、正常IQ(ipol=false) |
-| 服务器 | 电脑IP，UDP上/下行均1700 |
+| 模式 | 原始 LoRa，`lorawan_public=false` |
+| 上行信道 | 470.3/470.5/470.7/470.9/471.1/471.3/471.5/471.7 MHz |
+| 50 Hz | SF6、125 kHz、4/5、同步字 `0x12`、前导码 12 |
+| 100 Hz | SF5，仅在 50 Hz 验收后显式启用 |
+| 控制下行 | 470.3 MHz、SF6BW125、4/5、正常 IQ |
+| 电脑链路 | Semtech UDP v2，上下行端口 1700 |
 
-将生成配置传回原配置目标位置，保留备份。然后执行：
+将生成文件上传到原配置位置后执行 `gw start`、`gw status`，并查看网关日志。
 
-```sh
-gw start
-gw status
-journalctl -u gw -f
-```
-
-## 4. 上位机
-
-电脑安装Python 3.10+并带Tk，项目上位机仅用标准库。根目录执行：
+## 3. 启动上位机
 
 ```powershell
-python -m host --nodes 1001,1002 --output data/e870
+python -m host --gateway-config gateway/project.local.json --output data/e870
 ```
 
-1. 设置监听0.0.0.0:1700、目标节点、目录，点击连接网关。
-2. 放行本机可信局域网UDP1700；确认界面显示网关下行通道。
-3. 点击查询节点。等待GNSS锁定及60秒时钟验证，两个健康标志均正常。
-4. 选择50/100Hz、量程和时长，点击开始。
-5. 上位机重复广播带目标掩码的START_AT，节点错时回复；检查每个节点确认。
-6. 到未来UTC时刻正式采集。点击停止后继续保持接收，让尾包和确认完成。
-7. 关闭上位机时输出采集报告。
+- 默认目标为 `1001–1008`，默认 50 Hz/SF6。`--nodes` 可改为 1、2、4 个节点做分级测试。
+- `--gateway-config` 必须指向包含原 TX 能力的配置。未验证时程序仍可纯接收，但查询、开始和停止下行会被阻止。
+- 纯接收：`python -m host --headless --gateway-config gateway/project.local.json`。
+- 100 Hz 必须在界面显式选择 100 Hz 和 SF5；程序不会从 50 Hz 自动切换。
 
-纯接收诊断：`python -m host --headless --nodes 1001,1002`。正式采集由桌面界面发起。
+开始前确认 8 个目标节点均在线、待机、GNSS/PPS 和时钟健康。START 重复广播三次，只有全部目标节点返回成功 CONFIRM 才会进入正式运行；启动前两秒仍缺节点时，本次运行取消并发送 STOP。
 
-文件：
+## 4. 五秒周期
+
+- `0–4.00 s`：8 个节点在各自信道上传。
+- `4.00–4.25 s`：节点监听 470.3 MHz；E870 串行发送批量 ACK、START、STOP 或状态请求。
+- `4.25–4.45 s`：节点切回自身信道并行发送 CONFIRM/STATUS。
+- `4.45–5.00 s`：节点补传未确认数据。
+
+PUSH_ACK 和 TX_ACK 只表示 UDP/网关发送链路状态，节点 CONFIRM 才表示控制命令实际到达。未知节点只显示告警，不写入当前运行 CSV。
+
+## 5. 输出和排查
+
+每个节点写入独立目录：
 
 ```text
-data/e870/
-  run_<运行编号>/sensor1001/acceleration.csv
-  run_<运行编号>/sensor1001/packets.csv
-  run_<运行编号>/sensor1002/acceleration.csv
-  capture_report.json
+data/e870/run_<运行编号>/sensor1001/acceleration.csv
+data/e870/run_<运行编号>/sensor1001/packets.csv
+data/e870/capture_report.json
 ```
 
-acceleration.csv为UTC时间与g单位XYZ；packets.csv保留序号、名义采样率、量程、标志、接收质量、接收UTC和估算延迟。乱序包先暂存，补齐后按序写入。结束时输出未补齐缺口；缓存超限后的迟到数据另存late_acceleration.csv。
-界面的“样本数”是已收到数据的统计；存在缺口时主CSV会等候补传。
-
-## 5. 控制和确认
-
-- 网关PUSH_ACK仅确认UDP报文；TX_ACK只报告网关发送结果。节点CONFIRM才代表节点接受开始命令。
-- 5秒周期：0–4秒正常上行，4–4.5秒控制/批量ACK，4.5–5秒补传。
-- 主机根据节点状态时间估计UTC偏移；当前控制发送为即时下发，需在实际网关验证网络延迟和窗口余量。
-- 初版以双节点为联调目标；8–10节点需要按实际链路分配信道和验证SF5/时隙，不能只增加节点列表。
-- 每个IIM用实际DRDY作UTC锚点。GNSS暂失时数据标记时间降级；新一轮启动需重新满足健康条件。
-
-## 6. 排查与恢复
+质量报告提供每节点及整体到达率、补传率、最终缺失率、最大延迟和 10 秒内到达比例。
 
 | 现象 | 检查 |
 |---|---|
-| 没有网关连接 | 上位机IP、UDP上/下行1700、防火墙、PULL_DATA和gw日志 |
-| 没有节点状态 | 节点FAULT、频率、SF6/125k、私有同步字、IQ、物理CRC |
-| 网关报TX_FREQ错误 | 原射频TX范围是否包含470.3MHz；完成厂家确认与硬件实测 |
-| TX_ACK成功但节点没确认 | 节点是否待机监听控制频点，SF/IQ一致，确认时隙是否碰撞 |
-| 开始被拒绝 | GNSS/PPS健康、60秒实测clock_ok、目标时间至少在未来1秒 |
-| 收到但无法解析 | 必须固件v3和本上位机配套；旧v2数据不能混用 |
-| 丢样/队列增长 | 先用USB测试区分传感器读取与无线容量，再查ACK窗口和干扰 |
+| 无网关连接 | 电脑 IP、防火墙、UDP 1700、PULL_DATA 和网关日志 |
+| 不能下行 | `--gateway-config` 路径、原 TX 范围、TX_ACK 和 470.3 MHz 实测 |
+| 节点无状态 | 节点 ID/频率、SF6、同步字、GNSS/PPS 和硬件状态 |
+| START 被取消 | 找出未 CONFIRM 节点，不要绕过全部确认检查 |
+| 队列持续增长 | 停止扩容，检查信道遗漏、ACK 窗口、干扰和空口余量 |
+| 跨节点数据 | 检查重复节点 ID；未知节点不得进入当前运行目录 |
 
-恢复网关：`gw stop`，还原备份配置及原软链接，再`gw start`。代码回退：在新基线保存后，对指定阶段提交执行git revert，按匹配环境重新烧录。
+恢复时先 `gw stop`，还原原配置和软链接，再执行 `gw start`。

@@ -20,7 +20,16 @@ class Recorder:
         key = (frame.node, frame.run, frame.sequence)
         node_key = (frame.node, frame.run)
         stats = self.stats.setdefault(
-            node_key, {"packets": 0, "samples": 0, "duplicates": 0, "flagged_packets": 0}
+            node_key,
+            {
+                "packets": 0,
+                "samples": 0,
+                "duplicates": 0,
+                "flagged_packets": 0,
+                "latency_count": 0,
+                "latency_within_10s": 0,
+                "max_latency_ms": 0.0,
+            },
         )
         if key in self.seen:
             stats["duplicates"] += 1
@@ -82,6 +91,10 @@ class Recorder:
         stats["packets"] += 1
         stats["samples"] += frame.count
         stats["flagged_packets"] += bool(frame.flags & 12)
+        if latency_ms != "":
+            stats["latency_count"] += 1
+            stats["latency_within_10s"] += latency_ms <= 10000
+            stats["max_latency_ms"] = max(stats["max_latency_ms"], latency_ms)
         pending = self.pending.setdefault(node_key, {})
         pending[frame.sequence] = frame
         self.expected.setdefault(node_key, 0)
@@ -148,10 +161,62 @@ class Recorder:
     def save_report(self):
         if self.stats:
             self.root.mkdir(parents=True, exist_ok=True)
-            report = {
-                f"{n}:{r}": dict(s, pending_packets=len(self.pending.get((n, r), {})))
-                for (n, r), s in self.stats.items()
+            report = {}
+            totals = {
+                "packets": 0,
+                "samples": 0,
+                "duplicates": 0,
+                "unresolved_packet_gaps": 0,
+                "latency_count": 0,
+                "latency_within_10s": 0,
+                "max_latency_ms": 0.0,
             }
+            for (node, run), stats in self.stats.items():
+                item = dict(stats, pending_packets=len(self.pending.get((node, run), {})))
+                expected_packets = item["packets"] + item.get("unresolved_packet_gaps", 0)
+                received_attempts = item["packets"] + item["duplicates"]
+                item["arrival_rate"] = (
+                    item["packets"] / expected_packets if expected_packets else 1.0
+                )
+                item["retransmission_rate"] = (
+                    item["duplicates"] / received_attempts if received_attempts else 0.0
+                )
+                item["final_missing_rate"] = (
+                    item.get("unresolved_packet_gaps", 0) / expected_packets
+                    if expected_packets
+                    else 0.0
+                )
+                item["within_10s_rate"] = (
+                    item["latency_within_10s"] / item["latency_count"]
+                    if item["latency_count"]
+                    else None
+                )
+                report[f"{node}:{run}"] = item
+                for key in totals:
+                    if key == "max_latency_ms":
+                        totals[key] = max(totals[key], item[key])
+                    else:
+                        totals[key] += item.get(key, 0)
+            expected_packets = totals["packets"] + totals["unresolved_packet_gaps"]
+            received_attempts = totals["packets"] + totals["duplicates"]
+            report["_overall"] = dict(
+                totals,
+                nodes=len(self.stats),
+                arrival_rate=(totals["packets"] / expected_packets if expected_packets else 1.0),
+                retransmission_rate=(
+                    totals["duplicates"] / received_attempts if received_attempts else 0.0
+                ),
+                final_missing_rate=(
+                    totals["unresolved_packet_gaps"] / expected_packets
+                    if expected_packets
+                    else 0.0
+                ),
+                within_10s_rate=(
+                    totals["latency_within_10s"] / totals["latency_count"]
+                    if totals["latency_count"]
+                    else None
+                ),
+            )
             (self.root / "capture_report.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
             )

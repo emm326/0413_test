@@ -8,6 +8,7 @@ import struct
 MAGIC, VERSION, BROADCAST = 0xA55A, 3, 0xFFFF
 DATA, START, STOP, CONFIRM, STATUS, DISCOVER, ACK = range(1, 8)
 GPS_HEALTHY, CLOCK_HEALTHY = 1, 2
+NODE_FREQUENCIES = {node: round(470.3 + (node - 1001) * 0.2, 1) for node in range(1001, 1009)}
 HEADER = struct.Struct("<HBBHHIIQHBB")
 START_OPTIONS = struct.Struct("<fIBBH")
 STATUS_PAYLOAD = struct.Struct("<ffIIHBB")
@@ -81,20 +82,22 @@ class Frame:
 def start_frame(
     run,
     epoch_us,
-    rate=100,
+    rate=50,
     range_g=4,
     sf=6,
     duration=0,
     node=BROADCAST,
     uplink=0.0,
-    node_count=2,
-    node_mask=0x3FF,
+    node_count=8,
+    node_mask=0xFF,
 ):
     if (
         rate not in (50, 100)
         or range_g not in (2, 4, 8, 16)
         or sf not in (5, 6, 7)
-        or not 1 <= node_count <= 10
+        or not 1 <= node_count <= 8
+        or (rate == 50 and sf != 6)
+        or (rate == 100 and sf != 5)
     ):
         raise ValueError("invalid sampling or radio settings")
     if not run or epoch_us <= 0 or duration < 0:
