@@ -23,14 +23,14 @@ bool IIM42352Driver::begin() {
   delay(5);
 
   writeRegister(REG_BANK_SEL, 0x00);
-  if (!checkDeviceIdConsecutive(2)) {
+  if (!checkDeviceIdConsecutive(2) && !waitForDeviceId()) {
     return false;
   }
 
   writeRegister(REG_DEVICE_CONFIG, 0x01);
   delay(50);
   writeRegister(REG_BANK_SEL, 0x00);
-  if (!checkDeviceIdConsecutive(2)) {
+  if (!checkDeviceIdConsecutive(2) && !waitForDeviceId()) {
     return false;
   }
 
@@ -48,6 +48,19 @@ bool IIM42352Driver::begin() {
   delay(20);
   return checkDeviceIdConsecutive(2) && externalClockConfigured() &&
          dataReadyInt1Configured();
+}
+
+bool IIM42352Driver::waitForDeviceId() {
+  // Allow startup/reset transients, but still require two valid consecutive IDs.
+  // A disconnected or incorrect sensor must fail after a bounded wait.
+  for (uint8_t attempt = 0; attempt < 20; ++attempt) {
+    delay(10);
+    writeRegister(REG_BANK_SEL, 0x00);
+    if (checkDeviceIdConsecutive(2)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool IIM42352Driver::checkDeviceId() {

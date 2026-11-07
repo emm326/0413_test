@@ -9,6 +9,12 @@ __pycache__/
 .reasonix
 tmp
 data_usb_pps_sync
+.codex-ppt-inspect
+.codex-wang-ppt-build
+kaiti
+outputs
+ppt_editable_build
+report-extract.txt
 data/
 data1
 data2

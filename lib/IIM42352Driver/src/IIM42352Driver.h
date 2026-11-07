@@ -100,6 +100,7 @@ class IIM42352Driver {
   static constexpr uint8_t PIN9_FUNCTION_CLKIN = 0x04;
   static constexpr uint8_t MASK_ACCEL_FS_SEL = 0x60;
 
+  bool waitForDeviceId();
   bool readMulti(uint8_t startReg, uint8_t* buffer, size_t length);
   bool readFifoPacket(RawSample& outSample);
   uint16_t fifoByteCount();
