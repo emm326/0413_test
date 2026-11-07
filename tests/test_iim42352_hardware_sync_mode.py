@@ -13,7 +13,7 @@ class Iim42352HardwareSyncModeTest(unittest.TestCase):
     def test_clkout_feature_exists_but_default_builds_do_not_enable_it(self):
         board_pins = read_text("include/board_pins.h")
         config = read_text("include/config.h")
-        platformio = read_text("platformio.ini")
+        platformio = read_text("platformio_legacy.ini")
 
         self.assertIn("#define PIN_IIM42352_CLKOUT 3", board_pins)
         self.assertIn("APP_IIM42352_GPS_DISCIPLINED_CLKIN", config)

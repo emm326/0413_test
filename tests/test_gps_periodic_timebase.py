@@ -142,7 +142,7 @@ class GpsPeriodicTimebaseTest(unittest.TestCase):
         self.assertIn("gpsTimebase.timebaseAgeMs()", update_fn)
 
     def test_usb_gps_sync_mode_requires_and_uses_gps_timebase(self):
-        platformio_text = (PROJECT_ROOT / "platformio.ini").read_text(encoding="utf-8")
+        platformio_text = (PROJECT_ROOT / "platformio_legacy.ini").read_text(encoding="utf-8")
         config_text = (PROJECT_ROOT / "include" / "config.h").read_text(encoding="utf-8")
         main_text = (PROJECT_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
         arm_usb_fn = self._function_body(main_text, "void armTxRunUsb")

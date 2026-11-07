@@ -42,7 +42,7 @@ class AnalyzeCsvGapsTest(unittest.TestCase):
 
     def test_gap_default_matches_platformio_p2p_packet_config(self):
         project_root = Path(__file__).resolve().parents[1]
-        platformio_text = (project_root / "platformio.ini").read_text(encoding="utf-8")
+        platformio_text = (project_root / "platformio_legacy.ini").read_text(encoding="utf-8")
         p2p_start = platformio_text.index("p2p_common_build_flags =")
         p2p_end = platformio_text.index("p2p_tx_build_flags =", p2p_start)
         p2p_flags = platformio_text[p2p_start:p2p_end]

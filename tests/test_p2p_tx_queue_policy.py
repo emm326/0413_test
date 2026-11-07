@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class P2pTxQueuePolicyTest(unittest.TestCase):
     def test_p2p_queue_capacity_is_256_and_uses_16_bit_counters(self):
-        platformio_text = (PROJECT_ROOT / "platformio.ini").read_text(encoding="utf-8")
+        platformio_text = (PROJECT_ROOT / "platformio_legacy.ini").read_text(encoding="utf-8")
         config_text = (PROJECT_ROOT / "include" / "config.h").read_text(encoding="utf-8")
         main_text = (PROJECT_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
 
