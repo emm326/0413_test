@@ -39,3 +39,5 @@ data20
 data21
 data22
 *.log
+
+gateway/*.local.json

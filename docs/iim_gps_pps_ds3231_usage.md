@@ -1,3 +1,5 @@
+> 本页描述保留的旧版v2/DS3231或实验方案。当前v3请阅读[接线与烧录](wiring_and_flash.md)、[网关与上位机](e870_setup.md)和根目录PROJECT_PLAN.md。
+
 # HTIT-WB32LA + IIM-42352 + LC76G + DS3231 多节点同步采集说明
 
 功耗、LoRa airtime、USB/无线模式逐模块估算见 `docs/power_consumption_estimate.md`。

@@ -1,3 +1,5 @@
+> 本页描述保留的旧版v2/DS3231或实验方案。当前v3请阅读[接线与烧录](wiring_and_flash.md)、[网关与上位机](e870_setup.md)和根目录PROJECT_PLAN.md。
+
 # GPS Disciplined CLKIN 硬件接线与同步方案
 
 ## 概述
