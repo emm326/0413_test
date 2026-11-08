@@ -139,12 +139,7 @@ START_AT依次为UTC启动微秒、50或100Hz、量程g、非零运行编号、�
 输出`SAMPLE,node,run,utc_us,x,y,z`，XYZ为原始int16。
 采集期间不拔插时钟线；用示波器验证CLKIN=32.000kHz，时钟测量必须在±100ppm内。
 
-## 旧工程回退入口
+## 当前工程与历史版本
 
-原src/include/lib保留，旧配置保存为`platformio_legacy.ini`：
-
-```powershell
-pio run -c platformio_legacy.ini -e heltec_wifi_lora_32_V3_iim_gps_tx_1001
-```
-
-旧固件使用v2轮询协议，新固件使用v3，与上位机配套选择。
+本文环境均由根目录 `platformio.ini` 构建，使用当前 `firmware/` 固件；四种正式组合和四种 USB 测试环境继续保留。
+旧版固件及专属工具已从工作目录移除，历史代码通过 Git 标签 `archive/pre-cleanup-20261108` 查询。现行节点需配套当前 `host/` 上位机和协议 v3。
