@@ -31,6 +31,8 @@
 
 环境：`heltec_v32_iim42652_tx`，默认节点`1004`。
 
+首次验证优先烧录`heltec_v32_iim42652_usb_test`，只看传感器启动自检，不要求先有GNSS锁定；完整分阶段步骤见[Heltec与IIM42652测试指南](heltec_iim42652_test.md)。Heltec板载CP2102使用UART0，本项目对此板设置`ARDUINO_USB_CDC_ON_BOOT=0`；EoRa仍为1。
+
 | 模块信号 | 主控连接 |
 |---|---|
 | IIM VDD(8)/VDDIO(5) | 3.3V（按模块原理图接供电入口） |
