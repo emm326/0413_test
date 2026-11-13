@@ -41,3 +41,6 @@ data22
 *.log
 
 gateway/*.local.json
+
+.venv/
+gateway/state/

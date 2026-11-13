@@ -2,6 +2,7 @@
 
 #include <driver/gpio.h>
 #include <driver/ledc.h>
+#include <hal/gpio_ll.h>
 #include <driver/pcnt.h>
 #include <soc/pcnt_struct.h>
 
@@ -59,8 +60,6 @@ bool SampleClock::begin(int pin) {
   channel.channel = LEDC_CHANNEL_0;
   channel.timer_sel = LEDC_TIMER_0;
   channel.duty = 1;
-  if (ledc_channel_config(&channel) != ESP_OK)
-    return false;
   pcnt_config_t counter = {};
   counter.pulse_gpio_num = pin;
   counter.ctrl_gpio_num = PCNT_PIN_NOT_USED;
@@ -74,7 +73,11 @@ bool SampleClock::begin(int pin) {
   counter.channel = PCNT_CHANNEL_0;
   if (pcnt_unit_config(&counter) != ESP_OK)
     return false;
-  gpio_set_direction(static_cast<gpio_num_t>(pin), GPIO_MODE_INPUT_OUTPUT);
+  // PCNT config changes the pin direction. Attach LEDC after that, then enable
+  // input without gpio_set_direction(), which would disconnect the LEDC output.
+  if (ledc_channel_config(&channel) != ESP_OK)
+    return false;
+  gpio_ll_input_enable(&GPIO, static_cast<gpio_num_t>(pin));
   if (pcnt_counter_pause(PCNT_UNIT_0) != ESP_OK || pcnt_counter_clear(PCNT_UNIT_0) != ESP_OK)
     return false;
   if (pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_H_LIM) != ESP_OK)

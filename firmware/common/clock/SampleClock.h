@@ -4,6 +4,9 @@ class SampleClock {
  public:
   bool begin(int pin);
   void update(bool ppsHealthy);
+  uint64_t edgeCount() const {
+    return edges();
+  }
   bool measured() const {
     return measured_;
   }

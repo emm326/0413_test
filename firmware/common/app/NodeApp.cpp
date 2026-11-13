@@ -1,4 +1,6 @@
 #include "NodeApp.h"
+#include "sensor/Registers.h"
+#include <driver/gpio.h>
 
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -44,7 +46,7 @@ void NodeApp::resetEdges() {
 }
 void NodeApp::begin() {
   Serial.begin(Config::serialBaud);
-  delay(1000);
+  delay(5000);  // Allow the USB diagnostic reader to attach after upload.
   Board::begin();
   Serial.printf("BOOT,version=%s,board=%s,sensor=%s,id=%u,uplink=%.1f,clock=32000,packet=180\n",
                 APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId,
@@ -53,23 +55,66 @@ void NodeApp::begin() {
   gps_.setPpsObserver(SampleClock::onPps);
   pinMode(Board::sensorInt, INPUT);
   attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
-  if (clockOk && sensor_.begin()) {
+  const bool sensorInit = clockOk && sensor_.begin();
+  Serial.println("DIAG_STAGE,before_radio");
+  sensor_.diagnostic();
+  uint32_t selfTestEdges = 0;
+  uint16_t selfTestFifo = 0;
+  uint64_t selfTestClockEdges = 0;
+  if (sensorInit) {
     const uint32_t before = edgeTotal;
+    const uint64_t clockBefore = clock_.edgeCount();
     sensor_.start();
     delay(120);
-    sensorReady_ = edgeTotal > before && sensor_.available() > 0;
+    selfTestEdges = edgeTotal - before;
+    selfTestClockEdges = clock_.edgeCount() - clockBefore;
+    selfTestFifo = sensor_.available();
+    // At 100 Hz a 120 ms probe should produce about 12 samples. An INT1
+    // carrying CLKIN (~3840 edges) is not a successful data-ready test.
+    sensorReady_ = selfTestEdges >= 4 && selfTestEdges <= 30 &&
+                   selfTestFifo >= 4 && selfTestFifo <= 30 && sensor_.fifoCountValid();
+    if (selfTestFifo) {
+      AccelSample sample = {};
+      const bool valid = sensor_.read(sample);
+      Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", valid, sample.x, sample.y,
+                    sample.z);
+    }
     sensor_.standby();
     resetEdges();
   }
+  Serial.printf(
+      "SENSOR_CHECK,init=%u,drdy=%lu,fifo_samples=%u,clock_edges=%llu,int1_level=%u,ok=%u\n",
+      sensorInit, (unsigned long)selfTestEdges, selfTestFifo,
+      (unsigned long long)selfTestClockEdges, digitalRead(Board::sensorInt), sensorReady_);
   gps_.begin(Board::gpsRx, Board::gpsTx, Board::gpsPps, Config::gpsBaud);
 #ifndef APP_USB_TEST
   radioReady_ = Radio::begin();
+  Serial.println("DIAG_STAGE,after_radio");
+  sensor_.diagnostic();
 #else
   radioReady_ = true;
 #endif
   state_ = clockOk && sensorReady_ && radioReady_ ? Waiting : Fault;
   Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_measurement=wait_60_pps\n",
                 sensorReady_, radioReady_, clockOk);
+  if (!sensorReady_) {
+    for (gpio_pull_mode_t pull : {GPIO_FLOATING, GPIO_PULLDOWN_ONLY, GPIO_PULLUP_ONLY}) {
+      gpio_set_pull_mode(static_cast<gpio_num_t>(Board::sensorInt), pull);
+      const uint32_t beforeEdges = edgeTotal;
+      const uint64_t beforeClock = clock_.edgeCount();
+      delay(200);
+      Serial.printf("INT_PULL_DIAG,mode=%u,edges_200ms=%lu,clock_200ms=%llu,level=%u\n",
+          unsigned(pull), (unsigned long)(edgeTotal-beforeEdges),
+          (unsigned long long)(clock_.edgeCount()-beforeClock), digitalRead(Board::sensorInt));
+    }
+    gpio_set_pull_mode(static_cast<gpio_num_t>(Board::sensorInt), GPIO_FLOATING);
+  }
+  if (!sensorReady_) {
+    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    resetEdges();
+    Serial.println("SENSOR_FAULT,drdy_interrupt_disabled=1,capture_blocked=1");
+  }
+
   lastStatus_ = millis() + ((Config::nodeId - 1001) % 16) * 120;
 }
 uint64_t NodeApp::epoch(uint64_t local) const {
@@ -119,6 +164,14 @@ void NodeApp::tick() {
     state_ = Waiting;
   if (millis() - lastLog_ >= 5000) {
     lastLog_ = millis();
+    const uint64_t edgesNow = clock_.edgeCount();
+    Serial.printf("FLOW,edge_delta=%lu,valid=%lu,invalid=%lu,no_edge=%lu,resets=%lu,fifo_bytes=%u,rx=%lu,ack=%lu,stop=%lu,window=%lu,clock_delta=%llu,phase=%lu\n",
+      (unsigned long)(edgeTotal - diagEdges_), (unsigned long)diagValid_, (unsigned long)diagInvalid_,
+      (unsigned long)diagNoEdge_, (unsigned long)diagResets_, sensor_.lastFifoBytes(),
+      (unsigned long)diagRx_, (unsigned long)diagAck_, (unsigned long)diagStop_, (unsigned long)diagWindow_,
+      (unsigned long long)(edgesNow - diagLastClock_),
+      (unsigned long)(now >= startEpoch_ ? (now - startEpoch_) % Config::cycleUs : 0));
+    diagEdges_ = edgeTotal; diagLastClock_ = edgesNow;
     Serial.printf(
         "STATUS,id=%u,state=%u,gps=%u,clock_hz=%.4f,ppm=%.2f,clock_ok=%u,queue=%u,lost_samples=%lu,"
         "lost_packets=%lu\n",
@@ -158,11 +211,20 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
     result_ = TooLate;
     return;
   }
+  if (sensor_.readRegister(IimRegister::WHO_AM_I) != sensor_.expectedIdentity()) {
+    sensorReady_ = false;
+    state_ = Fault;
+    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    result_ = NotReady;
+    return;
+  }
   if (!sensor_.configure(h.rate, h.range)) {
     result_ = BadSettings;
     return;
   }
   run_ = h.run;
+  diagValid_ = diagInvalid_ = diagNoEdge_ = diagResets_ = diagSamplesLogged_ = 0;
+  sensor_.diagnostic();
   rate_ = h.rate;
   range_ = h.range;
   sf_ = options.sf;
@@ -178,6 +240,8 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   state_ = Armed;
 }
 void NodeApp::stop() {
+  if (state_ == Fault && !sensorActive_)
+    return;  // STOP must never turn a failed sensor into "ready".
   if (sensorActive_) {
     acquire();
     sensor_.standby();
@@ -205,6 +269,7 @@ void NodeApp::process(const uint8_t* bytes, size_t length) {
   size_t size;
   if (!decode(bytes, length, h, p, size) || (h.node != Config::nodeId && h.node != broadcast))
     return;
+  ++diagRx_;
   if (h.type == Start && size == sizeof(StartOptions)) {
     StartOptions o;
     memcpy(&o, p, sizeof(o));
@@ -213,6 +278,7 @@ void NodeApp::process(const uint8_t* bytes, size_t length) {
       return;
     acceptStart(h, o);
   } else if (h.type == Stop && (h.run == run_ || h.run == 0)) {
+    ++diagStop_;
     stop();
     replyRun_ = h.run;
     result_ = Accepted;
@@ -223,6 +289,7 @@ void NodeApp::process(const uint8_t* bytes, size_t length) {
     replyPending_ = true;
     replyAt_ = millis() + Config::responseDelayMs;
   } else if (h.type == Ack && h.run == run_ && size % sizeof(AckEntry) == 0) {
+    ++diagAck_;
     for (size_t i = 0; i < size; i += sizeof(AckEntry)) {
       AckEntry a;
       memcpy(&a, p + i, sizeof(a));
@@ -245,6 +312,10 @@ void NodeApp::serialCommands() {
     }
     serialLine_[serialLength_] = 0;
     serialLength_ = 0;
+    if (!strcmp(serialLine_, "DIAG")) {
+      sensor_.diagnostic();
+      continue;
+    }
     if (!strcmp(serialLine_, "STOP")) {
       stop();
       continue;
@@ -278,30 +349,51 @@ void NodeApp::acquire() {
   overruns = edgeOverruns;
   edgeOverruns = 0;
   portEXIT_CRITICAL(&edgeMux);
-  if (overruns || sensor_.available() > 240) {
-    lostSamples_ += overruns ? overruns : sensor_.available();
+  const uint16_t available = sensor_.available();
+  if (!sensor_.fifoCountValid()) {
+    ++diagResets_;
+    gap_ = true;
+    sensorReady_ = false;
+    sensor_.standby();
+    sensorActive_ = false;
+    flush(true);
+    state_ = Fault;
+    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    Serial.printf("SENSOR_FAULT,invalid_fifo_bytes=%u,capture_blocked=1\n", sensor_.lastFifoBytes());
+    return;
+  }
+  if (overruns || available > 240) {
+    ++diagResets_;
+    if (diagResets_ <= 8) Serial.printf("FIFO_RESET,overruns=%lu,bytes=%u\n", (unsigned long)overruns, sensor_.lastFifoBytes());
+    // IRQ queue overruns count electrical edges, not sensor samples. Count
+    // only the bounded FIFO records actually discarded; mark the gap.
+    lostSamples_ += available;
     gap_ = true;
     flush(true);
     sensor_.flush();
     resetEdges();
     return;
   }
-  uint16_t available = sensor_.available();
   for (uint16_t i = 0; i < available; ++i) {
     AccelSample s;
     const bool valid = sensor_.read(s);
     uint64_t local;
     if (!popEdge(local)) {
+      ++diagNoEdge_;
       gap_ = true;
       ++lostSamples_;
       continue;
     }
     if (!valid) {
+      ++diagInvalid_;
+      if (diagInvalid_ <= 8) Serial.printf("FIFO_INVALID,header=0x%02X,bytes=%u,available=%u,index=%u\n", sensor_.lastHeader(), sensor_.lastFifoBytes(), available, i);
       gap_ = true;
       ++lostSamples_;
       continue;
     }
+    ++diagValid_;
     const uint64_t t = epoch(local);
+    if (diagSamplesLogged_++ < 16) Serial.printf("SAMPLE_DIAG,header=0x%02X,bytes=%u,t=%llu,dt=%lld,count=%u\n", sensor_.lastHeader(), sensor_.lastFifoBytes(), (unsigned long long)t, (long long)(lastEpoch_ ? int64_t(t)-int64_t(lastEpoch_) : 0), count_);
     if (!t || t < startEpoch_)
       continue;
     if (lastEpoch_ && (t <= lastEpoch_ || t - lastEpoch_ > 1500000 / rate_)) {
@@ -396,6 +488,7 @@ void NodeApp::communicate() {
     return;
   }
   if (phase >= Config::normalUplinkEndUs && phase < Config::downlinkEndUs) {
+    ++diagWindow_;
     if (!Radio::channel(Config::controlMHz, Config::spreadingFactor))
       return;
     return;

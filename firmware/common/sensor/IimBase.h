@@ -21,6 +21,10 @@ class IimBase {
     return identity_;
   }
   uint8_t readRegister(uint8_t address);
+  uint16_t lastFifoBytes() const { return lastFifoBytes_; }
+  uint8_t lastHeader() const { return lastHeader_; }
+  bool fifoCountValid() const { return lastFifoBytes_ <= 2048; }
+  void diagnostic();
 
  protected:
   virtual void configureFifo() = 0;
@@ -29,6 +33,8 @@ class IimBase {
  private:
   void readBytes(uint8_t address, uint8_t* data, size_t count);
   SPIClass spi_;
+  uint16_t lastFifoBytes_ = 0;
+  uint8_t lastHeader_ = 0;
   const char* name_;
   uint8_t identity_;
 };

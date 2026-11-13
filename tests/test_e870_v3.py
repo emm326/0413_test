@@ -185,8 +185,10 @@ class GatewayTests(unittest.TestCase):
 
     def test_stop_cancels_start_repeats(self):
         self.server._queue(start_frame(12, 1_800_000_000_000_000), "START")
+        self.server.run_id = 12
         self.server._request("stop", {})
-        self.assertEqual([item[1].kind for item in self.server.downlinks], [STOP])
+        self.assertEqual([item[1].kind for item in self.server.downlinks], [STOP, STOP, STOP])
+        self.assertTrue(all(item[1].run == 12 for item in self.server.downlinks))
 
     def test_start_rejects_unready_nodes(self):
         with self.assertRaises(ValueError):

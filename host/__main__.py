@@ -12,13 +12,17 @@ def main():
     parser.add_argument("--nodes", default=",".join(str(n) for n in range(1001, 1009)))
     parser.add_argument(
         "--gateway-config",
-        default="gateway/e870.local.json",
+        default="gateway/state/active.local.json",
         help="E870原始或已生成配置；用于验证470.3MHz下行范围",
     )
     parser.add_argument("--headless", action="store_true", help="仅接收和保存；默认打开桌面界面")
     args = parser.parse_args()
     nodes = [int(n.strip()) for n in args.nodes.split(",")]
-    tx_range_verified = verify_gateway_file(args.gateway_config)
+    try:
+        tx_range_verified = verify_gateway_file(args.gateway_config)
+    except (OSError, ValueError) as exc:
+        print(f"配置文件读取失败，仅允许接收：{exc}", flush=True)
+        tx_range_verified = False
     if not tx_range_verified:
         print(
             f"警告：{args.gateway_config} 未证明E870支持470.3MHz下行；仅允许接收，查询/开始/停止将被阻止。",

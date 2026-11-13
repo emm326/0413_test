@@ -17,5 +17,6 @@ constexpr uint8_t ACCEL_CONFIG0 = 0x50;
 constexpr uint8_t PWR_MGMT0 = 0x4e;
 constexpr uint8_t SIGNAL_PATH_RESET = 0x4b;
 constexpr uint8_t FIFO_COUNTH = 0x2e;
+constexpr uint8_t FIFO_COUNTL = 0x2f;
 constexpr uint8_t FIFO_DATA = 0x30;
 }  // namespace IimRegister

@@ -6,6 +6,24 @@ import json
 from pathlib import Path
 
 CONTROL_FREQUENCY_HZ = 470300000
+DEVICE_PROFILE = "e870-l470lg12-o"
+
+
+def profile_e870(config):
+    """Explicit model adaptation; never alter the source factory object."""
+    radio = config["SX130x_conf"]["radio_0"]
+    if radio.get("type") != "SX1250" or not radio.get("tx_enable"):
+        raise ValueError("设备配置档要求已启用 TX 的 SX1250 radio_0")
+    if not radio.get("tx_gain_lut"):
+        raise ValueError("缺少原厂功率表，不能应用设备配置档")
+    radio.update(tx_freq_min=470000000, tx_freq_max=510000000)
+    config["project_profile"] = {
+        "model": DEVICE_PROFILE,
+        "basis": "厂家470-510MHz标称及2026-11-12设备SX1250驱动校准分支",
+        "source": "https://www.ebyte.com/product/2588.html",
+        "rf_test_passed": False,
+    }
+
 
 
 def strip_comments(text):
@@ -74,7 +92,7 @@ def verify_gateway_file(path):
     return supports_control_tx(config)
 
 
-def configure(factory, server):
+def configure(factory, server, device_profile=None):
     result = copy.deepcopy(factory)
     if "SX130x_conf" not in result or "gateway_conf" not in result:
         raise ValueError("expected the gateway's SX130x_conf / gateway_conf factory file")
@@ -87,7 +105,13 @@ def configure(factory, server):
         )
     )
     merge(result, overlay)
+    import ipaddress
+    ipaddress.IPv4Address(server)
     result["gateway_conf"]["server_address"] = server
+    if device_profile is not None:
+        if device_profile != DEVICE_PROFILE:
+            raise ValueError("未知设备配置档")
+        profile_e870(result)
     supports = supports_control_tx(result)
     return result, supports
 
@@ -97,13 +121,14 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--server", required=True)
+    parser.add_argument("--device-profile", choices=[DEVICE_PROFILE], help="显式应用已核对的设备频段档；保留原厂备份")
     args = parser.parse_args()
     source = Path(args.input)
     target = Path(args.output)
     if source.resolve() == target.resolve():
         parser.error("output must differ from the original backup")
     factory = json.loads(strip_comments(source.read_text(encoding="utf-8-sig")))
-    result, supports = configure(factory, args.server)
+    result, supports = configure(factory, args.server, args.device_profile)
     if not supports:
         parser.error(
             "原配置的发射路径或频率范围不支持470.3MHz；未写入项目配置，请先确认E870硬件版本"

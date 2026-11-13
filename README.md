@@ -23,6 +23,15 @@
 
 历史采集数据、开题报告、PPT、文献、制作记录和临时资料继续保留原位；它们不属于当前固件构建入口。旧工程已从工作目录移除，可通过 Git 标签 `archive/pre-cleanup-20261108` 查询清理前版本。
 
+## 桌面配置与控制
+
+双击根目录 **启动E870上位机.cmd**。软件包含“网关配置 / 采集控制 / 诊断与测试”，运行环境位于 `.venv/`，日常启动无需联网安装。
+
+- [桌面软件操作说明](docs/e870_desktop.md)
+- 首次通过 USB2 配置，日常可使用网线 SSH；网关目标地址 192.168.1.10，电脑保持 192.168.1.22。
+- 无节点时可验证真实网关链路与专用下发自检，正式开始采集需要节点就绪；自检发射前确认天线连接。
+- 实际通过范围及待实测项以计划和本轮报告为准。
+
 ## 构建与运行
 
 在项目根目录执行；四种正式环境和四种 USB 测试环境详见接线与烧录说明。
@@ -32,7 +41,7 @@ pio run -e heltec_v32_iim42352_tx
 $env:APP_NODE_ID="1001"
 pio run -e heltec_v32_iim42352_tx
 Remove-Item Env:APP_NODE_ID
-python -m host --gateway-config gateway/project.local.json
+python -m host --gateway-config gateway/state/active.local.json
 python -m unittest discover -s tests -v
 ```
 
