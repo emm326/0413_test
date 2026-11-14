@@ -4,13 +4,13 @@
 
 - 更新日期：2026-11-14（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`675a49a`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：Heltec V3.2 + IIM42652节点1004已在COM6烧录USB自检版并完成启动读取；Flash校验、UART0控制台通过，但WHO0x00、sensor0/state5/queue0，自检未通过，识别恢复仍待实测。原EoRa/1003历史保持，不混用结果。
+- 本轮 Git 基线：`7c66c40`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 当前步骤：待实测；COM8/EoRa + IIM42652节点1003运行期身份恢复为0x6F，两轮DIAG通过，但state5/Fault、gps0、clock_ok0；下一步读取复位后的完整启动自检。Heltec1004历史单独保留。
 - 提交约定：用户于2026-11-14明确授权本轮提交当前文件并创建新分支，替代此前暂不提交要求。仅纳入代码、配置、文档和报告；采集数据、日志、网关本地配置/备份和构建产物继续排除。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
-- 本轮实施范围：COM6身份核对、1004 USB自检版烧录/Flash校验、BOOT/DIAG/STATUS读取及报告。用户确认接线保持；不发START、不操作网关、不做无线验收。
-- 当前报告：[Heltec1004烧录与启动自检](docs/changes/2026-11-14_03_Heltec1004烧录与启动自检.md)；[串口修正与接线准备](docs/diagnostics/2026-11-14_02_Heltec与IIM42652接线和自检准备.md)；[Heltec分阶段指南](docs/heltec_iim42652_test.md)。
+- 本轮实施范围：已完成COM8枚举、460800波特约36秒运行日志与两轮DIAG；不烧录、不主动复位、不发送START/STOP/STATUS，不操作网关，接线及固定配置不变；串口已关闭。
+- 当前报告：[EoRa COM8串口复查](docs/changes/2026-11-14_04_EoRa_COM8串口复查.md)；[Heltec1004历史自检](docs/diagnostics/2026-11-14_03_Heltec1004烧录与启动自检.md)。
 - 最近Heltec实测（2026-11-14）：COM6/CP210x，ESP32-S3/8MB/MAC9c:13:9e:9d:e8:a8，节点1004。WHO0，200ms INT/clock各6402/6398/6399；MISO空闲均1但SPI仍0。最终STATUS,id=1004,state=5,gps=0,clock_hz=0.0000,ppm=0.00,clock_ok=0,queue=0,lost_samples=0,lost_packets=0；异常IRQ已关闭，sensor0拒采。EoRa结果单独保留。
 - 软件验证：准备阶段Heltec USB/正式、EoRa正式3环境构建及串口begin类型验证通过；本轮COM6构建/烧录/Flash校验和UART0日志通过。实际传感器身份与自检未通过，不能把编译/烧录成功写成采集恢复。
 - 网关沿用本日先前验证的192.168.1.10/UDP1700配置，本轮未改网关或发START；诊断查询能收到1003硬件异常状态，不能把网关链路可用等同于传感器正常。
@@ -141,7 +141,17 @@
 - 固定目标Heltec V3.2/IIM42652/1004，环境heltec_v32_iim42652_usb_test；Serial经UART0/CP2102，460800波特。
 - 准备阶段3个环境构建通过、串口begin类型已核对；本轮更新构建后仅COM6烧录并保存原始启动日志，不发START、不作无线验收。
 - Git基线675a49a，保留此前串口修正和文档；原始日志/镜像信息在tmp/heltec_com6_flash_20261114。
-- 报告：[Heltec1004烧录与启动自检](docs/changes/2026-11-14_03_Heltec1004烧录与启动自检.md)。
+- 报告：[Heltec1004烧录与启动自检](docs/diagnostics/2026-11-14_03_Heltec1004烧录与启动自检.md)。
+
+## 2026-11-14 EoRa COM8串口复查
+
+- 状态：已完成（本轮运行期身份复查）；待实测（启动自检、采样与GNSS/PPS/时钟精度）。
+- Git基线：`7c66c40`；工作区开始时干净。COM8为303A:1001，USB序列号90:DA:72:76:1F:30。
+- 两轮DIAG共8项SPI组合WHO均6F，MISO三种上下拉共6次WHO也均6F；配置读回一致。运行期身份已恢复，原因尚不确定。
+- 8条周期STATUS均id1003/state5/gps0/clock_ok0/queue0；FLOW每约5秒clock_delta160000，只有板端时钟存在证据，不是模块端波形或外部精度验收。
+- 仅DIAG两次，不发STATUS/START/STOP、不烧录、不主动复位；无BOOT或新SENSOR_CHECK，不能把运行期身份恢复写成启动采样自检通过。串口已关闭。
+- 本轮无新编译/烧录；固件及接线配置未改。下一步捕获复位完整启动自检，再验证GNSS/PPS，门槛满足后进入50Hz。
+- 报告：[EoRa COM8串口复查](docs/changes/2026-11-14_04_EoRa_COM8串口复查.md)。原Heltec已提交报告转入diagnostics长期保留并更新链接。
 
 ## 1. 固定配置
 
@@ -233,7 +243,7 @@
 
 ## 报告索引
 
-1. [Heltec1004烧录与启动自检](docs/changes/2026-11-14_03_Heltec1004烧录与启动自检.md)
+1. [EoRa COM8串口复查](docs/changes/2026-11-14_04_EoRa_COM8串口复查.md)
 
 已提交的历史轮次报告通过 Git 查询；changes/ 只保留当前轮报告。前轮未提交的传感器诊断证据原样保存在 [长期诊断记录](docs/iim42652_clock_diagnostic.md)，随此前修复继续留在工作区。
 

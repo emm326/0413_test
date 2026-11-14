@@ -77,6 +77,6 @@ STATUS,id=1004,state=1,...
 
 ## 6. 当前验证边界
 
-2026-11-14已完成板型核对、UART0串口修正和三个环境构建。用户随后授权在COM6烧录1004 USB自检版，Flash校验及日志读取通过，但WHO0、sensor0、state5，传感器自检未通过；未进行连续采集或无线验收。详见[实际烧录报告](changes/2026-11-14_03_Heltec1004烧录与启动自检.md)与[软件准备记录](diagnostics/2026-11-14_02_Heltec与IIM42652接线和自检准备.md)。
+2026-11-14已完成板型核对、UART0串口修正和三个环境构建。用户随后授权在COM6烧录1004 USB自检版，Flash校验及日志读取通过，但WHO0、sensor0、state5，传感器自检未通过；未进行连续采集或无线验收。详见[实际烧录报告](diagnostics/2026-11-14_03_Heltec1004烧录与启动自检.md)与[软件准备记录](diagnostics/2026-11-14_02_Heltec与IIM42652接线和自检准备.md)。
 
 官方依据：Heltec WiFi LoRa 32 V3.2数据手册及原理图，项目匹配Arduino 2.0.17/PlatformIO板型与Serial条件宏。原生USB GPIO19/20是额外硬件连接方式，不是板载CP2102串口。
