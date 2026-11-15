@@ -9,6 +9,7 @@
 - [协议 v3](docs/protocol_v3.md)
 - [设备能力与当前限制](docs/e870_capability_review.md)
 - [实机验收记录](docs/hardware_acceptance.md)
+- [六线最小IIM42652身份测试](minimal_six_wire_iim42652/README.md)
 - [本轮变更报告](docs/changes/)
 
 ## 工程目录

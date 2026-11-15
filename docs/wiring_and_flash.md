@@ -173,6 +173,14 @@ SENSOR_SAMPLE_TEST
 
 输出`SENSOR_TEST_SAMPLE,index=...,local_us=...,x=...,y=...,z=...,rate=50,range_g=4,synchronized=0`。XYZ是int16原始值，g值等于原始值×4/32768。诊断结束输出实际点数，再重新绑定LEDC和PCNT输入路由，检查2ms窗口有合理时钟边沿，恢复外部32kHz正式配置并重跑严格FIFO/DRDY自检；PPS频率验收从头累积。该测试不是UTC同步数据，不替代正式50Hz无线采集或GNSS/PPS时钟门槛；没有实际样本时不能报告采样通过。测试结果详见当前轮报告。
 
+## 最小六线身份测试
+
+传感器身份异常时，先使用独立工程[六线最小IIM42652身份测试](../minimal_six_wire_iim42652/README.md)。该程序只连接VCC/GND/SCK/MOSI/MISO/CS，不初始化LoRa、GNSS、INT1或CLKIN，不写传感器寄存器。
+
+EoRa-S3-400TB使用：VCC→排针第3脚3.3V，GND→第4脚，SCK→GPIO47，MOSI→GPIO48，MISO→GPIO39，CSB→GPIO40。若确认GPIO40板级异常，可将CSB改接第23脚GPIO35并使用备用构建环境。
+
+2026-11-15 COM8实测中CS始终为低，SCK/MOSI正常，32次WHO读取均0x00。当前应先排除CSB对地锁定，不能继续用采样配置判断模块好坏。
+
 ## USB时钟/采样验证
 
 环境对应替换为`heltec_v32_iim42352_usb_test`、`heltec_v32_iim42652_usb_test`、`eora_s3_400_iim42352_usb_test`、`eora_s3_400_iim42652_usb_test`。
