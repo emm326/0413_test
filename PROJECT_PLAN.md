@@ -4,7 +4,7 @@
 
 - 更新日期：2026-11-15（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`edf4fd8`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 本轮 Git 基线：`edf4fd8`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
 - 当前步骤：阶段1～3已完成。正式`firmware/sensors/iim42652/`已改用原厂Ixm42xxx 1.1.1：HSPI Mode0/100kHz软件CS、FIFO record模式、INT1推挽高有效、CLKIN 32kHz，并用物理寄存器读回校验时钟与配置。六个环境编译通过，完整回归86/86通过；实机采样与LoRa验收待阶段4～5。
 - 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线测试已完成；测试只使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，未接INT1/CLKIN/GNSS/LoRa。阶段1～3已提交，阶段4～5保持节点1003和±4g/50Hz配置做实机验证，结果单独记录。
@@ -39,7 +39,7 @@
 - 接线：SCK=GPIO47，MOSI=GPIO48，MISO=GPIO39，CSB=GPIO40，INT1=GPIO38，CLKIN=GPIO36。节点1003，上行470.7MHz，SF6/BW125/CR4-5。
 - 验证：原生驱动测试8/8通过；完整Python回归86/86通过；六个环境构建通过。
 - 边界：尚未烧录正式节点，尚未验证带INT1和CLKIN的正式链路采样，尚未完成LoRa数据包验收。
-- Git：基线`edf4fd8`；阶段1～3代码、测试和文档已在本轮提交，具体提交见`git log`。
+- Git：基线`edf4fd8`；阶段1～3代码、测试和文档已提交为`9e988f1`。
 - 报告：[正式IIM42652原厂驱动接入](docs/changes/2026-11-15_05_正式IIM42652原厂驱动接入.md)。
 
 ## 2026-11-15 原厂驱动六线导入测试
@@ -54,7 +54,7 @@
 - 比例修正：按DS-000440，±4g的灵敏度是8192 LSB/g，不是2048 LSB/g。修正前合向量4.058g，修正后1.0145g，数据合理。
 - 端口：COM8，USB-Serial/JTAG，串口460800。
 - 代码边界：原厂驱动放`firmware/sensors/iim42652_vendor/`，测试入口放`firmware/tests/iim42652_bringup/`，引脚沿用`firmware/boards/eora_s3_400/Board.h`。
-- Git：基线`edf4fd8`；该轮未提交，内容已随2026-11-15阶段1～3提交一并纳入。
+- Git：基线`edf4fd8`；该轮未单独提交，内容已随`9e988f1`一并纳入。
 
 ## 2026-11-12 真实下发自检继续
 
