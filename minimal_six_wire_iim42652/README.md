@@ -45,9 +45,11 @@ $env:PLATFORMIO_DISABLE_TELEMETRY="1"
 
 每个组合读取 8 次，只比较 `WHO_AM_I=0x6F`。
 
-## 2026-11-15 COM8实测
+## 2026-11-15 更换传感器后的COM8复测
 
-当前现场结果为CS低/高均读0，SCK和MOSI正常，MISO上拉仍读0，32次WHO读取全部0x00。先按[本轮报告](../docs/changes/2026-11-15_02_六线最小IIM42652身份测试.md)排查CSB对地锁定。详细日志见报告。
+用户更换新的IIM42652模块并保持六线连接后，CS/SCK/MOSI低/高回读均正常，旧CS持续低电平问题已消失。MISO上拉和下拉均为1，空闲为1；四种SPI组合共32次WHO读取仍全部为0x00。
+
+这表示ESP32侧输出链路正常，故障应在模块端供电、CSB/MISO/MOSI线路或传感器响应。先用万用表核查模块端3.3V和GND，再确认MISO/MOSI没有接反；不要改用GPIO35备用CS。完整结果见[本轮报告](../docs/changes/2026-11-15_03_更换传感器后的六线复测.md)，原始日志保留在本机`tmp/com8_new_sensor_six_wire_20261115.log`。
 
 ## 结果判断
 

@@ -179,7 +179,7 @@ SENSOR_SAMPLE_TEST
 
 EoRa-S3-400TB使用：VCC→排针第3脚3.3V，GND→第4脚，SCK→GPIO47，MOSI→GPIO48，MISO→GPIO39，CSB→GPIO40。若确认GPIO40板级异常，可将CSB改接第23脚GPIO35并使用备用构建环境。
 
-2026-11-15 COM8实测中CS始终为低，SCK/MOSI正常，32次WHO读取均0x00。当前应先排除CSB对地锁定，不能继续用采样配置判断模块好坏。
+2026-11-15更换新传感器后，COM8复测中CS/SCK/MOSI低高回读均正常，旧CS持续低电平问题已消失；MISO上拉和下拉均为1，32次WHO读取仍均为0x00。当前应先在模块端核查3.3V、GND、CSB和MISO/MOSI线路，不需要改用GPIO35，也不能继续用采样配置判断模块好坏。
 
 ## USB时钟/采样验证
 
