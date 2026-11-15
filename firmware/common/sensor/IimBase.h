@@ -1,9 +1,9 @@
 #pragma once
 #include <Arduino.h>
 #include <SPI.h>
-struct AccelSample {
-  int16_t x, y, z;
-};
+
+#include "sensor/AccelSample.h"
+
 class IimBase {
  public:
   IimBase(const char* name, uint8_t identity);

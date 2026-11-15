@@ -1,4 +1,4 @@
-"""Execute the real sensor driver against a deterministic SPI peripheral model."""
+"""Execute the formal IIM42652 driver against deterministic transport and vendor stubs."""
 import shutil
 import subprocess
 import unittest
@@ -19,7 +19,7 @@ class FirmwareSensorTransportTests(unittest.TestCase):
                    "-DAPP_BOARD_EORA=1", "-I" + str(ROOT / "tests/firmware_support"),
                    "-I" + str(ROOT / "firmware"), "-I" + str(ROOT / "firmware/common"),
                    str(ROOT / "tests/firmware_sensor_transport.cpp"),
-                   str(ROOT / "firmware/common/sensor/IimBase.cpp"),
+                   str(ROOT / "firmware/sensors/iim42652/SensorSpiTransport.cpp"),
                    str(ROOT / "firmware/sensors/iim42652/Driver.cpp"), "-o", str(executable)]
         built = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
@@ -27,6 +27,25 @@ class FirmwareSensorTransportTests(unittest.TestCase):
         (output / "result.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_formal_driver_has_no_legacy_base(self):
+        driver = (ROOT / "firmware/sensors/iim42652/Driver.h").read_text(encoding="utf-8")
+        self.assertNotIn("IimBase", driver)
+        vendor = (ROOT / "firmware/sensors/iim42652_vendor/Ixm42xxxDriver_HL.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("defined(IIM42652)", vendor)
+
+
+    def test_driver_verifies_hardware_not_cache(self):
+        header = (ROOT / "firmware/sensors/iim42652/Driver.h").read_text(encoding="utf-8")
+        driver = (ROOT / "firmware/sensors/iim42652/Driver.cpp").read_text(encoding="utf-8")
+        self.assertIn("directRead", header)
+        self.assertIn("physical_read=%u", driver)
+        self.assertIn("soft_reset=1", driver)
+        self.assertIn("packetBytes_", driver)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+

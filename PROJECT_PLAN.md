@@ -4,16 +4,16 @@
 
 - 更新日期：2026-11-15（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`1c2cb94`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：待实测；用户更换IIM42652并保持六线连接后，已完成COM8复测。CS/SCK/MOSI输出回读正常，但MISO内部下拉时仍为1，四种SPI组合共32次WHO_AM_I读取全部0x00；下一步需在模块端核查供电、CSB和MISO/MOSI线路。
-- 提交约定：上一轮六线诊断提交为`1c2cb94`。本轮结束后提交计划、交接、接线说明和更换传感器后的复测报告；日志、镜像、采集数据、现场配置和构建产物继续排除，不自动推送远端。
-- 当前操作约定：用户明确授权COM8测试。本轮未重新烧录，保留默认六线诊断固件；不改供电电压、不接INT1/GNSS、不驱动CLKIN、不初始化LoRa、不发送芯片软件复位、不启动正式采集；测试结果以COM8串口为准。
+- 本轮 Git 基线：`edf4fd8`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 当前步骤：阶段1～3已完成。正式`firmware/sensors/iim42652/`已改用原厂Ixm42xxx 1.1.1：HSPI Mode0/100kHz软件CS、FIFO record模式、INT1推挽高有效、CLKIN 32kHz，并用物理寄存器读回校验时钟与配置。六个环境编译通过，完整回归86/86通过；实机采样与LoRa验收待阶段4～5。
+- 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
+- 当前操作约定：六线测试已完成；测试只使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，未接INT1/CLKIN/GNSS/LoRa。阶段1～3已提交，阶段4～5保持节点1003和±4g/50Hz配置做实机验证，结果单独记录。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
-- 本轮实施范围：在新传感器六线连接下复跑默认最小SPI身份扫描，执行引脚回读、MISO上下拉、1MHz/100kHz与Mode0/Mode3的32次只读WHO_AM_I探测。复测和文档保存已完成，传感器身份未恢复。
-- 当前报告：[更换传感器后的六线复测](docs/changes/2026-11-15_03_更换传感器后的六线复测.md)；[交接文档](docs/HANDOVER.md)；[上一轮六线身份测试](docs/diagnostics/2026-11-15_02_六线最小IIM42652身份测试.md)。
+- 本轮实施范围：把六线验证通过的原厂链路移植到正式驱动，保留NodeApp公共接口；增加物理寄存器读回、FIFO包长统计和安全关闭。IIM42352实现不动。
+- 当前报告：[正式IIM42652原厂驱动接入](docs/changes/2026-11-15_05_正式IIM42652原厂驱动接入.md)；[原厂驱动六线导入测试](docs/diagnostics/2026-11-15_04_原厂驱动六线导入测试.md)；[交接文档](docs/HANDOVER.md)。
 - 最近Heltec实测（2026-11-14）：COM6/CP210x，ESP32-S3/8MB/MAC9c:13:9e:9d:e8:a8，节点1004。WHO0，200ms INT/clock各6402/6398/6399；MISO空闲均1但SPI仍0。最终STATUS,id=1004,state=5,gps=0,clock_hz=0.0000,ppm=0.00,clock_ok=0,queue=0,lost_samples=0,lost_packets=0；异常IRQ已关闭，sensor0拒采。EoRa结果单独保留。
-- 软件验证（2026-11-15）：项目.venv下84/84项完整回归通过，其中真实驱动模拟SPI专项31/31；四个正式环境及EoRa42652 USB共5/5构建通过。本轮无实机操作，身份与采样仍待实测。
+- 软件验证（2026-11-15）：项目.venv下86/86项完整回归通过；六环境构建通过（EoRa42652正式/USB、Heltec42652、EoRa42352、Heltec42352、EoRa42652六线bringup）。EoRa正式环境RAM 52356/327680字节，Flash 377833/1310720字节。六线bringup实机已通过：WHO_AM_I=0x6F，247样本/5秒，49.4Hz，SPI错误0，合向量1.0145g。正式节点尚未烧录。
 - 网关本轮实测：192.168.1.10↔电脑192.168.1.22/UDP1700，EUI0000000000000923；3次下发/3次TX_ACK NONE/3次独立编号节点CONFIRM，上行470.7MHz/SF6BW125/4/5，RSSI-35dBm，SNR10.2/10.5/10.2dB，双向控制链路已通过。未启动采样。
 - 原厂保护：470_CN470.json SHA256仍为7e036e4f60ccfb14697fbca825df01fa1ac1f7aa91771f89e596bc3e44e58f15；初始完整备份位于gateway/state/backups/20261112T055807747491Z_a9ee522e，另有每次应用前备份及设备侧副本，均不提交。
 - 当前项目配置：依据用户频段说明、厂家标称和设备驱动核查，以显式e870-l470lg12-o设备档生成470–510 MHz允许范围，原厂文件保持不变；配置为私有LoRa、8信道、电脑UDP1700。当前三次专用下发在网关执行层已通过，未宣称节点收包或射频功率验收。
@@ -26,7 +26,35 @@
 - 前轮软件验证（2026-11-11）：EoRa + IIM42652、Heltec + IIM42352 两个代表环境构建通过；EoRa 修复固件烧录及 Flash 校验通过；现有 Python 测试 32/32 通过。此处为2026-11-11历史结果，本轮最小诊断与恢复另列。
 - 历史软件验证：清理前后 E870 测试各 32 项通过；四种正式环境及四种 USB 环境 clean 后全量构建 8/8 通过。历史八环境结果与本轮两环境结果分开记录。
 - 已知边界：严格结束区间尚无样本级终点过滤；手动 STOP 和取消启动均依赖无线接收，不能保证瞬时同时停止或全有全无启动。详见 [设备能力核查](docs/e870_capability_review.md)。
-- 下一步：在模块端测量3.3V和GND，确认CSB片选、SCK/MOSI/MISO连接及MISO/MOSI未接反；必要时用示波器或逻辑分析仪捕获一次0xF5命令和返回。稳定读到0x6F后才接INT1/CLKIN并恢复正式固件。
+- 下一步：阶段4烧录`eora_s3_400_iim42652_tx`（COM8），核对`SENSOR_VENDOR_INIT/SENSOR_CLOCK/SENSOR_CONFIGURE/SENSOR_START/SENSOR_CHECK`；阶段5改用非USB环境验证网关收到STATUS与DATA。仍不提交Git。
+
+## 2026-11-15 正式IIM42652原厂驱动接入
+
+- 状态：进行中；阶段1～3（驱动移植、FIFO/INT1/CLKIN、采样接口）已完成并通过离线验证。阶段4～5的实机采样和LoRa验收为待实测。
+- 驱动：`firmware/sensors/iim42652/Driver.*`不再继承`IimBase`，改用原厂`inv_ixm42xxx_init()`；`SensorSpiTransport.*`固定HSPI、Mode 0、100kHz和软件CS。
+- 配置：默认50Hz、±4g；FIFO为record模式、水印1包；INT1使用FIFO阈值、推挽、高有效；CLKIN启用32kHz。
+- 读回：新增`directRead()`绕过原厂寄存器缓存；`SENSOR_CLOCK`和`SENSOR_CONFIGURE`用物理读回校验RTC_MODE、CLKIN引脚、ODR、FSR和FIFO模式，避免只回显驱动写入值。
+- FIFO：包长按`FIFO_CONFIG1`实际使能位计算，不再固定10字节；溢出上限由2048字节容量推导；`SENSOR_START`和`SENSOR_DIAG`输出`packet_bytes`。
+- 复位语义：原厂`inv_ixm42xxx_init()`总是执行软复位，`begin(false,...)`不能跳过。日志固定输出`soft_reset=1`，`reset_requested`只记录调用意图。
+- 接线：SCK=GPIO47，MOSI=GPIO48，MISO=GPIO39，CSB=GPIO40，INT1=GPIO38，CLKIN=GPIO36。节点1003，上行470.7MHz，SF6/BW125/CR4-5。
+- 验证：原生驱动测试8/8通过；完整Python回归86/86通过；六个环境构建通过。
+- 边界：尚未烧录正式节点，尚未验证带INT1和CLKIN的正式链路采样，尚未完成LoRa数据包验收。
+- Git：基线`edf4fd8`；阶段1～3代码、测试和文档已在本轮提交，具体提交见`git log`。
+- 报告：[正式IIM42652原厂驱动接入](docs/changes/2026-11-15_05_正式IIM42652原厂驱动接入.md)。
+
+## 2026-11-15 原厂驱动六线导入测试
+
+- 状态：已完成；离线编译和COM8实机测试均通过，只做传感器启动与采样验证，不接INT1、CLKIN、GNSS或LoRa。
+- 依据：原厂`IIM42652-NUCLEO-G070`示例和`Ixm42xxx` 1.1.1驱动。真实SPI事务参考`Src/main.c`：CS低、发送`地址|0x80`、连续读取数据、CS高；写操作用`地址&0x7F`。
+- 固定接线：VCC=3.3V，GND=GND，SCK=GPIO47，MOSI=GPIO48，MISO=GPIO39，CSB=GPIO40。
+- 测试流程：候选SPI链路连续3次读WHO_AM_I，只有稳定`0x6F`才调用原厂`inv_ixm42xxx_init()`；随后关闭FIFO，设置±4g/50Hz，启动加速度低噪声模式，等待20ms，轮询寄存器采集5秒。
+- 通过条件：WHO_AM_I稳定`0x6F`；5秒内样本率40–60Hz；XYZ可读；采样结束后加速度正常关闭。
+- 实机结果：`PREFLIGHT`在`hspi_mode0_100k`连续3次读到`0x6F`；原厂初始化、关闭FIFO和WHO读取返回码均为0；`INT_STATUS=0x08`，DRDY=1。
+- 采样结果：5秒247个样本，49.4Hz，SPI错误0；XYZ均值`-694.8/-5141.4/6492.8`，合向量1.0145g；`accel_off=1`，最终`PASS`。
+- 比例修正：按DS-000440，±4g的灵敏度是8192 LSB/g，不是2048 LSB/g。修正前合向量4.058g，修正后1.0145g，数据合理。
+- 端口：COM8，USB-Serial/JTAG，串口460800。
+- 代码边界：原厂驱动放`firmware/sensors/iim42652_vendor/`，测试入口放`firmware/tests/iim42652_bringup/`，引脚沿用`firmware/boards/eora_s3_400/Board.h`。
+- Git：基线`edf4fd8`；该轮未提交，内容已随2026-11-15阶段1～3提交一并纳入。
 
 ## 2026-11-12 真实下发自检继续
 
