@@ -84,7 +84,32 @@ bool SampleClock::begin(int pin) {
     return false;
   if (pcnt_isr_register(onOverflow, nullptr, ESP_INTR_FLAG_IRAM, nullptr) != ESP_OK)
     return false;
-  return pcnt_intr_enable(PCNT_UNIT_0) == ESP_OK && pcnt_counter_resume(PCNT_UNIT_0) == ESP_OK;
+  const bool started = pcnt_intr_enable(PCNT_UNIT_0) == ESP_OK &&
+                       pcnt_counter_resume(PCNT_UNIT_0) == ESP_OK;
+  if (started)
+    outputPin_ = pin;
+  return started;
+}
+bool SampleClock::setOutputEnabled(bool enabled) {
+  if (outputPin_ < 0)
+    return false;
+  // gpio_ll_output_disable also detaches the output matrix on ESP32-S3.
+  // Restore the LEDC route, then re-enable the PCNT input path explicitly.
+  if (enabled) {
+    if (ledc_set_pin(outputPin_, LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0) != ESP_OK)
+      return false;
+    gpio_ll_input_enable(&GPIO, static_cast<gpio_num_t>(outputPin_));
+  } else {
+    gpio_ll_output_disable(&GPIO, static_cast<gpio_num_t>(outputPin_));
+  }
+  gpio_set_pull_mode(static_cast<gpio_num_t>(outputPin_), GPIO_FLOATING);
+  measured_ = false;
+  seconds_ = 0;
+  lastLocal_ = 0;
+  portENTER_CRITICAL(&ppsMux);
+  consumed_ = ppsSerial;
+  portEXIT_CRITICAL(&ppsMux);
+  return true;
 }
 void SampleClock::update(bool ppsHealthy) {
   uint32_t serial;

@@ -2,6 +2,7 @@
 
 当前固件 v3：EoRa-S3-400TB / Heltec V3.2 LF × IIM-42352 / IIM-42652，ESP32 输出 32000 Hz CLKIN，结合 GNSS/PPS 授时，通过 E870-L470LG12-O 分信道收发并在电脑保存数据。
 
+- [项目交接与接手顺序](docs/HANDOVER.md)
 - [项目计划与进度](PROJECT_PLAN.md)
 - [四种组合接线及烧录](docs/wiring_and_flash.md)
 - [E870 网关和上位机](docs/e870_setup.md)
@@ -42,7 +43,7 @@ $env:APP_NODE_ID="1001"
 pio run -e heltec_v32_iim42352_tx
 Remove-Item Env:APP_NODE_ID
 python -m host --gateway-config gateway/state/active.local.json
-python -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 `platformio.ini` 是当前唯一固件构建配置。构建及软件测试通过与实机验收分别记录，当前硬件状态以 `PROJECT_PLAN.md` 为准。

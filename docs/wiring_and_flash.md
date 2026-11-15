@@ -142,7 +142,36 @@ Remove-Item Env:APP_NODE_ID
 ```
 
 `APP_NODE_ID` 非整数或超出 `1001–1008` 时构建会停止。烧录前检查没有重复节点，烧录后核对 BOOT 日志中的 `id` 和 `uplink`。节点与频率固定映射为 1001/470.3、1002/470.5、1003/470.7、1004/470.9、1005/471.1、1006/471.3、1007/471.5、1008/471.7 MHz。
-EoRa使用4MB Flash和2MB Quad PSRAM配置；Heltec沿用其8MB板型。两者都使用原生USB CDC。
+EoRa使用4MB Flash和2MB Quad PSRAM配置；Heltec沿用其8MB板型。EoRa使用原生USB CDC；Heltec使用板载CP210x/UART0，`ARDUINO_USB_CDC_ON_BOOT=0`。
+
+## 传感器通信恢复命令（当前诊断固件）
+
+当前COM8/1003诊断固件为EoRa + IIM42652保留“不发芯片软件复位”的初始化方式，支持`SENSOR_RETRY`、`SENSOR_LINK_TEST`和`SENSOR_SAMPLE_TEST`。命令已部署，但当前身份未稳定、实际采样未通过，不能把命令存在当作设备就绪。
+
+新版本的`DIAG`只读取当前选定SPI连接及配置，不再扫描其他模式或切换MISO上下拉。`SENSOR_RETRY`会重新绑定传感器SPI、搜索模式0/3与1MHz/100kHz、要求连续三次正确身份，再校验配置和执行120ms采样自检；它不重启主控、GNSS、时钟或无线，也不发送传感器芯片软件复位。重试会重新配置传感器并清理其FIFO，只允许节点待机或故障、没有活动采样且队列为空时执行。
+
+在新版串口监视器输入：
+
+```text
+DIAG
+SENSOR_RETRY
+```
+
+重试成功需要实际身份、有效加速度样本、合理DRDY/FIFO数量与板端时钟边沿同时通过。日志应出现`SENSOR_RESET,skipped=1`、`SENSOR_CHECK,...sample_valid=1,...ok=1`及`SENSOR_RETRY,ok=1,state=1,reset=0`。这些是新版成功判据示例，不是当前设备实测结果。正式采集仍要求GNSS/PPS和时钟健康，不用重试命令跳过门槛。
+
+### SPI独立只读对照
+
+当前诊断版支持`SENSOR_LINK_TEST`，仅在Waiting/Fault、未活动采样且队列为空时执行。它暂时将同一组传感器GPIO改为软件SPI，只读WHO_AM_I，在两种模式与两种半周期各读取4次，然后恢复硬件SPI路由；不会写传感器寄存器、不会复位芯片，也不会自动恢复采集。日志`spi_restored=1`表示程序执行了路由恢复，不代表芯片身份读取成功。本次现场16次均00，采样恢复仍待验证。
+
+### IIM42652直接采样测试
+
+手册修订版增加`SENSOR_SAMPLE_TEST`，仅允许节点处于Waiting/Fault且没有活动采集和队列数据时执行。命令不向芯片发送软件复位，临时将主控CLKIN输出置为高阻，然后先关闭Accel/Gyro并保持RC时钟，再使用内部时钟配置50Hz/±4g，轮询INT_STATUS.DATA_RDY并直接读ACCEL_DATA_X1起始的六个字节，最多读取20点、超时2.5秒。每点须有新的DRDY和正确WHO，拒绝-32768无效数据码。
+
+```text
+SENSOR_SAMPLE_TEST
+```
+
+输出`SENSOR_TEST_SAMPLE,index=...,local_us=...,x=...,y=...,z=...,rate=50,range_g=4,synchronized=0`。XYZ是int16原始值，g值等于原始值×4/32768。诊断结束输出实际点数，再重新绑定LEDC和PCNT输入路由，检查2ms窗口有合理时钟边沿，恢复外部32kHz正式配置并重跑严格FIFO/DRDY自检；PPS频率验收从头累积。该测试不是UTC同步数据，不替代正式50Hz无线采集或GNSS/PPS时钟门槛；没有实际样本时不能报告采样通过。测试结果详见当前轮报告。
 
 ## USB时钟/采样验证
 

@@ -1,5 +1,6 @@
 #include "NodeApp.h"
 #include "sensor/Registers.h"
+#include "sensor/StartupCheck.h"
 #include <driver/gpio.h>
 
 #include <esp_system.h>
@@ -51,71 +52,128 @@ void NodeApp::begin() {
   Serial.printf("BOOT,version=%s,board=%s,sensor=%s,id=%u,uplink=%.1f,clock=32000,packet=180\n",
                 APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId,
                 Config::uplinkMHz);
-  const bool clockOk = clock_.begin(Board::clockOut);
+  clockOutputReady_ = clock_.begin(Board::clockOut);
   gps_.setPpsObserver(SampleClock::onPps);
+#if defined(APP_BOARD_EORA) && defined(APP_SENSOR_IIM42652)
+  sensorReady_ = initializeSensor(false);
+#else
+  sensorReady_ = initializeSensor(true);
+#endif
+  if (clockOutputReady_) {
+    Serial.println("DIAG_STAGE,before_radio");
+    sensor_.diagnostic();
+  }
+  gps_.begin(Board::gpsRx, Board::gpsTx, Board::gpsPps, Config::gpsBaud);
+#ifndef APP_USB_TEST
+  radioReady_ = Radio::begin();
+  if (clockOutputReady_) {
+    Serial.println("DIAG_STAGE,after_radio");
+    sensor_.diagnostic();
+  }
+#else
+  radioReady_ = true;
+#endif
+  state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
+  Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_measurement=wait_60_pps\n",
+                sensorReady_, radioReady_, clockOutputReady_);
+  lastStatus_ = millis() + ((Config::nodeId - 1001) % 16) * 120;
+}
+bool NodeApp::initializeSensor(bool resetDevice) {
+  // Rebind only the sensor SPI bus; do not restart the clock, GNSS, or radio.
+  detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+  resetEdges();
   pinMode(Board::sensorInt, INPUT);
-  attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
-  const bool sensorInit = clockOk && sensor_.begin();
-  Serial.println("DIAG_STAGE,before_radio");
-  sensor_.diagnostic();
-  uint32_t selfTestEdges = 0;
-  uint16_t selfTestFifo = 0;
-  uint64_t selfTestClockEdges = 0;
-  if (sensorInit) {
+  SensorChecks::StartupCheck check = {};
+  const bool initialized = clockOutputReady_ && sensor_.begin(resetDevice);
+  if (initialized) {
+    attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
     const uint32_t before = edgeTotal;
     const uint64_t clockBefore = clock_.edgeCount();
     sensor_.start();
     delay(120);
-    selfTestEdges = edgeTotal - before;
-    selfTestClockEdges = clock_.edgeCount() - clockBefore;
-    selfTestFifo = sensor_.available();
-    // At 100 Hz a 120 ms probe should produce about 12 samples. An INT1
-    // carrying CLKIN (~3840 edges) is not a successful data-ready test.
-    sensorReady_ = selfTestEdges >= 4 && selfTestEdges <= 30 &&
-                   selfTestFifo >= 4 && selfTestFifo <= 30 && sensor_.fifoCountValid();
-    if (selfTestFifo) {
+    check.dataReadyEdges = edgeTotal - before;
+    check.clockEdges = clock_.edgeCount() - clockBefore;
+    check.fifoSamples = sensor_.available();
+    check.fifoCountValid = sensor_.fifoCountValid();
+    if (check.fifoSamples && check.fifoCountValid) {
       AccelSample sample = {};
-      const bool valid = sensor_.read(sample);
-      Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", valid, sample.x, sample.y,
-                    sample.z);
+      check.sampleValid = sensor_.read(sample);
+      Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", check.sampleValid,
+                    sample.x, sample.y, sample.z);
     }
+    check.identityValid = sensor_.readRegister(IimRegister::WHO_AM_I) ==
+                          sensor_.expectedIdentity();
     sensor_.standby();
     resetEdges();
   }
-  Serial.printf(
-      "SENSOR_CHECK,init=%u,drdy=%lu,fifo_samples=%u,clock_edges=%llu,int1_level=%u,ok=%u\n",
-      sensorInit, (unsigned long)selfTestEdges, selfTestFifo,
-      (unsigned long long)selfTestClockEdges, digitalRead(Board::sensorInt), sensorReady_);
-  gps_.begin(Board::gpsRx, Board::gpsTx, Board::gpsPps, Config::gpsBaud);
-#ifndef APP_USB_TEST
-  radioReady_ = Radio::begin();
-  Serial.println("DIAG_STAGE,after_radio");
-  sensor_.diagnostic();
-#else
-  radioReady_ = true;
-#endif
-  state_ = clockOk && sensorReady_ && radioReady_ ? Waiting : Fault;
-  Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_measurement=wait_60_pps\n",
-                sensorReady_, radioReady_, clockOk);
-  if (!sensorReady_) {
-    for (gpio_pull_mode_t pull : {GPIO_FLOATING, GPIO_PULLDOWN_ONLY, GPIO_PULLUP_ONLY}) {
-      gpio_set_pull_mode(static_cast<gpio_num_t>(Board::sensorInt), pull);
-      const uint32_t beforeEdges = edgeTotal;
-      const uint64_t beforeClock = clock_.edgeCount();
-      delay(200);
-      Serial.printf("INT_PULL_DIAG,mode=%u,edges_200ms=%lu,clock_200ms=%llu,level=%u\n",
-          unsigned(pull), (unsigned long)(edgeTotal-beforeEdges),
-          (unsigned long long)(clock_.edgeCount()-beforeClock), digitalRead(Board::sensorInt));
-    }
-    gpio_set_pull_mode(static_cast<gpio_num_t>(Board::sensorInt), GPIO_FLOATING);
-  }
-  if (!sensorReady_) {
+  const bool passed = initialized && SensorChecks::startupPassed(check);
+  Serial.printf("SENSOR_CHECK,init=%u,executed=%u,drdy=%lu,fifo_samples=%u,"
+                "clock_edges=%llu,sample_valid=%u,identity_ok=%u,fifo_bytes=%u,"
+                "int1_level=%u,ok=%u\n", initialized, initialized,
+                (unsigned long)check.dataReadyEdges, check.fifoSamples,
+                (unsigned long long)check.clockEdges, check.sampleValid, check.identityValid,
+                sensor_.lastFifoBytes(), digitalRead(Board::sensorInt), passed);
+  if (!passed) {
     detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
     resetEdges();
     Serial.println("SENSOR_FAULT,drdy_interrupt_disabled=1,capture_blocked=1");
   }
-
-  lastStatus_ = millis() + ((Config::nodeId - 1001) % 16) * 120;
+  return passed;
+}
+void NodeApp::sensorSampleTest() {
+  if (!SensorChecks::canRetry(state_, sensorActive_, queue_.size()) ||
+      !clockOutputReady_) {
+    Serial.println("SENSOR_SAMPLE_TEST,ok=0,reason=not_idle");
+    return;
+  }
+  detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+  resetEdges();
+  sensorReady_ = false;
+  state_ = Fault;
+  const bool isolated = clock_.setOutputEnabled(false);
+  Serial.printf("SENSOR_SAMPLE_TEST_BEGIN,clock=internal,rate=50,range_g=4,"
+                "target=20,synchronized=0,sensor_reset=0,clkin_output_high_z=%u\n",
+                isolated);
+  const bool configured = isolated && sensor_.begin(false, false) &&
+                          sensor_.configure(50, 4);
+  uint16_t captured = 0;
+  if (configured) {
+    sensor_.start();
+    const uint32_t started = millis();
+    while (captured < 20 && millis() - started < 2500) {
+      AccelSample sample = {};
+      if (sensor_.readDirect(sample)) {
+        ++captured;
+        Serial.printf("SENSOR_TEST_SAMPLE,index=%u,local_us=%llu,x=%d,y=%d,z=%d,"
+                      "rate=50,range_g=4,synchronized=0\n", captured,
+                      (unsigned long long)esp_timer_get_time(),sample.x,sample.y,sample.z);
+      }
+      gps_.update();
+      clock_.update(gps_.healthy());
+#ifndef APP_USB_TEST
+      if (radioReady_)
+        Radio::update();
+#endif
+      delay(1);
+    }
+    sensor_.standby();
+  }
+  Serial.printf("SENSOR_SAMPLE_TEST_END,configured=%u,samples=%u,target=20,ok=%u\n",
+                configured, captured, configured && captured == 20);
+  // Restore the clock buffer before selecting external RTC mode again.
+  clockOutputReady_ = clock_.setOutputEnabled(true);
+  const uint64_t restoredBefore = clock_.edgeCount();
+  delayMicroseconds(2000);
+  const uint64_t restoredEdges = clock_.edgeCount() - restoredBefore;
+  clockOutputReady_ = clockOutputReady_ && restoredEdges >= 32 && restoredEdges <= 128;
+  Serial.printf("SENSOR_CLOCK_RESTORE,output_enabled=%u,edges_2ms=%llu,"
+                "pps_recalibration=1\n", clockOutputReady_,
+                (unsigned long long)restoredEdges);
+  // The internal-clock diagnostic never authorizes synchronized acquisition.
+  sensorReady_ = initializeSensor(false);
+  state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
+  Serial.printf("SENSOR_SAMPLE_TEST_RESTORE,external_clock=1,sensor_ready=%u,state=%u\n",
+                sensorReady_,state_);
 }
 uint64_t NodeApp::epoch(uint64_t local) const {
   if (!anchorEpoch_)
@@ -313,7 +371,32 @@ void NodeApp::serialCommands() {
     serialLine_[serialLength_] = 0;
     serialLength_ = 0;
     if (!strcmp(serialLine_, "DIAG")) {
-      sensor_.diagnostic();
+      if (clockOutputReady_)
+        sensor_.diagnostic();
+      else
+        Serial.println("SENSOR_ERROR,stage=clock_output");
+      continue;
+    }
+    if (!strcmp(serialLine_, "SENSOR_SAMPLE_TEST")) {
+      sensorSampleTest();
+      continue;
+    }
+    if (!strcmp(serialLine_, "SENSOR_LINK_TEST")) {
+      if (!clockOutputReady_ || !SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
+        Serial.println("SENSOR_LINK_TEST,ok=0,reason=not_idle");
+        continue;
+      }
+      sensor_.linkTest();
+      continue;
+    }
+    if (!strcmp(serialLine_, "SENSOR_RETRY")) {
+      if (!SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
+        Serial.println("SENSOR_RETRY,ok=0,reason=busy,reset=0");
+        continue;
+      }
+      sensorReady_ = initializeSensor(false);
+      state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
+      Serial.printf("SENSOR_RETRY,ok=%u,state=%u,reset=0\n", sensorReady_, state_);
       continue;
     }
     if (!strcmp(serialLine_, "STOP")) {
@@ -340,7 +423,7 @@ void NodeApp::serialCommands() {
       acceptStart(h, options);
     } else
       Serial.println(
-          "COMMANDS: START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
+          "COMMANDS: DIAG; SENSOR_RETRY; SENSOR_SAMPLE_TEST; SENSOR_LINK_TEST; START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
   }
 }
 void NodeApp::acquire() {

@@ -17,6 +17,8 @@ class NodeApp {
   void commands();
   void process(const uint8_t* bytes, size_t length);
   void serialCommands();
+  bool initializeSensor(bool resetDevice);
+  void sensorSampleTest();
   void acceptStart(const WireProtocol::Header&, const WireProtocol::StartOptions&);
   void stop();
   void acquire();
@@ -42,6 +44,7 @@ class NodeApp {
   uint32_t replyRun_ = 0, replyAt_ = 0, lastStatus_ = 0, lastLog_ = 0;
   uint64_t startEpoch_ = 0, firstEpoch_ = 0, lastEpoch_ = 0, anchorEpoch_ = 0, anchorLocal_ = 0;
   float uplink_ = Config::uplinkMHz;
+  bool clockOutputReady_ = false;
   bool sensorReady_ = false, radioReady_ = false, sensorActive_ = false, gap_ = false,
        overflow_ = false;
   bool replyPending_ = false;
