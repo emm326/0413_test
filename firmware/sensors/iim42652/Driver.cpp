@@ -60,6 +60,7 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
+  fifoErrors_ = 0;
   overflow_ = false;
   packetBytes_ = 11;
 
@@ -268,6 +269,7 @@ bool Iim42652::configureFifo() {
       BIT_FIFO_CONFIG1_WM_GT_TH_MASK);
   uint8_t fifo = 0;
   uint8_t fifo1 = 0;
+  uint8_t intf0 = 0;
   for (uint8_t attempt = 0; attempt < 3; ++attempt) {
     int rc = inv_ixm42xxx_configure_fifo(&driver_, INV_IXM42XXX_FIFO_ENABLED);
     rc |= inv_ixm42xxx_configure_fifo_wm(&driver_, 1);
@@ -276,13 +278,23 @@ bool Iim42652::configureFifo() {
       continue;
     }
     delay(1);
+    // FIFO_COUNT_REC=0 reports bytes, but available() consumes records. Switch
+    // the chip to record counts so a 50 Hz stream cannot look like an overflow.
+    if (setBank(0) && directRead(MPUREG_INTF_CONFIG0, intf0) &&
+        (intf0 & BIT_FIFO_COUNT_REC_MASK) == 0) {
+      writeRaw(MPUREG_INTF_CONFIG0, static_cast<uint8_t>(intf0 | BIT_FIFO_COUNT_REC_MASK));
+    }
+    delay(1);
     const bool read = setBank(0) && directRead(MPUREG_FIFO_CONFIG, fifo) &&
-                      directRead(MPUREG_FIFO_CONFIG1, fifo1);
+                      directRead(MPUREG_FIFO_CONFIG1, fifo1) &&
+                      directRead(MPUREG_INTF_CONFIG0, intf0);
     const bool modeOk =
         (fifo & BIT_FIFO_CONFIG_MODE_MASK) ==
         static_cast<uint8_t>(IXM42XXX_FIFO_CONFIG_MODE_STOP_ON_FULL);
     const bool featuresOk = (fifo1 & config1Mask) == config1Mask;
-    if (read && modeOk && featuresOk) {
+    const bool countRecOk = (intf0 & BIT_FIFO_COUNT_REC_MASK) != 0;
+    if (read && modeOk && featuresOk && countRecOk) {
+      Serial.printf("SENSOR_FIFO_COUNT,rec=1,intf0=0x%02X,ok=1\n", intf0);
       return true;
     }
   }
@@ -325,6 +337,27 @@ bool Iim42652::forceSixteenBitFifo() {
 }
 
 bool Iim42652::configureInterrupt() {
+  // INT_CONFIG1 bit4 INT_ASYNC_RESET resets to 1. The datasheet requires 0 for
+  // proper INT1/INT2 operation; leaving it set produces extra interrupt edges.
+  uint8_t intCfg1Before = 0;
+  uint8_t intCfg1After = 0;
+  bool intCfg1Ok = false;
+  for (uint8_t attempt = 0; attempt < 3 && !intCfg1Ok; ++attempt) {
+    if (!setBank(0) || !directRead(MPUREG_INT_CONFIG1, intCfg1Before)) {
+      delay(1);
+      continue;
+    }
+    const uint8_t wanted1 = static_cast<uint8_t>(intCfg1Before & ~0x10);
+    if (wanted1 != intCfg1Before && !writeRaw(MPUREG_INT_CONFIG1, wanted1)) {
+      delay(1);
+      continue;
+    }
+    delay(1);
+    intCfg1Ok = setBank(0) && directRead(MPUREG_INT_CONFIG1, intCfg1After) &&
+                (intCfg1After & 0x10) == 0;
+  }
+  Serial.printf("SENSOR_INT_CONFIG1,before=0x%02X,after=0x%02X,ok=%u\n",
+                intCfg1Before, intCfg1After, intCfg1Ok ? 1 : 0);
   const uint8_t mask = static_cast<uint8_t>(
       BIT_INT_CONFIG_INT1_DRIVE_CIRCUIT_MASK | BIT_INT_CONFIG_INT1_POLARITY_MASK);
   uint8_t requested = 0;
@@ -347,9 +380,16 @@ bool Iim42652::configureInterrupt() {
       delay(1);
       if (setBank(0) && directRead(MPUREG_INT_CONFIG, applied) &&
           (applied & mask) == (requested & mask)) {
-        Serial.printf("SENSOR_INT_CONFIG,requested=0x%02X,applied=0x%02X,ok=1\n",
-                      requested, applied);
-        return true;
+        uint8_t source0 = 0;
+        const bool sourceOk =
+            setBank(0) && directRead(MPUREG_INT_SOURCE0, source0) &&
+            (source0 & BIT_INT_SOURCE0_FIFO_THS_INT1_EN) != 0 &&
+            (source0 & BIT_INT_SOURCE0_UI_DRDY_INT1_EN) == 0;
+        Serial.printf("SENSOR_INT_CONFIG,requested=0x%02X,applied=0x%02X,"
+                      "source0=0x%02X,source_ok=%u,ok=%u\n",
+                      requested, applied, source0, sourceOk ? 1 : 0,
+                      (sourceOk && intCfg1Ok) ? 1 : 0);
+        return sourceOk && intCfg1Ok;
       }
     }
     delay(1);
@@ -440,6 +480,7 @@ void Iim42652::start() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
+  fifoErrors_ = 0;
   overflow_ = false;
   if (setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
@@ -471,6 +512,7 @@ void Iim42652::standby() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
+  fifoErrors_ = 0;
   overflow_ = false;
   if (setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
@@ -482,6 +524,7 @@ void Iim42652::flush() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
+  fifoErrors_ = 0;
   overflow_ = false;
   if (initialized_ && setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
@@ -494,14 +537,20 @@ uint16_t Iim42652::available() {
   }
 
   uint8_t countBytes[2] = {};
-  if (!setBank(0) || !readRaw(MPUREG_FIFO_COUNTH, countBytes, 2)) {
-    overflow_ = true;
-    lastFifoBytes_ = 0xffff;
-    return count_;
+  uint16_t packets = 0;
+  bool countOk = false;
+  // Immediately after start() the chip can answer FIFO_COUNT with 0xFFFF while
+  // it powers up. Retry before treating that as a real overflow.
+  for (uint8_t attempt = 0; attempt < 3 && !countOk; ++attempt) {
+    if (setBank(0) && readRaw(MPUREG_FIFO_COUNTH, countBytes, 2)) {
+      packets = static_cast<uint16_t>(countBytes[0]) |
+                (static_cast<uint16_t>(countBytes[1]) << 8);
+      countOk = packets <= maxFifoPackets();
+    }
+    if (!countOk)
+      delay(1);
   }
-  const uint16_t packets = static_cast<uint16_t>(countBytes[0]) |
-                           (static_cast<uint16_t>(countBytes[1]) << 8);
-  if (packets > maxFifoPackets()) {
+  if (!countOk) {
     overflow_ = true;
     lastFifoBytes_ = 0xffff;
     head_ = tail_ = count_ = 0;
@@ -516,14 +565,21 @@ uint16_t Iim42652::available() {
 
   for (uint16_t i = 0; i < packets; ++i) {
     if (!readFifoPacket()) {
-      overflow_ = true;
-      lastFifoBytes_ = 0xffff;
+      // One corrupted record is a gap, not a dead sensor: drop it and let the
+      // caller keep running. Three consecutive failures still raise a fault.
+      ++fifoErrors_;
+      if (fifoErrors_ >= 3) {
+        overflow_ = true;
+      }
+      lastFifoBytes_ = 0;
+      inv_ixm42xxx_reset_fifo(&driver_);
       Serial.printf("SENSOR_FIFO_ERROR,index=%u,packets=%u,buffered=%u,"
-                    "header=0x%02X\n",
-                    i, packets, count_, lastHeader_);
+                    "header=0x%02X,consecutive=%u\n",
+                    i, packets, count_, lastHeader_, fifoErrors_);
       return count_;
     }
   }
+  fifoErrors_ = 0;
   return count_;
 }
 

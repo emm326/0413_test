@@ -9,6 +9,15 @@
 #ifndef APP_FIRMWARE_VERSION
 #define APP_FIRMWARE_VERSION "3.0.0"
 #endif
+#ifndef APP_REQUIRE_TIME_SYNC
+// Field builds gate sampling on GNSS/PPS. Bench builds set this to 0 so the
+// sensor can be validated indoors; timestamps are then flagged untrusted.
+#define APP_REQUIRE_TIME_SYNC 1
+#endif
+#ifndef APP_BENCH_EPOCH_US
+// Pseudo epoch used only when APP_REQUIRE_TIME_SYNC=0 and GNSS has no fix.
+#define APP_BENCH_EPOCH_US 1767225600000000ULL  // 2026-01-01T00:00:00Z
+#endif
 namespace Config {
 constexpr uint16_t nodeId = APP_NODE_ID;
 static_assert(nodeId >= 1001 && nodeId <= 1008, "APP_NODE_ID must be 1001..1008");

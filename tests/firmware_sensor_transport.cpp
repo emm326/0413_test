@@ -38,6 +38,8 @@ struct Bus {
     bank = 0;
     // A real chip answers this address without any prior configuration.
     regs[0][0x75] = 0x6f;
+    // INT_CONFIG1 reset value is 0x10 (INT_ASYNC_RESET=1).
+    regs[0][MPUREG_INT_CONFIG1] = 0x10;
   }
 
   uint8_t read(uint8_t reg) {
@@ -384,6 +386,13 @@ void driverConfiguration() {
           "high-resolution FIFO was not disabled");
   require(vendor.int1Fifo == INV_IXM42XXX_ENABLE,
           "INT1 FIFO threshold was not enabled");
+  require((bus.regs[0][MPUREG_INT_CONFIG1] & 0x10) == 0,
+          "INT_ASYNC_RESET was not cleared");
+  require(bus.regs[0][MPUREG_INT_SOURCE0] ==
+              BIT_INT_SOURCE0_FIFO_THS_INT1_EN,
+          "INT1 source is not FIFO threshold only");
+  require((bus.regs[0][MPUREG_INTF_CONFIG0] & BIT_FIFO_COUNT_REC_MASK) != 0,
+          "FIFO count was not switched to records");
 
   // readRegister must be a physical read. A value changed behind the vendor
   // register cache has to be visible, otherwise clock verification would only

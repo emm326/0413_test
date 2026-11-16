@@ -2,16 +2,16 @@
 
 ## 当前进度
 
-- 更新日期：2026-11-15（Asia/Hong_Kong）
+- 更新日期：2026-11-16（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`edf4fd8`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：阶段1～3已完成。正式`firmware/sensors/iim42652/`已改用原厂Ixm42xxx 1.1.1：HSPI Mode0/100kHz软件CS、FIFO record模式、INT1推挽高有效、CLKIN 32kHz，并用物理寄存器读回校验时钟与配置。六个环境编译通过，完整回归86/86通过；实机采样与LoRa验收待阶段4～5。
+- 本轮 Git 基线：`8a4bb8c`（调试基线提交）；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 当前步骤：阶段4～5进行中。保留ESP32 GPIO36输出32kHz作为IIM42652 CLKIN，已完成时钟自检/恢复、INT_ASYNC_RESET清零、FIFO记录计数修正、INT1去抖和自检重试。COM8实机启动自检已通过（drdy=19,fifo=12,clock=3840,ok=1），采集可输出25条有效样本；样本间隔不均匀和约5秒后FIFO故障未解决，连续60秒与LoRa验收待完成。
 - 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线测试已完成；测试只使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，未接INT1/CLKIN/GNSS/LoRa。阶段1～3已提交，阶段4～5保持节点1003和±4g/50Hz配置做实机验证，结果单独记录。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
 - 本轮实施范围：把六线验证通过的原厂链路移植到正式驱动，保留NodeApp公共接口；增加物理寄存器读回、FIFO包长统计和安全关闭。IIM42352实现不动。
-- 当前报告：[正式IIM42652原厂驱动接入](docs/changes/2026-11-15_05_正式IIM42652原厂驱动接入.md)；[原厂驱动六线导入测试](docs/diagnostics/2026-11-15_04_原厂驱动六线导入测试.md)；[交接文档](docs/HANDOVER.md)。
+- 当前报告：[ESP32时钟保留方案与台架采样](docs/changes/2026-11-16_01_ESP32时钟保留方案与台架采样.md)；[交接文档](docs/HANDOVER.md)。
 - 最近Heltec实测（2026-11-14）：COM6/CP210x，ESP32-S3/8MB/MAC9c:13:9e:9d:e8:a8，节点1004。WHO0，200ms INT/clock各6402/6398/6399；MISO空闲均1但SPI仍0。最终STATUS,id=1004,state=5,gps=0,clock_hz=0.0000,ppm=0.00,clock_ok=0,queue=0,lost_samples=0,lost_packets=0；异常IRQ已关闭，sensor0拒采。EoRa结果单独保留。
 - 软件验证（2026-11-15）：项目.venv下86/86项完整回归通过；六环境构建通过（EoRa42652正式/USB、Heltec42652、EoRa42352、Heltec42352、EoRa42652六线bringup）。EoRa正式环境RAM 52356/327680字节，Flash 377833/1310720字节。六线bringup实机已通过：WHO_AM_I=0x6F，247样本/5秒，49.4Hz，SPI错误0，合向量1.0145g。正式节点尚未烧录。
 - 网关本轮实测：192.168.1.10↔电脑192.168.1.22/UDP1700，EUI0000000000000923；3次下发/3次TX_ACK NONE/3次独立编号节点CONFIRM，上行470.7MHz/SF6BW125/4/5，RSSI-35dBm，SNR10.2/10.5/10.2dB，双向控制链路已通过。未启动采样。
@@ -467,3 +467,14 @@
 - [统一启动、并行发送与结束收尾核查](docs/e870_capability_review.md)
 - [协议v3和五秒周期](docs/protocol_v3.md)
 - [实机验收记录](docs/hardware_acceptance.md)
+
+## 2026-11-16 ESP32 时钟保留与台架采样
+
+- 状态：进行中（时钟与启动自检已通过；采样时序和长时间稳定性待修复）。
+- 需求变化：不接入 DS3231，继续使用 ESP32 GPIO36 的 32.000 kHz 作为 IIM42652 CLKIN。固件时钟常量保持 32000，不做 ODR 改频。
+- 本轮改动：`SampleClock` 增加 10 ms 边沿自检、恢复和看门狗；`Driver` 清零 INT_ASYNC_RESET、把 FIFO_COUNT 切换为记录单位并增加计数重试和坏记录容错；`NodeApp` 增加 INT1 下拉与 2 ms 去抖、三次启动自检、采集启动时序和台架模式；新增环境 `eora_s3_400_iim42652_bench`。
+- 编译验证：bench 环境和正式 tx 环境均构建通过；`tests.test_firmware_sensor` 3/3 通过。
+- 实机验证（COM8）：时钟自检 320 边沿/10 ms；启动自检 ok=1；采集输出 25 条有效样本，Z 轴约 8280 LSB（±4 g 下约 1.0 g）。
+- 未通过：样本时间间隔不均匀（0～120 ms），约 5 秒后 FIFO 故障进入 state=5，连续 60 秒和 LoRa 未验收。
+- 报告：`docs/changes/2026-11-16_01_ESP32时钟保留方案与台架采样.md`。
+- 下一步：使用 FIFO 内建 TMST 时间戳或保证每条记录一个中断边沿；定位采集约 5 秒后的 FIFO 故障；再跑 60 秒和 LoRa。

@@ -82,6 +82,7 @@ class Iim42652 final {
   uint16_t tail_ = 0;
   uint16_t count_ = 0;
   uint16_t lastFifoBytes_ = 0;
+  uint8_t fifoErrors_ = 0;
   uint16_t packetBytes_ = 11;
   uint8_t lastHeader_ = 0;
   uint16_t rate_ = 50;

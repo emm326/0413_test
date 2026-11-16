@@ -14,17 +14,23 @@ portMUX_TYPE edgeMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint64_t edgeTimes[256];
 volatile uint16_t edgeHead = 0, edgeTail = 0;
 volatile uint32_t edgeOverruns = 0, edgeTotal = 0;
+volatile uint64_t edgeLastUs = 0;
 void IRAM_ATTR dataReady() {
   const uint64_t now = esp_timer_get_time();
   portENTER_CRITICAL_ISR(&edgeMux);
-  uint16_t next = (edgeHead + 1) % 256;
-  if (next == edgeTail)
-    ++edgeOverruns;
-  else {
-    edgeTimes[edgeHead] = now;
-    edgeHead = next;
+  // 50 Hz is 20 ms and 100 Hz is 10 ms apart. Ringing closer than 2 ms is
+  // electrical noise, not a new sample.
+  if (now - edgeLastUs >= 2000) {
+    edgeLastUs = now;
+    uint16_t next = (edgeHead + 1) % 256;
+    if (next == edgeTail)
+      ++edgeOverruns;
+    else {
+      edgeTimes[edgeHead] = now;
+      edgeHead = next;
+    }
+    ++edgeTotal;
   }
-  ++edgeTotal;
   portEXIT_CRITICAL_ISR(&edgeMux);
 }
 bool popEdge(uint64_t& time) {
@@ -39,6 +45,12 @@ bool popEdge(uint64_t& time) {
 }
 }  // namespace
 NodeApp::NodeApp() : gpsSerial_(1), gps_(gpsSerial_) {}
+void NodeApp::detachSensorInterrupt() {
+  if (intAttached_) {
+    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    intAttached_ = false;
+  }
+}
 void NodeApp::resetEdges() {
   portENTER_CRITICAL(&edgeMux);
   edgeHead = edgeTail = 0;
@@ -56,7 +68,10 @@ void NodeApp::begin() {
   if (clockOutputReady_) {
     // Let the LEDC output and PCNT input path settle before measuring.
     delay(100);
+    clockWatchEdges_ = clock_.edgeCount();
+    clockWatchMs_ = millis();
   }
+  Serial.printf("CLOCK_OUTPUT,ready=%u\n", clockOutputReady_ ? 1 : 0);
   gps_.setPpsObserver(SampleClock::onPps);
 #if defined(APP_BOARD_EORA) && defined(APP_SENSOR_IIM42652)
   sensorReady_ = initializeSensor(false);
@@ -84,46 +99,73 @@ void NodeApp::begin() {
 }
 bool NodeApp::initializeSensor(bool resetDevice) {
   // Rebind only the sensor SPI bus; do not restart the clock, GNSS, or radio.
-  detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+  detachSensorInterrupt();
   resetEdges();
   // Internal pull-down keeps a floating INT1 line from generating a false edge storm.
   pinMode(Board::sensorInt, INPUT_PULLDOWN);
-  SensorChecks::StartupCheck check = {};
-  const bool initialized = clockOutputReady_ && sensor_.begin(resetDevice);
-  if (initialized) {
-    attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
-    sensor_.start();
-    // Ignore the FIFO/INT1 transient created while the sensor switches into
-    // low-noise mode. Measure only a stable 120 ms window.
-    delay(20);
-    resetEdges();
-    const uint32_t before = edgeTotal;
-    const uint64_t clockBefore = clock_.edgeCount();
-    delay(120);
-    check.dataReadyEdges = edgeTotal - before;
-    check.clockEdges = clock_.edgeCount() - clockBefore;
-    check.fifoSamples = sensor_.available();
-    check.fifoCountValid = sensor_.fifoCountValid();
-    if (check.fifoSamples && check.fifoCountValid) {
-      AccelSample sample = {};
-      check.sampleValid = sensor_.read(sample);
-      Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", check.sampleValid,
-                    sample.x, sample.y, sample.z);
-    }
-    check.identityValid = sensor_.readRegister(IimRegister::WHO_AM_I) ==
-                          sensor_.expectedIdentity();
-    sensor_.standby();
-    resetEdges();
+  // The sensor requires a live CLKIN in RTC mode. Verify the pin actually
+  // toggles before vendor init, and re-route once if it does not.
+  bool clockAlive = clockOutputReady_ && clock_.verifyOutput(10, 240, 400);
+  if (!clockAlive && clockOutputReady_) {
+    Serial.println("CLOCK_VERIFY_FAILED,recover=1");
+    clockAlive = clock_.recover() && clock_.verifyOutput(10, 240, 400);
+    clockOutputReady_ = clockAlive;
   }
-  const bool passed = initialized && SensorChecks::startupPassed(check);
+  const bool initialized = clockAlive && sensor_.begin(resetDevice);
+  bool passed = false;
+  SensorChecks::StartupCheck last = {};
+  if (initialized) {
+    // A marginal INT1 line can fail one window and pass the next. Retry the
+    // whole start/measure cycle before declaring the sensor faulty.
+    for (uint8_t attempt = 1; attempt <= 3 && !passed; ++attempt) {
+      SensorChecks::StartupCheck check = {};
+      detachSensorInterrupt();
+      resetEdges();
+      sensor_.flush();
+      attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
+      intAttached_ = true;
+      sensor_.start();
+      // Ignore the FIFO/INT1 transient created while the sensor switches into
+      // low-noise mode. Measure only a stable window after the transient.
+      delay(100);
+      resetEdges();
+      const uint32_t before = edgeTotal;
+      const uint64_t clockBefore = clock_.edgeCount();
+      delay(120);
+      check.dataReadyEdges = edgeTotal - before;
+      check.clockEdges = clock_.edgeCount() - clockBefore;
+      check.fifoSamples = sensor_.available();
+      check.fifoCountValid = sensor_.fifoCountValid();
+      if (check.fifoSamples && check.fifoCountValid) {
+        AccelSample sample = {};
+        check.sampleValid = sensor_.read(sample);
+        Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", check.sampleValid,
+                      sample.x, sample.y, sample.z);
+      }
+      check.identityValid = sensor_.readRegister(IimRegister::WHO_AM_I) ==
+                            sensor_.expectedIdentity();
+      sensor_.standby();
+      detachSensorInterrupt();
+      resetEdges();
+      passed = SensorChecks::startupPassed(check);
+      last = check;
+      Serial.printf("SENSOR_CHECK_ATTEMPT,attempt=%u,drdy=%lu,fifo_samples=%u,"
+                    "clock_edges=%llu,sample_valid=%u,identity_ok=%u,ok=%u\n",
+                    attempt, (unsigned long)check.dataReadyEdges, check.fifoSamples,
+                    (unsigned long long)check.clockEdges, check.sampleValid,
+                    check.identityValid, passed ? 1 : 0);
+      if (!passed)
+        delay(50);
+    }
+  }
   Serial.printf("SENSOR_CHECK,init=%u,executed=%u,drdy=%lu,fifo_samples=%u,"
                 "clock_edges=%llu,sample_valid=%u,identity_ok=%u,fifo_bytes=%u,"
                 "int1_level=%u,ok=%u\n", initialized, initialized,
-                (unsigned long)check.dataReadyEdges, check.fifoSamples,
-                (unsigned long long)check.clockEdges, check.sampleValid, check.identityValid,
+                (unsigned long)last.dataReadyEdges, last.fifoSamples,
+                (unsigned long long)last.clockEdges, last.sampleValid, last.identityValid,
                 sensor_.lastFifoBytes(), digitalRead(Board::sensorInt), passed);
   if (!passed) {
-    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    detachSensorInterrupt();
     resetEdges();
     Serial.println("SENSOR_FAULT,drdy_interrupt_disabled=1,capture_blocked=1");
   }
@@ -135,7 +177,7 @@ void NodeApp::sensorSampleTest() {
     Serial.println("SENSOR_SAMPLE_TEST,ok=0,reason=not_idle");
     return;
   }
-  detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+  detachSensorInterrupt();
   resetEdges();
   sensorReady_ = false;
   state_ = Fault;
@@ -187,8 +229,11 @@ void NodeApp::sensorSampleTest() {
                 sensorReady_,state_);
 }
 uint64_t NodeApp::epoch(uint64_t local) const {
-  if (!anchorEpoch_)
-    return 0;
+  if (!anchorEpoch_) {
+    // Bench builds have no GNSS anchor; use a fixed base plus uptime so the
+    // capture scheduler can still run. gps=0 marks the time as untrusted.
+    return APP_REQUIRE_TIME_SYNC ? 0 : static_cast<uint64_t>(APP_BENCH_EPOCH_US) + local;
+  }
   const int64_t value = int64_t(anchorEpoch_) + int64_t(local) - int64_t(anchorLocal_);
   return value > 0 ? uint64_t(value) : 0;
 }
@@ -207,19 +252,50 @@ void NodeApp::tick() {
   if (radioReady_)
     Radio::update();
 #endif
+  // Clock watchdog: the LEDC loopback must keep producing ~32 kHz. Two bad
+  // 1 s windows in a row trigger one full route restore.
+  if (clockOutputReady_ && state_ != WireProtocol::Fault &&
+      millis() - clockWatchMs_ >= 1000) {
+    const uint64_t edgesNow = clock_.edgeCount();
+    const uint64_t delta = edgesNow - clockWatchEdges_;
+    clockWatchEdges_ = edgesNow;
+    clockWatchMs_ = millis();
+    if (delta < 24000 || delta > 40000) {
+      ++clockWatchFaults_;
+      Serial.printf("CLOCK_WATCHDOG,edges_1s=%llu,faults=%u\n",
+                    (unsigned long long)delta, clockWatchFaults_);
+      if (clockWatchFaults_ >= 2) {
+        const bool recovered = clock_.recover() && clock_.verifyOutput(10, 240, 400);
+        Serial.printf("CLOCK_RECOVER,ok=%u\n", recovered ? 1 : 0);
+        clockWatchFaults_ = 0;
+        if (!recovered) {
+          clockOutputReady_ = false;
+          sensorReady_ = false;
+          state_ = WireProtocol::Fault;
+        }
+      }
+    } else {
+      clockWatchFaults_ = 0;
+    }
+  }
   serialCommands();
   commands();
   const uint64_t now = epoch(esp_timer_get_time());
   if (state_ == Armed && now && now + Config::warmupUs >= startEpoch_) {
-    if (!gps_.healthy() || !clock_.healthy()) {
+    if (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !clock_.healthy())) {
       result_ = NotReady;
       state_ = Waiting;
       replyPending_ = true;
       replyAt_ = millis();
     } else {
       sensor_.flush();
+      detachSensorInterrupt();
+      attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
+      intAttached_ = true;
       resetEdges();
       sensor_.start();
+      // Give the first FIFO records time to appear before the first count read.
+      delay(100);
       sensorActive_ = true;
       state_ = Capturing;
     }
@@ -261,7 +337,8 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
     result_ = Busy;
     return;
   }
-  if (state_ == Fault || !sensorReady_ || !gps_.healthy() || !clock_.healthy()) {
+  if (state_ == Fault || !sensorReady_ ||
+      (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !clock_.healthy()))) {
     result_ = NotReady;
     return;
   }
@@ -276,14 +353,16 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
     return;
   }
   const uint64_t now = epoch(esp_timer_get_time());
-  if (!h.run || h.epochUs < now + 1000000) {
+  const uint64_t startUs =
+      (!APP_REQUIRE_TIME_SYNC && h.epochUs == 0) ? now + 1000000 : h.epochUs;
+  if (!h.run || startUs < now + 1000000) {
     result_ = TooLate;
     return;
   }
   if (sensor_.readRegister(IimRegister::WHO_AM_I) != sensor_.expectedIdentity()) {
     sensorReady_ = false;
     state_ = Fault;
-    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    detachSensorInterrupt();
     result_ = NotReady;
     return;
   }
@@ -298,7 +377,7 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   range_ = h.range;
   sf_ = options.sf;
   uplink_ = Config::uplinkMHz;
-  startEpoch_ = h.epochUs;
+  startEpoch_ = startUs;
   duration_ = options.durationSeconds;
   sequence_ = count_ = 0;
   lostSamples_ = lostPackets_ = 0;
@@ -314,6 +393,7 @@ void NodeApp::stop() {
   if (sensorActive_) {
     acquire();
     sensor_.standby();
+    detachSensorInterrupt();
     sensorActive_ = false;
     resetEdges();
   }
@@ -452,7 +532,7 @@ void NodeApp::acquire() {
     sensorActive_ = false;
     flush(true);
     state_ = Fault;
-    detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
+    detachSensorInterrupt();
     Serial.printf("SENSOR_FAULT,invalid_fifo_bytes=%u,capture_blocked=1\n", sensor_.lastFifoBytes());
     return;
   }
@@ -540,7 +620,7 @@ void NodeApp::report(uint8_t type) {
   h.run = replyRun_;
   h.rate = rate_;
   h.range = range_;
-  h.epochUs = gps_.healthy() ? epoch(esp_timer_get_time()) : 0;
+  h.epochUs = (gps_.healthy() || !APP_REQUIRE_TIME_SYNC) ? epoch(esp_timer_get_time()) : 0;
   StatusPayload p = {clock_.hz(),   clock_.ppm(),    lostSamples_, lostPackets_,
                      queue_.size(), uint8_t(state_), result_};
   uint8_t packet[64];

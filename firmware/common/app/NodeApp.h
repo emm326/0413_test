@@ -28,6 +28,7 @@ class NodeApp {
   uint16_t flags() const;
   uint64_t epoch(uint64_t local) const;
   void resetEdges();
+  void detachSensorInterrupt();
   HardwareSerial gpsSerial_;
   GpsTimebase gps_;
   SampleClock clock_;
@@ -40,11 +41,15 @@ class NodeApp {
   uint32_t diagValid_ = 0, diagInvalid_ = 0, diagNoEdge_ = 0, diagResets_ = 0, diagEdges_ = 0;
   uint32_t diagRx_ = 0, diagAck_ = 0, diagStop_ = 0, diagWindow_ = 0, diagSamplesLogged_ = 0;
   uint64_t diagLastClock_ = 0;
+  uint64_t clockWatchEdges_ = 0;
+  uint32_t clockWatchMs_ = 0;
+  uint8_t clockWatchFaults_ = 0;
   uint32_t run_ = 0, sequence_ = 0, duration_ = 0, lostSamples_ = 0, lostPackets_ = 0;
   uint32_t replyRun_ = 0, replyAt_ = 0, lastStatus_ = 0, lastLog_ = 0;
   uint64_t startEpoch_ = 0, firstEpoch_ = 0, lastEpoch_ = 0, anchorEpoch_ = 0, anchorLocal_ = 0;
   float uplink_ = Config::uplinkMHz;
   bool clockOutputReady_ = false;
+  bool intAttached_ = false;
   bool sensorReady_ = false, radioReady_ = false, sensorActive_ = false, gap_ = false,
        overflow_ = false;
   bool replyPending_ = false;
