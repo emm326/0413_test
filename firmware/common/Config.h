@@ -7,7 +7,7 @@
 #define APP_NODE_ID APP_DEVICE_ID_VALUE
 #endif
 #ifndef APP_FIRMWARE_VERSION
-#define APP_FIRMWARE_VERSION "3.0.0"
+#define APP_FIRMWARE_VERSION "3.0.1"
 #endif
 #ifndef APP_REQUIRE_TIME_SYNC
 // Field builds gate sampling on GNSS/PPS. Bench builds set this to 0 so the

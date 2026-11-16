@@ -568,10 +568,15 @@ void startupPolicy() {
 void recoveryPolicy() {
   using namespace WireProtocol;
   using SensorChecks::canRetry;
+  using SensorChecks::shouldRetrySensorStartup;
   require(canRetry(Fault, false, 0) && canRetry(Waiting, false, 0),
           "idle recovery rejected");
   require(!canRetry(Fault, true, 0) && !canRetry(Waiting, false, 1),
           "active or queued recovery was allowed");
+  require(shouldRetrySensorStartup(1) && shouldRetrySensorStartup(2),
+          "sensor startup retry stopped before the configured bound");
+  require(!shouldRetrySensorStartup(SensorChecks::sensorStartupMaxAttempts),
+          "sensor startup retry exceeded the configured bound");
 }
 
 int main() {

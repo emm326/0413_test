@@ -18,6 +18,7 @@ class NodeApp {
   void process(const uint8_t* bytes, size_t length);
   void serialCommands();
   bool initializeSensor(bool resetDevice);
+  bool startSensorWithRecovery(const char* trigger, bool resetDevice);
   void sensorSampleTest();
   void acceptStart(const WireProtocol::Header&, const WireProtocol::StartOptions&);
   void stop();
@@ -56,6 +57,10 @@ class NodeApp {
   bool haveLastFifoTimestamp_ = false;
   float uplink_ = Config::uplinkMHz;
   bool clockOutputReady_ = false;
+  bool clockOutputBlocked_ = false;
+  uint8_t sensorStartupAttempts_ = 0;
+  const char* startupFailure_ = "none";
+  const char* faultReason_ = "none";
   bool externalClock_ = false;
   bool intAttached_ = false;
   bool sensorReady_ = false, radioReady_ = false, sensorActive_ = false, gap_ = false,

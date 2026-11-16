@@ -10,6 +10,9 @@
 #include "radio/Radio.h"
 using namespace WireProtocol;
 namespace {
+constexpr uint32_t kExternalClockVerifyMs = 500;
+constexpr uint32_t kExternalClockMinEdges = 12000;
+constexpr uint32_t kExternalClockMaxEdges = 20000;
 portMUX_TYPE edgeMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t edgeTotal = 0;
 volatile uint64_t edgeLastUs = 0;
@@ -51,6 +54,7 @@ void NodeApp::begin() {
     clockOutputReady_ = clock_.begin(Board::clockOut);
   }
   externalClock_ = clockOutputReady_;
+  clockOutputBlocked_ = !clockOutputReady_;
   if (clockOutputReady_) {
     // Let the carrier and PCNT input path settle before measuring.
     delay(100);
@@ -63,9 +67,9 @@ void NodeApp::begin() {
                 clock_.padUsable() ? 1 : 0);
   gps_.setPpsObserver(SampleClock::onPps);
 #if defined(APP_BOARD_EORA) && defined(APP_SENSOR_IIM42652)
-  sensorReady_ = initializeSensor(false);
+  sensorReady_ = startSensorWithRecovery("boot", false);
 #else
-  sensorReady_ = initializeSensor(true);
+  sensorReady_ = startSensorWithRecovery("boot", true);
 #endif
   if (clockOutputReady_) {
     Serial.println("DIAG_STAGE,before_radio");
@@ -84,6 +88,7 @@ void NodeApp::begin() {
   // External-clock mode is preferred but not mandatory: the IIM42652 can use
   // its internal oscillator, which keeps sampling alive when the board-side
   // CLKIN pin is unusable.
+  faultReason_ = sensorReady_ ? (radioReady_ ? "none" : "radio_init") : "sensor_startup";
   state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
   Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_source=%s,"
                 "clock_measurement=%s\n",
@@ -98,21 +103,22 @@ bool NodeApp::initializeSensor(bool resetDevice) {
   resetEdges();
   // Internal pull-down keeps a floating INT1 line from generating a false edge storm.
   pinMode(Board::sensorInt, INPUT_PULLDOWN);
-  // The sensor requires a live CLKIN in RTC mode. If the initial output setup
-  // failed, retry the complete LEDC/PCNT initialization before vendor init.
-  if (!clockOutputReady_) {
+  // The sensor requires a live CLKIN in RTC mode. Probe it once per boot, but
+  // do not repeat the same failed hardware probe on every sensor retry.
+  if (!clockOutputReady_ && !clockOutputBlocked_) {
     Serial.println("CLOCK_REINIT,reason=not_ready");
     clockOutputReady_ = clock_.begin(Board::clockOut);
   }
-  bool clockAlive = clockOutputReady_ && clock_.verifyOutput(50, 1200, 2000);
-  if (!clockAlive) {
+  bool clockAlive =
+      clockOutputReady_ && clock_.verifyOutput(kExternalClockVerifyMs, kExternalClockMinEdges, kExternalClockMaxEdges);
+  if (!clockAlive && !clockOutputBlocked_) {
     Serial.println("CLOCK_VERIFY_FAILED,recover=1");
     // Use a 50 ms window so a single PCNT hiccup cannot declare a live carrier
     // dead. Five rebuilds cover both a stopped timer and a lost GPIO route.
     for (uint8_t attempt = 1; attempt <= 5 && !clockAlive; ++attempt) {
       const bool rebuilt = clock_.recover();
-      const uint32_t measured = rebuilt ? clock_.measureEdges(50) : 0;
-      clockAlive = measured >= 1200 && measured <= 2000;
+      const uint32_t measured = rebuilt ? clock_.measureEdges(kExternalClockVerifyMs) : 0;
+      clockAlive = measured >= kExternalClockMinEdges && measured <= kExternalClockMaxEdges;
       Serial.printf("CLOCK_RECOVER,attempt=%u,rebuilt=%u,edges_50ms=%lu,ok=%u\n",
                     attempt, rebuilt ? 1 : 0, (unsigned long)measured,
                     clockAlive ? 1 : 0);
@@ -120,13 +126,18 @@ bool NodeApp::initializeSensor(bool resetDevice) {
         delay(10);
       }
     }
-    clockOutputReady_ = clockAlive;
   }
+  clockOutputReady_ = clockAlive;
   externalClock_ = clockAlive;
   if (!externalClock_) {
-    Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
-                  "reason=clkin_unavailable\n",
-                  clock_.padUsable() ? 1 : 0);
+    if (!clockOutputBlocked_) {
+      Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
+                    "reason=clkin_unavailable\n",
+                    clock_.padUsable() ? 1 : 0);
+    }
+    clockOutputBlocked_ = true;
+  } else {
+    clockOutputBlocked_ = false;
   }
   bool initialized = sensor_.begin(resetDevice, externalClock_);
   SensorChecks::StartupCheck last = {};
@@ -193,28 +204,61 @@ bool NodeApp::initializeSensor(bool resetDevice) {
     clock_.setOutputEnabled(false);
     clockOutputReady_ = false;
     externalClock_ = false;
+    clockOutputBlocked_ = true;
     delay(20);
     initialized = sensor_.begin(false, false);
     passed = initialized && runStartupChecks();
   }
+  startupFailure_ = passed ? "none" : (initialized ? "startup_checks"
+                                                        : "vendor_init");
   Serial.printf("SENSOR_CHECK,init=%u,executed=%u,drdy=%lu,fifo_samples=%u,"
                 "clock_edges=%llu,clock_source=%s,sample_valid=%u,identity_ok=%u,"
-                "fifo_bytes=%u,int1_level=%u,ok=%u\n", initialized, initialized,
-                (unsigned long)last.dataReadyEdges, last.fifoSamples,
-                (unsigned long long)last.clockEdges,
+                "fifo_bytes=%u,int1_level=%u,failure=%s,ok=%u\n",
+                initialized, initialized, (unsigned long)last.dataReadyEdges,
+                last.fifoSamples, (unsigned long long)last.clockEdges,
                 externalClock_ ? "external" : "sensor_internal",
-                last.sampleValid, last.identityValid,
-                sensor_.lastFifoBytes(), digitalRead(Board::sensorInt), passed);
+                last.sampleValid, last.identityValid, sensor_.lastFifoBytes(),
+                digitalRead(Board::sensorInt), startupFailure_, passed);
   if (!passed) {
+    faultReason_ = "sensor_startup";
     detachSensorInterrupt();
     resetEdges();
-    Serial.println("SENSOR_FAULT,drdy_interrupt_disabled=1,capture_blocked=1");
+    Serial.printf("SENSOR_FAULT,reason=sensor_startup,failure=%s,"
+                  "drdy_interrupt_disabled=1,capture_blocked=1\n",
+                  startupFailure_);
   }
   return passed;
 }
+bool NodeApp::startSensorWithRecovery(const char* trigger, bool resetDevice) {
+  sensorStartupAttempts_ = 0;
+  for (uint8_t attempt = 1;
+       attempt <= SensorChecks::sensorStartupMaxAttempts; ++attempt) {
+    sensorStartupAttempts_ = attempt;
+    Serial.printf("SENSOR_STARTUP_ATTEMPT,trigger=%s,attempt=%u,max=%u\n",
+                  trigger, attempt, SensorChecks::sensorStartupMaxAttempts);
+    if (initializeSensor(resetDevice)) {
+      startupFailure_ = "none";
+      faultReason_ = "none";
+      Serial.printf("SENSOR_STARTUP_END,trigger=%s,ok=1,attempt=%u\n",
+                    trigger, attempt);
+      return true;
+    }
+    Serial.printf("SENSOR_STARTUP_FAILED,trigger=%s,attempt=%u,failure=%s\n",
+                  trigger, attempt, startupFailure_);
+    if (SensorChecks::shouldRetrySensorStartup(attempt)) {
+      Serial.printf("SENSOR_STARTUP_RETRY,delay_ms=%u\n",
+                    SensorChecks::sensorStartupRetryDelayMs);
+      delay(SensorChecks::sensorStartupRetryDelayMs);
+    }
+  }
+  faultReason_ = "sensor_startup";
+  Serial.printf("SENSOR_STARTUP_END,trigger=%s,ok=0,attempts=%u,"
+                "failure=%s\n",
+                trigger, sensorStartupAttempts_, startupFailure_);
+  return false;
+}
 void NodeApp::sensorSampleTest() {
-  if (!SensorChecks::canRetry(state_, sensorActive_, queue_.size()) ||
-      !clockOutputReady_) {
+  if (!SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
     Serial.println("SENSOR_SAMPLE_TEST,ok=0,reason=not_idle");
     return;
   }
@@ -222,10 +266,13 @@ void NodeApp::sensorSampleTest() {
   resetEdges();
   sensorReady_ = false;
   state_ = Fault;
-  const bool isolated = clock_.setOutputEnabled(false);
+  faultReason_ = "sensor_sample_test";
+  const bool hadExternalClock = clockOutputReady_ && externalClock_;
+  const bool isolated = !hadExternalClock || clock_.setOutputEnabled(false);
   Serial.printf("SENSOR_SAMPLE_TEST_BEGIN,clock=internal,rate=50,range_g=4,"
-                "target=20,synchronized=0,sensor_reset=0,clkin_output_high_z=%u\n",
-                isolated);
+                "target=20,synchronized=0,sensor_reset=0,clkin_output_high_z=%u,"
+                "prior_clock_source=%s\n",
+                isolated, hadExternalClock ? "external" : "sensor_internal");
   const bool configured = isolated && sensor_.begin(false, false) &&
                           sensor_.configure(50, 4);
   uint16_t captured = 0;
@@ -238,7 +285,8 @@ void NodeApp::sensorSampleTest() {
         ++captured;
         Serial.printf("SENSOR_TEST_SAMPLE,index=%u,local_us=%llu,x=%d,y=%d,z=%d,"
                       "rate=50,range_g=4,synchronized=0\n", captured,
-                      (unsigned long long)esp_timer_get_time(),sample.x,sample.y,sample.z);
+                      (unsigned long long)esp_timer_get_time(), sample.x, sample.y,
+                      sample.z);
       }
       gps_.update();
       clock_.update(gps_.healthy());
@@ -252,24 +300,33 @@ void NodeApp::sensorSampleTest() {
   }
   Serial.printf("SENSOR_SAMPLE_TEST_END,configured=%u,samples=%u,target=20,ok=%u\n",
                 configured, captured, configured && captured == 20);
-  // Restore the clock buffer before selecting external RTC mode again.
-  clockOutputReady_ = clock_.setOutputEnabled(true);
-  // Ignore the output-matrix reconnect transient.
-  delay(100);
-  const bool restored = clockOutputReady_ &&
-                        clock_.verifyOutput(50, 1200, 2000);
-  clockOutputReady_ = restored;
-  Serial.printf("SENSOR_CLOCK_RESTORE,output_enabled=%u,"
-                "verified_50ms=%u,pps_recalibration=1\n", clockOutputReady_,
-                restored ? 1 : 0);
+  if (hadExternalClock) {
+    // Restore the clock buffer before selecting external RTC mode again.
+    clockOutputReady_ = clock_.setOutputEnabled(true);
+    // Ignore the output-matrix reconnect transient.
+    delay(100);
+    const bool restored =
+        clockOutputReady_ && clock_.verifyOutput(kExternalClockVerifyMs, kExternalClockMinEdges, kExternalClockMaxEdges);
+    clockOutputReady_ = restored;
+    externalClock_ = restored;
+    clockOutputBlocked_ = !restored;
+    Serial.printf("SENSOR_CLOCK_RESTORE,output_enabled=%u,"
+                  "verified_50ms=%u,pps_recalibration=1\n",
+                  restored ? 1 : 0, restored ? 1 : 0);
+  } else {
+    clockOutputReady_ = false;
+    externalClock_ = false;
+    clockOutputBlocked_ = true;
+    Serial.println("SENSOR_CLOCK_RESTORE,skipped=1,source=sensor_internal");
+  }
   // The internal-clock diagnostic never authorizes synchronized acquisition.
-  sensorReady_ = initializeSensor(false);
-  // External-clock mode is preferred but not mandatory: the IIM42652 can use
-  // its internal oscillator, which keeps sampling alive when the board-side
-  // CLKIN pin is unusable.
+  sensorReady_ = startSensorWithRecovery("sample_test_restore", false);
   state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
-  Serial.printf("SENSOR_SAMPLE_TEST_RESTORE,external_clock=1,sensor_ready=%u,state=%u\n",
-                sensorReady_,state_);
+  faultReason_ =
+      sensorReady_ ? (radioReady_ ? "none" : "radio_init") : "sensor_startup";
+  Serial.printf("SENSOR_SAMPLE_TEST_RESTORE,external_clock=%u,sensor_ready=%u,"
+                "state=%u,fault_reason=%s\n",
+                hadExternalClock ? 1 : 0, sensorReady_, state_, faultReason_);
 }
 uint64_t NodeApp::epoch(uint64_t local) const {
   if (!anchorEpoch_) {
@@ -310,7 +367,7 @@ void NodeApp::tick() {
     // Do not treat a failed PCNT readback as a stopped clock. The pad poll
     // independently proves that GPIO36 is still toggling.
     const bool outputHealthy =
-        pcntHealthy || clock_.verifyOutput(50, 1200, 2000);
+        pcntHealthy || clock_.verifyOutput(kExternalClockVerifyMs, kExternalClockMinEdges, kExternalClockMaxEdges);
     if (!outputHealthy) {
       ++clockWatchFaults_;
       Serial.printf("CLOCK_WATCHDOG,edges_1s=%llu,pcnt_ok=%u,"
@@ -318,13 +375,34 @@ void NodeApp::tick() {
                     (unsigned long long)delta, pcntHealthy ? 1 : 0,
                     outputHealthy ? 1 : 0, clockWatchFaults_);
       if (clockWatchFaults_ >= 2) {
-        const bool recovered = clock_.recover() && clock_.verifyOutput(50, 1200, 2000);
+        const bool recovered = clock_.recover() && clock_.verifyOutput(kExternalClockVerifyMs, kExternalClockMinEdges, kExternalClockMaxEdges);
         Serial.printf("CLOCK_RECOVER,ok=%u\n", recovered ? 1 : 0);
         clockWatchFaults_ = 0;
         if (!recovered) {
+          const bool canFallback =
+              SensorChecks::canRetry(state_, sensorActive_, queue_.size());
+          Serial.printf("CLOCK_WATCHDOG_FALLBACK,idle=%u,source=sensor_internal\n",
+                        canFallback ? 1 : 0);
+          clock_.setOutputEnabled(false);
           clockOutputReady_ = false;
-          sensorReady_ = false;
-          state_ = WireProtocol::Fault;
+          clockOutputBlocked_ = true;
+          externalClock_ = false;
+          if (canFallback) {
+            // A failed external carrier is not a sensor failure. Reinitialize
+            // from the beginning using the sensor's internal oscillator.
+            sensorReady_ = startSensorWithRecovery("clock_watchdog", false);
+            state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
+            faultReason_ = sensorReady_
+                               ? (radioReady_ ? "none" : "radio_init")
+                               : "sensor_startup";
+            Serial.printf("CLOCK_WATCHDOG_RECOVERED,sensor_ready=%u,state=%u,"
+                          "fault_reason=%s\n",
+                          sensorReady_, state_, faultReason_);
+          } else {
+            sensorReady_ = false;
+            faultReason_ = "clock_watchdog";
+            state_ = WireProtocol::Fault;
+          }
         }
       }
     } else {
@@ -379,11 +457,13 @@ void NodeApp::tick() {
     diagEdges_ = edgeTotal; diagLastClock_ = edgesNow;
     Serial.printf(
         "STATUS,id=%u,state=%u,gps=%u,clock_hz=%.4f,ppm=%.2f,clock_ok=%u,"
-        "clock_source=%s,queue=%u,lost_samples=%lu,lost_packets=%lu\n",
+        "clock_source=%s,queue=%u,lost_samples=%lu,lost_packets=%lu,"
+        "startup_attempts=%u,startup_failure=%s,fault_reason=%s\n",
         Config::nodeId, state_, gps_.healthy(), clock_.hz(), clock_.ppm(),
         samplingClockHealthy() ? 1 : 0,
         externalClock_ ? "external" : "sensor_internal", queue_.size(),
-        (unsigned long)lostSamples_, (unsigned long)lostPackets_);
+        (unsigned long)lostSamples_, (unsigned long)lostPackets_,
+        sensorStartupAttempts_, startupFailure_, faultReason_);
   }
   delay(1);
 }
@@ -423,6 +503,7 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   }
   if (sensor_.readRegister(IimRegister::WHO_AM_I) != sensor_.expectedIdentity()) {
     sensorReady_ = false;
+    faultReason_ = "sensor_identity";
     state_ = Fault;
     detachSensorInterrupt();
     result_ = NotReady;
@@ -531,10 +612,10 @@ void NodeApp::serialCommands() {
     serialLine_[serialLength_] = 0;
     serialLength_ = 0;
     if (!strcmp(serialLine_, "DIAG")) {
-      if (clockOutputReady_)
+      if (sensorReady_)
         sensor_.diagnostic();
       else
-        Serial.println("SENSOR_ERROR,stage=clock_output");
+        Serial.println("SENSOR_ERROR,stage=sensor_not_ready");
       continue;
     }
     if (!strcmp(serialLine_, "SENSOR_SAMPLE_TEST")) {
@@ -542,7 +623,7 @@ void NodeApp::serialCommands() {
       continue;
     }
     if (!strcmp(serialLine_, "SENSOR_LINK_TEST")) {
-      if (!clockOutputReady_ || !SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
+      if (!sensorReady_ || !SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
         Serial.println("SENSOR_LINK_TEST,ok=0,reason=not_idle");
         continue;
       }
@@ -554,12 +635,15 @@ void NodeApp::serialCommands() {
         Serial.println("SENSOR_RETRY,ok=0,reason=busy,reset=0");
         continue;
       }
-      sensorReady_ = initializeSensor(false);
+      sensorReady_ = startSensorWithRecovery("command", false);
       // External-clock mode is preferred but not mandatory: the IIM42652 can use
-  // its internal oscillator, which keeps sampling alive when the board-side
-  // CLKIN pin is unusable.
-  state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
-      Serial.printf("SENSOR_RETRY,ok=%u,state=%u,reset=0\n", sensorReady_, state_);
+      // its internal oscillator, which keeps sampling alive when the board-side
+      // CLKIN pin is unusable.
+      faultReason_ =
+          sensorReady_ ? (radioReady_ ? "none" : "radio_init") : "sensor_startup";
+      state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
+      Serial.printf("SENSOR_RETRY,ok=%u,state=%u,fault_reason=%s,reset=0\n",
+                    sensorReady_, state_, faultReason_);
       continue;
     }
     if (!strcmp(serialLine_, "STOP")) {
@@ -635,6 +719,7 @@ void NodeApp::acquire() {
     sensor_.standby();
     sensorActive_ = false;
     flush(true);
+    faultReason_ = "sensor_fifo";
     state_ = Fault;
     detachSensorInterrupt();
     return;

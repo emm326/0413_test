@@ -3,6 +3,11 @@
 #include "protocol/Wire.h"
 
 namespace SensorChecks {
+constexpr uint8_t sensorStartupMaxAttempts = 3;
+constexpr uint32_t sensorStartupRetryDelayMs = 300;
+constexpr bool shouldRetrySensorStartup(uint8_t failedAttempt) {
+  return failedAttempt < sensorStartupMaxAttempts;
+}
 struct StartupCheck {
   uint32_t dataReadyEdges;
   uint16_t fifoSamples;
