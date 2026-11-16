@@ -1,7 +1,7 @@
 # E870 八节点采集项目交接文档
 
 交接日期：2026-11-16（Asia/Hong_Kong）
-仓库分支：`codex/20261116-baseline`
+仓库分支：`codex/20261116-baseline`（远程：`origin/codex/20261116-baseline`；后续修改在此分支，不合并 `main`）
 当前功能固件提交：`cb99db0`（fix: 增加传感器启动自动恢复与时钟回退）
 交接文档提交：以 `git log -1 --oneline` 为准
 工作区状态：本轮提交后干净
@@ -256,8 +256,8 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 ## 9. 新对话接手顺序
 
 1. 先读本文件和根目录 [PROJECT_PLAN.md](../PROJECT_PLAN.md)。
-2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认基线 `e44bb6b`。
-3. 读取[本轮报告](changes/2026-11-16_06_Git日期化提交与分支基线.md)。
+2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认当前分支为 `codex/20261116-baseline`，并与 `origin/codex/20261116-baseline` 同步。
+3. 读取[本轮报告](changes/2026-11-16_07_远程分支推送与后续工作分支.md)。
 4. 识别当前 COM 口和设备，不要默认仍为 COM8。
 5. 读取 STATUS，确认 `state=1,clock_ok=1,startup_failure=none,fault_reason=none`；再单独读取 GPS_DIAG 检查 GNSS/PPS。
 6. 需要验证采样时，先跑 USB 60 秒，再烧录正式 tx。
@@ -267,10 +267,12 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 ## 10. Git 与本地资料
 
 - 当前分支：`codex/20261116-baseline`
+- 远程分支：`origin/codex/20261116-baseline`
+- 分支规则：后续修改都在此分支提交并推送；未经明确要求不合并到 `main`。
 - 当前功能固件提交：`cb99db0`
 - 关键前序提交：`96cdbe3`、`f9bda89`、`cb099e7`、`4cadadd`
 - 日期化提交：从 2026-11-16 起，提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件以日期开头；长期文档改动更新“更新日期”。
-- 当前报告：[Git 日期化提交与分支基线](changes/2026-11-16_06_Git日期化提交与分支基线.md)
+- 当前报告：[远程分支推送与后续工作分支](changes/2026-11-16_07_远程分支推送与后续工作分支.md)
 - 长期接线文档：[wiring_and_flash.md](wiring_and_flash.md)
 - 协议文档：[protocol_v3.md](protocol_v3.md)
 - 网关操作：[e870_setup.md](e870_setup.md)
