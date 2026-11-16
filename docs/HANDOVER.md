@@ -2,22 +2,24 @@
 
 交接日期：2026-11-16（Asia/Hong_Kong）
 仓库分支：`codex/sensor-recovery-20261114`
-当前 Git 提交：`f9bda89`（fix: 修复IIM42652内部时钟采样门槛）
+当前功能固件提交：`cb99db0`（fix: 增加传感器启动自动恢复与时钟回退）
+交接文档提交：以 `git log -1 --oneline` 为准
 工作区状态：干净
 
 ## 1. 当前结论
 
-IIM42652 传感器已经能够正常启动和正常采样。当前设备使用传感器内部时钟，室外 GNSS/PPS 正常，正式 tx 固件已经烧录到 COM8。当前没有主动采样，因为节点处于 Waiting，正在等待 START 命令。
+IIM42652 传感器已经能够自动启动和正常采样。启动自检最多重试 3 次，无效外部 32 kHz 在空闲状态会自动回退到传感器内部时钟。2026-11-16 18:08 再次完成一次冷启动，传感器在 `attempt=1` 通过，节点进入 `state=1`，启动后没有进入 `state=5`。正式 tx 固件保留在 COM8，当前没有主动采样，因为节点处于 Waiting。GNSS/PPS 健康状态仍会波动，正式 START 必须以实时 `GPS_DIAG` 的 `healthy=1` 为准。
 
 | 功能 | 当前状态 | 结论 |
 |---|---|---|
 | 传感器身份 | 已通过 | WHO_AM_I=`0x6F` |
 | 传感器启动自检 | 已通过 | 有效 FIFO 样本、身份和配置检查均通过 |
-| 50 Hz 采样 | 已通过 | USB 60 秒和正式 tx 10 秒实测通过 |
-| GNSS 定位 | 已通过 | `fix=1` |
-| PPS 秒脉冲 | 已通过 | 间隔约 999980～999983 µs |
-| UTC/PPS 时间映射 | 已通过 | `time=1, healthy=1` |
-| 外部 32 kHz CLKIN | 不可用 | 固件自动回退到传感器内部时钟 |
+| 启动自动恢复 | 已通过 | 4 次冷启动均自动进入 `state=1` |
+| 50 Hz 采样 | 已通过 | 最新台架 60 秒 2973 样，丢样和 FIFO 错误均为 0 |
+| GNSS 定位 | 已定位但时间门槛待复测 | 最近读取 `fix=1`，定位有效 |
+| PPS 秒脉冲 | 不稳定 | 最近读取 `pps=0`，间隔 865267 µs；也观察到 `pps=1` 且间隔约 999982 µs |
+| UTC/PPS 时间映射 | 不稳定 | 最近读取 `time=0, healthy=0`，不能启动正式同步采样 |
+| 外部 32 kHz CLKIN | 不可用 | 启动探测和运行时看门狗均会回退到传感器内部时钟 |
 | 内部时钟采样门槛 | 已修复 | `clock_ok=1, clock_source=sensor_internal` |
 | LoRa 射频初始化 | 已通过 | `READY,sensor=1,radio=1` |
 | LoRa 实际收包与 ACK | 待实测 | 尚无 E870 在线收包证据 |
@@ -25,18 +27,28 @@ IIM42652 传感器已经能够正常启动和正常采样。当前设备使用�
 
 ## 2. 当前设备状态
 
-以下为 2026-11-16 交接前 COM8 实读状态：
+以下为 2026-11-16 冷启动后 COM8 实读状态：
 
 ```text
-STATUS,id=1003,state=1,gps=1,clock_hz=10.4167,ppm=-999674.50,
+STATUS,id=1003,state=1,gps=1,clock_hz=0.0000,ppm=0.00,
 clock_ok=1,clock_source=sensor_internal,queue=0,
-lost_samples=0,lost_packets=0
+lost_samples=0,lost_packets=0,startup_attempts=1,
+startup_failure=none,fault_reason=none
+```
+
+同一时段的 GNSS 详细状态为：
+
+```text
+GPS_DIAG,fix=1,pps=0,time=0,healthy=0,pps_count=43,
+pps_interval_us=865267,pps_bad=12
 ```
 
 解释：
 
 - `state=1`：Waiting。节点已就绪，但当前没有运行采样。
-- `gps=1`：GNSS/PPS 时间基准健康。
+- `gps=1`：该次 `STATUS` 输出时，GNSS/PPS 时间基准判定健康。
+- `gps=0`：该次 `STATUS` 输出时，GNSS/PPS 时间基准不合格。
+- `gps` 会随实时健康判定变化。正式 START 前必须用 `GPS_DIAG` 确认 `healthy=1`，不能依赖上一次 `STATUS`。
 - `clock_ok=1`：当前采样时钟门槛通过。
 - `clock_source=sensor_internal`：使用 IIM42652 内部时钟。
 - `clock_hz` 和 `ppm` 无效：该字段仍在测量已经停用的 GPIO36 外部 32 kHz，不能用于内部时钟判定。
@@ -60,17 +72,19 @@ lost_samples=0,lost_packets=0
 | GNSS RX ← 主控 TX | GPIO15 |
 | GNSS PPS → 主控 | GPIO41 |
 
-供电与接地沿用现有接线。PPS 指示灯正常闪烁。不要自行改 GPIO、电压或接反 GNSS RX/TX。
+供电与接地沿用现有接线。PPS 指示灯此前观察为闪烁，健康判定必须以 `GPS_DIAG` 为准。不要自行改 GPIO、电压或接反 GNSS RX/TX。
 
 ## 4. 固件行为
 
-- 上电先尝试 GPIO36 外部 32 kHz。
+- 上电先尝试 GPIO36 外部 32 kHz，并用 500 ms 窗口确认频率。
 - 外部时钟不可用时关闭 CLKIN，重新用 `external_clock=0` 初始化 IIM42652。
+- 启动自检最多执行 3 次完整初始化，每次失败后等待 300 ms。
+- 外部时钟在空闲运行时连续失败，会关闭 CLKIN 并自动回退内部时钟。
+- 采样进行中或队列非空时不会无提示切换时基；这种情况仍进入 Fault。
 - 内部时钟模式不要求 GPIO36 边沿，也不要求外部 60 秒频率测量。
 - 内部时钟模式仍要求传感器启动自检、有效 FIFO 样本、有效 XYZ 和 WHO_AM_I。
 - 采样间隔使用 FIFO 内建时间戳。
 - FIFO 每 5 ms 轮询一次，批量 SPI 读取。
-- 单次 FIFO 故障执行恢复；连续 3 次失败才进入 Fault。
 - 正式模式仍要求 GNSS/PPS 健康，不会因为允许内部时钟而跳过 GNSS/PPS 门槛。
 
 ## 5. 已通过的实机验收
@@ -128,6 +142,56 @@ ts_anomaly=0
 
 节点自动执行 `SENSOR_STANDBY`。测试中没有在线网关 ACK，因此队列保留 20 包。这个结果证明采样和发送排队正常，不证明 E870 已收到数据。
 
+### 5.4 启动自动恢复回归（2026-11-16）
+
+连续 4 次冷启动全部成功：
+
+```text
+READY,sensor=1,radio=1,clock_output=0,
+clock_source=sensor_internal,clock_measurement=sensor_internal_fifo
+SENSOR_STARTUP_END,trigger=boot,ok=1,attempt=1
+STATUS,state=1,clock_ok=1,startup_attempts=1,
+startup_failure=none,fault_reason=none
+```
+
+台架固件再次完成 50 Hz、60 秒采样：
+
+```text
+samples=2973
+dt_mean_us=20000
+dt_min_us=19985
+dt_max_us=20002
+invalid=0
+lost_samples=0
+ts_anomaly=0
+fifo_errors=0
+state_after=1
+fault_reason=none
+pass=1
+```
+
+第 4 次冷启动于 18:08 完成，仍为 `attempt=1`，之后传感器 `DIAG` 返回 `who=0x6F`。
+
+日志：
+
+```text
+tmp/logs/com8_boot_20261116_180839.log
+tmp/logs/startup_retry_coldboot_1_20261116.log
+tmp/logs/startup_retry_coldboot_2_20261116.log
+tmp/logs/startup_retry_coldboot_3_20261116.log
+tmp/logs/startup_retry_bench_50hz_60s_20261116.log
+tmp/logs/startup_retry_tx_final_20261116.log
+```
+
+正式 tx 固件已恢复到 COM8，当前状态：
+
+```text
+STATUS,id=1003,state=1,gps=0,clock_ok=1,
+clock_source=sensor_internal,queue=0,
+lost_samples=0,lost_packets=0,startup_attempts=1,
+startup_failure=none,fault_reason=none
+```
+
 ## 6. 构建与烧录
 
 当前正式环境：
@@ -175,7 +239,7 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 - `START_AT epoch_us 50 4 run_id duration_s`：启动指定运行。
 - `STOP`：停止当前运行。
 - `SENSOR_RETRY`：重新初始化传感器，会操作寄存器。
-- `SENSOR_SAMPLE_TEST`：内部时钟直接采样诊断，会改变现场状态。
+- `SENSOR_SAMPLE_TEST`：内部时钟直接采样诊断，会改变现场状态；内部时钟模式也可执行。
 - `SENSOR_LINK_TEST`：SPI 链路诊断，会改变现场状态。
 
 不要在不了解影响时执行 `SENSOR_RETRY`、`SENSOR_SAMPLE_TEST` 或 `SENSOR_LINK_TEST`。
@@ -192,10 +256,10 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 ## 9. 新对话接手顺序
 
 1. 先读本文件和根目录 [PROJECT_PLAN.md](../PROJECT_PLAN.md)。
-2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认基线 `f9bda89`。
-3. 读取[本轮报告](changes/2026-11-16_04_内部时钟采样门槛修复.md)。
+2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认基线 `cb99db0`。
+3. 读取[本轮报告](changes/2026-11-16_05_启动故障自动恢复.md)。
 4. 识别当前 COM 口和设备，不要默认仍为 COM8。
-5. 读取 STATUS 和 GPS_DIAG，确认 `gps=1,clock_ok=1,clock_source=sensor_internal`。
+5. 读取 STATUS，确认 `state=1,clock_ok=1,startup_failure=none,fault_reason=none`；再单独读取 GPS_DIAG 检查 GNSS/PPS。
 6. 需要验证采样时，先跑 USB 60 秒，再烧录正式 tx。
 7. 需要验证 LoRa 时，先启动 E870 和上位机，再下发正式 START。
 8. 不把 `clock_hz=0` 或低值当作内部时钟故障；内部模式只看传感器自检、FIFO 和错误计数。
@@ -203,9 +267,9 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 ## 10. Git 与本地资料
 
 - 当前分支：`codex/sensor-recovery-20261114`
-- 当前提交：`f9bda89`
-- 关键前序提交：`cb099e7`、`1b76a12`、`4cadadd`
-- 当前报告：[内部时钟采样门槛修复](changes/2026-11-16_04_内部时钟采样门槛修复.md)
+- 当前功能固件提交：`cb99db0`
+- 关键前序提交：`96cdbe3`、`f9bda89`、`cb099e7`、`4cadadd`
+- 当前报告：[启动故障自动恢复](changes/2026-11-16_05_启动故障自动恢复.md)
 - 长期接线文档：[wiring_and_flash.md](wiring_and_flash.md)
 - 协议文档：[protocol_v3.md](protocol_v3.md)
 - 网关操作：[e870_setup.md](e870_setup.md)
@@ -213,10 +277,13 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 采集数据、日志、构建产物和镜像不进入 Git。以下本机日志可直接用于新对话时核对：
 
 ```text
+tmp/logs/startup_retry_coldboot_1_20261116.log
+tmp/logs/startup_retry_coldboot_2_20261116.log
+tmp/logs/startup_retry_coldboot_3_20261116.log
+tmp/logs/startup_retry_bench_50hz_60s_20261116.log
+tmp/logs/startup_retry_tx_final_20261116.log
 tmp/logs/run7010_internal_clock_60s_20261116.log
 tmp/logs/tx7011_internal_clock_short_20261116.log
-tmp/logs/tx_boot_after_clock_fix_20261116.log
-tmp/logs/handover_live_check_20261116.log
 ```
 
 这些文件不提交 Git，新电脑或重新克隆仓库后可能不存在。
