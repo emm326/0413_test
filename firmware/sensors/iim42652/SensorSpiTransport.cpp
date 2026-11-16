@@ -44,12 +44,13 @@ int SensorSpiTransport::read(uint8_t reg, uint8_t* buffer, uint32_t length) {
 
   spi_.beginTransaction(SPISettings(kSpiHz, MSBFIRST, kSpiMode));
   select(true);
-  delayMicroseconds(1);
+  delayMicroseconds(2);
   spi_.transfer(static_cast<uint8_t>(reg | 0x80));
-  for (uint32_t i = 0; i < length; ++i) {
-    buffer[i] = spi_.transfer(0);
-  }
-  delayMicroseconds(1);
+  // The six-wire bring-up used one continuous transferBytes() call. Keeping
+  // the whole payload in one hardware burst avoids per-byte turnaround and is
+  // required for reliable long FIFO reads.
+  spi_.transferBytes(nullptr, buffer, length);
+  delayMicroseconds(2);
   select(false);
   spi_.endTransaction();
   return 0;
@@ -63,12 +64,10 @@ int SensorSpiTransport::write(uint8_t reg, const uint8_t* buffer,
 
   spi_.beginTransaction(SPISettings(kSpiHz, MSBFIRST, kSpiMode));
   select(true);
-  delayMicroseconds(1);
+  delayMicroseconds(2);
   spi_.transfer(static_cast<uint8_t>(reg & 0x7f));
-  for (uint32_t i = 0; i < length; ++i) {
-    spi_.transfer(buffer[i]);
-  }
-  delayMicroseconds(1);
+  spi_.transferBytes(buffer, nullptr, length);
+  delayMicroseconds(2);
   select(false);
   spi_.endTransaction();
   return 0;

@@ -13,6 +13,7 @@ class SPIClass {
   void beginTransaction(SPISettings settings);
   void endTransaction();
   uint8_t transfer(uint8_t value);
+  void transferBytes(const uint8_t* data, uint8_t* out, uint32_t length);
  private:
   bool started_=false,command_=true,reading_=false;
   uint8_t address_=0;

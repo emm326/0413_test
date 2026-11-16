@@ -11,10 +11,16 @@ struct StartupCheck {
   bool sampleValid;
   bool identityValid;
 };
-constexpr bool startupPassed(const StartupCheck& check) {
-  return check.dataReadyEdges >= 4 && check.dataReadyEdges <= 30 &&
+// INT1 is optional in the six-wire setup, so a zero DRDY count is allowed.
+// The upper bound still catches an interrupt storm. FIFO count, a valid
+// sample and the identity register are the authoritative startup evidence.
+// External-clock mode additionally requires the 32 kHz board-side loopback.
+constexpr bool startupPassed(const StartupCheck& check,
+                             bool requireExternalClock = true) {
+  return (!requireExternalClock ||
+          (check.clockEdges >= 3000 && check.clockEdges <= 4700)) &&
+         check.dataReadyEdges <= 30 &&
          check.fifoSamples >= 4 && check.fifoSamples <= 30 &&
-         check.clockEdges >= 3000 && check.clockEdges <= 4700 &&
          check.fifoCountValid && check.sampleValid && check.identityValid;
 }
 constexpr bool canRetry(WireProtocol::State state, bool sensorActive, uint16_t queued) {

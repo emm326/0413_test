@@ -11,37 +11,19 @@
 using namespace WireProtocol;
 namespace {
 portMUX_TYPE edgeMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint64_t edgeTimes[256];
-volatile uint16_t edgeHead = 0, edgeTail = 0;
-volatile uint32_t edgeOverruns = 0, edgeTotal = 0;
+volatile uint32_t edgeTotal = 0;
 volatile uint64_t edgeLastUs = 0;
 void IRAM_ATTR dataReady() {
   const uint64_t now = esp_timer_get_time();
   portENTER_CRITICAL_ISR(&edgeMux);
   // 50 Hz is 20 ms and 100 Hz is 10 ms apart. Ringing closer than 2 ms is
-  // electrical noise, not a new sample.
+  // electrical noise, not a new sample. INT1 is now only a wake/threshold
+  // signal; sample intervals come from the sensor's FIFO timestamp.
   if (now - edgeLastUs >= 2000) {
     edgeLastUs = now;
-    uint16_t next = (edgeHead + 1) % 256;
-    if (next == edgeTail)
-      ++edgeOverruns;
-    else {
-      edgeTimes[edgeHead] = now;
-      edgeHead = next;
-    }
     ++edgeTotal;
   }
   portEXIT_CRITICAL_ISR(&edgeMux);
-}
-bool popEdge(uint64_t& time) {
-  portENTER_CRITICAL(&edgeMux);
-  bool ok = edgeTail != edgeHead;
-  if (ok) {
-    time = edgeTimes[edgeTail];
-    edgeTail = (edgeTail + 1) % 256;
-  }
-  portEXIT_CRITICAL(&edgeMux);
-  return ok;
 }
 }  // namespace
 NodeApp::NodeApp() : gpsSerial_(1), gps_(gpsSerial_) {}
@@ -52,10 +34,8 @@ void NodeApp::detachSensorInterrupt() {
   }
 }
 void NodeApp::resetEdges() {
-  portENTER_CRITICAL(&edgeMux);
-  edgeHead = edgeTail = 0;
-  edgeOverruns = 0;
-  portEXIT_CRITICAL(&edgeMux);
+  // edgeTotal is cumulative so FLOW can report a delta. No per-sample edge
+  // queue remains; FIFO timestamps are the sampling timebase.
 }
 void NodeApp::begin() {
   Serial.begin(Config::serialBaud);
@@ -65,13 +45,22 @@ void NodeApp::begin() {
                 APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId,
                 Config::uplinkMHz);
   clockOutputReady_ = clock_.begin(Board::clockOut);
+  for (uint8_t attempt = 2; attempt <= 3 && !clockOutputReady_; ++attempt) {
+    Serial.printf("CLOCK_REINIT,attempt=%u\n", attempt);
+    delay(10);
+    clockOutputReady_ = clock_.begin(Board::clockOut);
+  }
+  externalClock_ = clockOutputReady_;
   if (clockOutputReady_) {
-    // Let the LEDC output and PCNT input path settle before measuring.
+    // Let the carrier and PCNT input path settle before measuring.
     delay(100);
     clockWatchEdges_ = clock_.edgeCount();
     clockWatchMs_ = millis();
   }
-  Serial.printf("CLOCK_OUTPUT,ready=%u\n", clockOutputReady_ ? 1 : 0);
+  Serial.printf("CLOCK_OUTPUT,ready=%u,source=%s,pad_usable=%u\n",
+                clockOutputReady_ ? 1 : 0,
+                clockOutputReady_ ? "external" : "sensor_internal",
+                clock_.padUsable() ? 1 : 0);
   gps_.setPpsObserver(SampleClock::onPps);
 #if defined(APP_BOARD_EORA) && defined(APP_SENSOR_IIM42652)
   sensorReady_ = initializeSensor(false);
@@ -92,9 +81,14 @@ void NodeApp::begin() {
 #else
   radioReady_ = true;
 #endif
-  state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
-  Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_measurement=wait_60_pps\n",
-                sensorReady_, radioReady_, clockOutputReady_);
+  // External-clock mode is preferred but not mandatory: the IIM42652 can use
+  // its internal oscillator, which keeps sampling alive when the board-side
+  // CLKIN pin is unusable.
+  state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
+  Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_source=%s,"
+                "clock_measurement=wait_60_pps\n",
+                sensorReady_, radioReady_, clockOutputReady_,
+                externalClock_ ? "external" : "sensor_internal");
   lastStatus_ = millis() + ((Config::nodeId - 1001) % 16) * 120;
 }
 bool NodeApp::initializeSensor(bool resetDevice) {
@@ -103,21 +97,45 @@ bool NodeApp::initializeSensor(bool resetDevice) {
   resetEdges();
   // Internal pull-down keeps a floating INT1 line from generating a false edge storm.
   pinMode(Board::sensorInt, INPUT_PULLDOWN);
-  // The sensor requires a live CLKIN in RTC mode. Verify the pin actually
-  // toggles before vendor init, and re-route once if it does not.
-  bool clockAlive = clockOutputReady_ && clock_.verifyOutput(10, 240, 400);
-  if (!clockAlive && clockOutputReady_) {
+  // The sensor requires a live CLKIN in RTC mode. If the initial output setup
+  // failed, retry the complete LEDC/PCNT initialization before vendor init.
+  if (!clockOutputReady_) {
+    Serial.println("CLOCK_REINIT,reason=not_ready");
+    clockOutputReady_ = clock_.begin(Board::clockOut);
+  }
+  bool clockAlive = clockOutputReady_ && clock_.verifyOutput(50, 1200, 2000);
+  if (!clockAlive) {
     Serial.println("CLOCK_VERIFY_FAILED,recover=1");
-    clockAlive = clock_.recover() && clock_.verifyOutput(10, 240, 400);
+    // Use a 50 ms window so a single PCNT hiccup cannot declare a live carrier
+    // dead. Five rebuilds cover both a stopped timer and a lost GPIO route.
+    for (uint8_t attempt = 1; attempt <= 5 && !clockAlive; ++attempt) {
+      const bool rebuilt = clock_.recover();
+      const uint32_t measured = rebuilt ? clock_.measureEdges(50) : 0;
+      clockAlive = measured >= 1200 && measured <= 2000;
+      Serial.printf("CLOCK_RECOVER,attempt=%u,rebuilt=%u,edges_50ms=%lu,ok=%u\n",
+                    attempt, rebuilt ? 1 : 0, (unsigned long)measured,
+                    clockAlive ? 1 : 0);
+      if (!clockAlive) {
+        delay(10);
+      }
+    }
     clockOutputReady_ = clockAlive;
   }
-  const bool initialized = clockAlive && sensor_.begin(resetDevice);
-  bool passed = false;
+  externalClock_ = clockAlive;
+  if (!externalClock_) {
+    Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
+                  "reason=clkin_unavailable\n",
+                  clock_.padUsable() ? 1 : 0);
+  }
+  bool initialized = sensor_.begin(resetDevice, externalClock_);
   SensorChecks::StartupCheck last = {};
-  if (initialized) {
-    // A marginal INT1 line can fail one window and pass the next. Retry the
-    // whole start/measure cycle before declaring the sensor faulty.
-    for (uint8_t attempt = 1; attempt <= 3 && !passed; ++attempt) {
+  bool passed = false;
+  // Run the complete start/measure cycle. A marginal INT1 line can fail one
+  // window and pass the next, so retry before either declaring a fault or
+  // changing the clock source.
+  auto runStartupChecks = [&]() {
+    bool ok = false;
+    for (uint8_t attempt = 1; attempt <= 5 && !ok; ++attempt) {
       SensorChecks::StartupCheck check = {};
       detachSensorInterrupt();
       resetEdges();
@@ -127,18 +145,20 @@ bool NodeApp::initializeSensor(bool resetDevice) {
       sensor_.start();
       // Ignore the FIFO/INT1 transient created while the sensor switches into
       // low-noise mode. Measure only a stable window after the transient.
-      delay(100);
+      delay(200);
       resetEdges();
       const uint32_t before = edgeTotal;
-      const uint64_t clockBefore = clock_.edgeCount();
-      delay(120);
+      // measureEdges() covers this 120 ms window with both PCNT and a direct
+      // GPIO poll, so a marginal PCNT route cannot fail an otherwise live
+      // CLKIN output.
+      check.clockEdges = clock_.measureEdges(120);
       check.dataReadyEdges = edgeTotal - before;
-      check.clockEdges = clock_.edgeCount() - clockBefore;
       check.fifoSamples = sensor_.available();
       check.fifoCountValid = sensor_.fifoCountValid();
       if (check.fifoSamples && check.fifoCountValid) {
         AccelSample sample = {};
-        check.sampleValid = sensor_.read(sample);
+        check.sampleValid = sensor_.read(sample) &&
+                            !(sample.x == 0 && sample.y == 0 && sample.z == 0);
         Serial.printf("SENSOR_SAMPLE,valid=%u,x=%d,y=%d,z=%d\n", check.sampleValid,
                       sample.x, sample.y, sample.z);
       }
@@ -147,22 +167,42 @@ bool NodeApp::initializeSensor(bool resetDevice) {
       sensor_.standby();
       detachSensorInterrupt();
       resetEdges();
-      passed = SensorChecks::startupPassed(check);
+      ok = SensorChecks::startupPassed(check, externalClock_);
       last = check;
       Serial.printf("SENSOR_CHECK_ATTEMPT,attempt=%u,drdy=%lu,fifo_samples=%u,"
                     "clock_edges=%llu,sample_valid=%u,identity_ok=%u,ok=%u\n",
                     attempt, (unsigned long)check.dataReadyEdges, check.fifoSamples,
                     (unsigned long long)check.clockEdges, check.sampleValid,
-                    check.identityValid, passed ? 1 : 0);
-      if (!passed)
+                    check.identityValid, ok ? 1 : 0);
+      if (!ok)
         delay(50);
     }
+    return ok;
+  };
+  if (initialized)
+    passed = runStartupChecks();
+  // GPIO36 can pass the boot self-test and then lose the carrier. Do not
+  // leave the node faulted: stop CLKIN, let the sensor use its internal
+  // oscillator, and rerun the same startup evidence checks. External clock is
+  // preferred, but a stable internal-clock node is usable.
+  if (!passed && externalClock_) {
+    Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
+                  "reason=external_runtime_failed\n",
+                  clock_.padUsable() ? 1 : 0);
+    clock_.setOutputEnabled(false);
+    clockOutputReady_ = false;
+    externalClock_ = false;
+    delay(20);
+    initialized = sensor_.begin(false, false);
+    passed = initialized && runStartupChecks();
   }
   Serial.printf("SENSOR_CHECK,init=%u,executed=%u,drdy=%lu,fifo_samples=%u,"
-                "clock_edges=%llu,sample_valid=%u,identity_ok=%u,fifo_bytes=%u,"
-                "int1_level=%u,ok=%u\n", initialized, initialized,
+                "clock_edges=%llu,clock_source=%s,sample_valid=%u,identity_ok=%u,"
+                "fifo_bytes=%u,int1_level=%u,ok=%u\n", initialized, initialized,
                 (unsigned long)last.dataReadyEdges, last.fifoSamples,
-                (unsigned long long)last.clockEdges, last.sampleValid, last.identityValid,
+                (unsigned long long)last.clockEdges,
+                externalClock_ ? "external" : "sensor_internal",
+                last.sampleValid, last.identityValid,
                 sensor_.lastFifoBytes(), digitalRead(Board::sensorInt), passed);
   if (!passed) {
     detachSensorInterrupt();
@@ -215,16 +255,18 @@ void NodeApp::sensorSampleTest() {
   clockOutputReady_ = clock_.setOutputEnabled(true);
   // Ignore the output-matrix reconnect transient.
   delay(100);
-  const uint64_t restoredBefore = clock_.edgeCount();
-  delayMicroseconds(2000);
-  const uint64_t restoredEdges = clock_.edgeCount() - restoredBefore;
-  clockOutputReady_ = clockOutputReady_ && restoredEdges >= 32 && restoredEdges <= 128;
-  Serial.printf("SENSOR_CLOCK_RESTORE,output_enabled=%u,edges_2ms=%llu,"
-                "pps_recalibration=1\n", clockOutputReady_,
-                (unsigned long long)restoredEdges);
+  const bool restored = clockOutputReady_ &&
+                        clock_.verifyOutput(50, 1200, 2000);
+  clockOutputReady_ = restored;
+  Serial.printf("SENSOR_CLOCK_RESTORE,output_enabled=%u,"
+                "verified_50ms=%u,pps_recalibration=1\n", clockOutputReady_,
+                restored ? 1 : 0);
   // The internal-clock diagnostic never authorizes synchronized acquisition.
   sensorReady_ = initializeSensor(false);
-  state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
+  // External-clock mode is preferred but not mandatory: the IIM42652 can use
+  // its internal oscillator, which keeps sampling alive when the board-side
+  // CLKIN pin is unusable.
+  state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
   Serial.printf("SENSOR_SAMPLE_TEST_RESTORE,external_clock=1,sensor_ready=%u,state=%u\n",
                 sensorReady_,state_);
 }
@@ -252,7 +294,7 @@ void NodeApp::tick() {
   if (radioReady_)
     Radio::update();
 #endif
-  // Clock watchdog: the LEDC loopback must keep producing ~32 kHz. Two bad
+  // Clock watchdog: the MCPWM loopback must keep producing ~32 kHz. Two bad
   // 1 s windows in a row trigger one full route restore.
   if (clockOutputReady_ && state_ != WireProtocol::Fault &&
       millis() - clockWatchMs_ >= 1000) {
@@ -260,12 +302,19 @@ void NodeApp::tick() {
     const uint64_t delta = edgesNow - clockWatchEdges_;
     clockWatchEdges_ = edgesNow;
     clockWatchMs_ = millis();
-    if (delta < 24000 || delta > 40000) {
+    const bool pcntHealthy = delta >= 24000 && delta <= 40000;
+    // Do not treat a failed PCNT readback as a stopped clock. The pad poll
+    // independently proves that GPIO36 is still toggling.
+    const bool outputHealthy =
+        pcntHealthy || clock_.verifyOutput(50, 1200, 2000);
+    if (!outputHealthy) {
       ++clockWatchFaults_;
-      Serial.printf("CLOCK_WATCHDOG,edges_1s=%llu,faults=%u\n",
-                    (unsigned long long)delta, clockWatchFaults_);
+      Serial.printf("CLOCK_WATCHDOG,edges_1s=%llu,pcnt_ok=%u,"
+                    "output_ok=%u,faults=%u\n",
+                    (unsigned long long)delta, pcntHealthy ? 1 : 0,
+                    outputHealthy ? 1 : 0, clockWatchFaults_);
       if (clockWatchFaults_ >= 2) {
-        const bool recovered = clock_.recover() && clock_.verifyOutput(10, 240, 400);
+        const bool recovered = clock_.recover() && clock_.verifyOutput(50, 1200, 2000);
         Serial.printf("CLOCK_RECOVER,ok=%u\n", recovered ? 1 : 0);
         clockWatchFaults_ = 0;
         if (!recovered) {
@@ -309,13 +358,20 @@ void NodeApp::tick() {
     state_ = Waiting;
   if (millis() - lastLog_ >= 5000) {
     lastLog_ = millis();
+    const uint32_t clk10ms = clock_.measureEdges(10);
     const uint64_t edgesNow = clock_.edgeCount();
-    Serial.printf("FLOW,edge_delta=%lu,valid=%lu,invalid=%lu,no_edge=%lu,resets=%lu,fifo_bytes=%u,rx=%lu,ack=%lu,stop=%lu,window=%lu,clock_delta=%llu,phase=%lu\n",
+    Serial.printf("FLOW,edge_delta=%lu,valid=%lu,invalid=%lu,no_edge=%lu,resets=%lu,fifo_bytes=%u,rx=%lu,ack=%lu,stop=%lu,window=%lu,clock_delta=%llu,clk_10ms=%lu,phase=%lu,timed=%lu,fallback=%lu,ts_anomaly=%lu,fifo_errors=%lu,fifo_consecutive=%u,fifo_header=0x%02X,fifo_count=%u,fifo_packet=%u,dt_mean_us=%llu,dt_min_us=%u,dt_max_us=%u\n",
       (unsigned long)(edgeTotal - diagEdges_), (unsigned long)diagValid_, (unsigned long)diagInvalid_,
       (unsigned long)diagNoEdge_, (unsigned long)diagResets_, sensor_.lastFifoBytes(),
       (unsigned long)diagRx_, (unsigned long)diagAck_, (unsigned long)diagStop_, (unsigned long)diagWindow_,
-      (unsigned long long)(edgesNow - diagLastClock_),
-      (unsigned long)(now >= startEpoch_ ? (now - startEpoch_) % Config::cycleUs : 0));
+      (unsigned long long)(edgesNow - diagLastClock_), (unsigned long)clk10ms,
+      (unsigned long)(now >= startEpoch_ ? (now - startEpoch_) % Config::cycleUs : 0),
+      (unsigned long)diagTimestamped_, (unsigned long)diagTimestampFallback_,
+      (unsigned long)diagTimestampAnomaly_, (unsigned long)sensor_.fifoErrorTotal(),
+      sensor_.fifoConsecutiveFailures(), sensor_.lastHeader(), sensor_.lastFifoCountRaw(),
+      sensor_.fifoPacketBytes(),
+      (unsigned long long)(diagIntervalCount_ ? diagIntervalSum_ / diagIntervalCount_ : 0),
+      diagIntervalMin_, diagIntervalMax_);
     diagEdges_ = edgeTotal; diagLastClock_ = edgesNow;
     Serial.printf(
         "STATUS,id=%u,state=%u,gps=%u,clock_hz=%.4f,ppm=%.2f,clock_ok=%u,queue=%u,lost_samples=%lu,"
@@ -372,6 +428,9 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   }
   run_ = h.run;
   diagValid_ = diagInvalid_ = diagNoEdge_ = diagResets_ = diagSamplesLogged_ = 0;
+  diagTimestamped_ = diagTimestampFallback_ = diagTimestampAnomaly_ = 0;
+  diagIntervalCount_ = diagIntervalMin_ = diagIntervalMax_ = 0;
+  diagIntervalSum_ = 0;
   sensor_.diagnostic();
   rate_ = h.rate;
   range_ = h.range;
@@ -384,6 +443,9 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
   gap_ = overflow_ = false;
   queue_.clear();
   firstEpoch_ = lastEpoch_ = 0;
+  lastFifoTimestampTicks_ = 0;
+  haveLastFifoTimestamp_ = false;
+  lastFifoPollMs_ = millis();
   result_ = Accepted;
   state_ = Armed;
 }
@@ -391,7 +453,8 @@ void NodeApp::stop() {
   if (state_ == Fault && !sensorActive_)
     return;  // STOP must never turn a failed sensor into "ready".
   if (sensorActive_) {
-    acquire();
+    // Do not take a final FIFO reading here. A transient count failure at the
+    // commanded stop boundary must not turn a completed run into a fault.
     sensor_.standby();
     detachSensorInterrupt();
     sensorActive_ = false;
@@ -486,7 +549,10 @@ void NodeApp::serialCommands() {
         continue;
       }
       sensorReady_ = initializeSensor(false);
-      state_ = clockOutputReady_ && sensorReady_ && radioReady_ ? Waiting : Fault;
+      // External-clock mode is preferred but not mandatory: the IIM42652 can use
+  // its internal oscillator, which keeps sampling alive when the board-side
+  // CLKIN pin is unusable.
+  state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
       Serial.printf("SENSOR_RETRY,ok=%u,state=%u,reset=0\n", sensorReady_, state_);
       continue;
     }
@@ -518,13 +584,31 @@ void NodeApp::serialCommands() {
   }
 }
 void NodeApp::acquire() {
-  uint32_t overruns;
-  portENTER_CRITICAL(&edgeMux);
-  overruns = edgeOverruns;
-  edgeOverruns = 0;
-  portEXIT_CRITICAL(&edgeMux);
+  // Poll at 5 ms instead of hammering FIFO_COUNT and WHO_AM_I on every loop
+  // pass. 50 Hz needs only one new record every 20 ms; 5 ms still catches
+  // bursts while cutting register traffic by an order of magnitude.
+  const uint32_t nowMs = millis();
+  if (nowMs - lastFifoPollMs_ < 5) {
+    return;
+  }
+  lastFifoPollMs_ = nowMs;
   const uint16_t available = sensor_.available();
+  const bool fifoReadOk = sensor_.lastFifoReadOk();
   if (!sensor_.fifoCountValid()) {
+    const uint16_t invalidBytes = sensor_.lastFifoBytes();
+    Serial.printf(
+        "SENSOR_FAULT_DETAIL,reason=%s,available=%u,count_raw=%u,"
+        "count_attempts=%u,count_ok=%u,read_ok=%u,consecutive=%u,"
+        "fifo_errors=%u,header=0x%02X,packet_bytes=%u,fifo_bytes=%u,"
+        "timestamp_raw=%u,timestamp_valid=%u\n",
+        sensor_.lastFifoErrorReason(), available, sensor_.lastFifoCountRaw(),
+        sensor_.lastFifoCountAttempts(), sensor_.lastFifoCountOk() ? 1 : 0,
+        fifoReadOk ? 1 : 0, sensor_.fifoConsecutiveFailures(),
+        sensor_.fifoErrorTotal(), sensor_.lastHeader(),
+        sensor_.fifoPacketBytes(), invalidBytes, sensor_.lastFifoTimestamp(),
+        sensor_.lastFifoTimestampValid() ? 1 : 0);
+    Serial.printf("SENSOR_FAULT,invalid_fifo_bytes=%u,capture_blocked=1\n",
+                  invalidBytes);
     ++diagResets_;
     gap_ = true;
     sensorReady_ = false;
@@ -533,62 +617,140 @@ void NodeApp::acquire() {
     flush(true);
     state_ = Fault;
     detachSensorInterrupt();
-    Serial.printf("SENSOR_FAULT,invalid_fifo_bytes=%u,capture_blocked=1\n", sensor_.lastFifoBytes());
     return;
   }
-  if (overruns || available > 240) {
+
+  if (!fifoReadOk) {
     ++diagResets_;
-    if (diagResets_ <= 8) Serial.printf("FIFO_RESET,overruns=%lu,bytes=%u\n", (unsigned long)overruns, sensor_.lastFifoBytes());
-    // IRQ queue overruns count electrical edges, not sensor samples. Count
-    // only the bounded FIFO records actually discarded; mark the gap.
-    lostSamples_ += available;
     gap_ = true;
-    flush(true);
-    sensor_.flush();
-    resetEdges();
-    return;
-  }
-  for (uint16_t i = 0; i < available; ++i) {
-    AccelSample s;
-    const bool valid = sensor_.read(s);
-    uint64_t local;
-    if (!popEdge(local)) {
-      ++diagNoEdge_;
-      gap_ = true;
-      ++lostSamples_;
-      continue;
+    haveLastFifoTimestamp_ = false;
+    if (diagResets_ <= 8) {
+      Serial.printf(
+          "FIFO_RECOVER,reason=%s,available=%u,count_raw=%u,attempts=%u,"
+          "consecutive=%u,total=%u,header=0x%02X\n",
+          sensor_.lastFifoErrorReason(), available, sensor_.lastFifoCountRaw(),
+          sensor_.lastFifoCountAttempts(), sensor_.fifoConsecutiveFailures(),
+          sensor_.fifoErrorTotal(), sensor_.lastHeader());
     }
+    if (available == 0) {
+      ++lostSamples_;
+      return;
+    }
+  }
+
+  // The tick rate depends on the active clock mode: 32 kHz CLKIN in RTC mode,
+  // or the sensor's internal 16 us/1 us step otherwise.
+  const uint16_t expectedTicks = static_cast<uint16_t>(
+      sensor_.timestampTicksPerSecond() / rate_);
+  const uint64_t nominalIntervalUs = 1000000ULL / rate_;
+  for (uint16_t i = 0; i < available; ++i) {
+    Iim42652::FifoSample item = {};
+    const bool valid = sensor_.read(item);
+    const uint64_t local = esp_timer_get_time();
     if (!valid) {
       ++diagInvalid_;
-      if (diagInvalid_ <= 8) Serial.printf("FIFO_INVALID,header=0x%02X,bytes=%u,available=%u,index=%u\n", sensor_.lastHeader(), sensor_.lastFifoBytes(), available, i);
+      if (diagInvalid_ <= 8) {
+        Serial.printf("FIFO_INVALID,available=%u,index=%u\n", available, i);
+      }
       gap_ = true;
       ++lostSamples_;
       continue;
     }
+
+    // FIFO timestamp is a wrapping 16-bit 32 kHz counter value, not a
+    // per-record interval. Subtract consecutive counter values with uint16
+    // wrap semantics to recover the true ODR interval.
+    uint16_t timestampDeltaTicks = 0;
+    const uint16_t previousTimestampTicks = lastFifoTimestampTicks_;
+    bool timestampPlausible = false;
+    if (item.timed) {
+      if (!haveLastFifoTimestamp_) {
+        timestampPlausible = true;
+        timestampDeltaTicks = expectedTicks;
+      } else {
+        timestampDeltaTicks =
+            static_cast<uint16_t>(item.timestamp - lastFifoTimestampTicks_);
+        timestampPlausible =
+            timestampDeltaTicks >= expectedTicks / 2 &&
+            timestampDeltaTicks <= expectedTicks * 8;
+      }
+      haveLastFifoTimestamp_ = true;
+      lastFifoTimestampTicks_ = item.timestamp;
+    } else {
+      haveLastFifoTimestamp_ = false;
+    }
+
+    uint64_t intervalUs = nominalIntervalUs;
+    if (timestampPlausible) {
+      intervalUs = sensor_.timestampUs(timestampDeltaTicks);
+      ++diagTimestamped_;
+    } else {
+      ++diagTimestampFallback_;
+      if (item.timed) {
+        ++diagTimestampAnomaly_;
+        if (diagTimestampAnomaly_ <= 8) {
+          Serial.printf(
+              "SENSOR_TIMESTAMP_ANOMALY,raw=%u,previous=%u,delta=%u,"
+              "expected=%u,header=0x%02X\n",
+              item.timestamp, previousTimestampTicks, timestampDeltaTicks,
+              expectedTicks, item.header);
+        }
+      }
+    }
+
+    const uint64_t previousEpoch = lastEpoch_;
+    const uint64_t t =
+        previousEpoch ? previousEpoch + intervalUs : epoch(local);
+    if (previousEpoch && t > previousEpoch) {
+      const uint32_t dt = static_cast<uint32_t>(t - previousEpoch);
+      if (!diagIntervalCount_ || dt < diagIntervalMin_)
+        diagIntervalMin_ = dt;
+      if (dt > diagIntervalMax_)
+        diagIntervalMax_ = dt;
+      diagIntervalSum_ += dt;
+      ++diagIntervalCount_;
+    }
     ++diagValid_;
-    const uint64_t t = epoch(local);
-    if (diagSamplesLogged_++ < 16) Serial.printf("SAMPLE_DIAG,header=0x%02X,bytes=%u,t=%llu,dt=%lld,count=%u\n", sensor_.lastHeader(), sensor_.lastFifoBytes(), (unsigned long long)t, (long long)(lastEpoch_ ? int64_t(t)-int64_t(lastEpoch_) : 0), count_);
-    if (!t || t < startEpoch_)
+    const auto sampleIndex = diagSamplesLogged_++;
+    if (sampleIndex < 24 || diagValid_ % 500 == 0) {
+      Serial.printf(
+          "SAMPLE_DIAG,index=%lu,header=0x%02X,packet_bytes=%u,count_raw=%u,"
+          "ts_raw=%u,timed=%u,ts_us=%llu,t=%llu,dt=%lld\n",
+          (unsigned long)sampleIndex, item.header, item.packetBytes,
+          sensor_.lastFifoCountRaw(), item.timestamp, item.timed ? 1 : 0,
+          (unsigned long long)(timestampPlausible ? intervalUs : 0),
+          (unsigned long long)t,
+          (long long)(previousEpoch ? int64_t(t) - int64_t(previousEpoch) : 0));
+    }
+    if (!t || t < startEpoch_) {
       continue;
+    }
     if (lastEpoch_ && (t <= lastEpoch_ || t - lastEpoch_ > 1500000 / rate_)) {
       gap_ = true;
       flush(true);
     }
-    if (count_ && llabs(int64_t(t) - int64_t(firstEpoch_ + uint64_t(count_) * 1000000 / rate_)) >
-                      500000 / rate_)
+    if (count_ &&
+        llabs(int64_t(t) - int64_t(firstEpoch_ +
+                                   uint64_t(count_) * 1000000 / rate_)) >
+            500000 / rate_) {
       flush(true);
-    if (!count_)
+    }
+    if (!count_) {
       firstEpoch_ = t;
+    }
     lastEpoch_ = t;
-    samples_[count_++] = {s.x, s.y, s.z};
+    samples_[count_++] = {item.accel.x, item.accel.y, item.accel.z};
 #ifdef APP_USB_TEST
-    Serial.printf("SAMPLE,%u,%lu,%llu,%d,%d,%d\n", Config::nodeId, (unsigned long)run_,
-                  (unsigned long long)t, s.x, s.y, s.z);
+    Serial.printf("SAMPLE,%u,%lu,%llu,%d,%d,%d\n", Config::nodeId,
+                  (unsigned long)run_, (unsigned long long)t, item.accel.x,
+                  item.accel.y, item.accel.z);
 #endif
-    if (count_ == 25)
+    if (count_ == 25) {
       flush();
+    }
   }
 }
+
 void NodeApp::flush(bool tail) {
   if (!count_)
     return;

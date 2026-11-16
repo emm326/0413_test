@@ -43,6 +43,9 @@ struct Bus {
   }
 
   uint8_t read(uint8_t reg) {
+    if (reg == MPUREG_REG_BANK_SEL) {
+      return bank;
+    }
     if (bank == 0 && reg == MPUREG_FIFO_DATA) {
       return readFifoByteForTest();
     }
@@ -98,6 +101,16 @@ uint8_t SPIClass::transfer(uint8_t value) {
   return 0;
 }
 
+void SPIClass::transferBytes(const uint8_t* data, uint8_t* out,
+                             uint32_t length) {
+  for (uint32_t i = 0; i < length; ++i) {
+    const uint8_t received = transfer(data == nullptr ? 0 : data[i]);
+    if (out != nullptr) {
+      out[i] = received;
+    }
+  }
+}
+
 struct VendorState {
   int initRc = 0;
   int clkinStatus = 1;
@@ -113,7 +126,15 @@ struct VendorState {
   int fsr = -1;
   int packets = 0;
   std::vector<AccelSample> events;
+  std::vector<uint16_t> fifoTimestamps;
 } vendor;
+
+void setFifoPackets(int packets) {
+  vendor.packets = packets;
+  bus.regs[0][MPUREG_FIFO_COUNTH] = static_cast<uint8_t>(packets & 0xff);
+  bus.regs[0][MPUREG_FIFO_COUNTH + 1] =
+      static_cast<uint8_t>((packets >> 8) & 0xff);
+}
 
 std::vector<uint8_t> fifoStream;
 std::size_t fifoPos = 0;
@@ -121,16 +142,21 @@ std::size_t fifoPos = 0;
 void buildFifoStream() {
   fifoStream.clear();
   fifoPos = 0;
-  for (const AccelSample& sample : vendor.events) {
+  for (std::size_t index = 0; index < vendor.events.size(); ++index) {
+    const AccelSample& sample = vendor.events[index];
     fifoStream.push_back(FIFO_HEADER_ACC | FIFO_HEADER_GYRO | FIFO_HEADER_TMST);
     const int16_t axis[3] = {sample.x, sample.y, sample.z};
     for (int16_t value : axis) {
       fifoStream.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
       fifoStream.push_back(static_cast<uint8_t>(value & 0xff));
     }
-    for (int i = 0; i < 6 + 1 + 2; ++i) {
+    for (int i = 0; i < 6 + 1; ++i) {
       fifoStream.push_back(0);
     }
+    const uint16_t timestamp =
+        index < vendor.fifoTimestamps.size() ? vendor.fifoTimestamps[index] : 0;
+    fifoStream.push_back(static_cast<uint8_t>((timestamp >> 8) & 0xff));
+    fifoStream.push_back(static_cast<uint8_t>(timestamp & 0xff));
   }
 }
 
@@ -291,6 +317,16 @@ extern "C" int inv_ixm42xxx_get_clkin_rtc_status(struct inv_ixm42xxx* s) {
   return vendor.clkinStatus;
 }
 
+extern "C" int inv_ixm42xxx_configure_timestamp_resolution(
+    struct inv_ixm42xxx* s, IXM42XXX_TMST_CONFIG_RESOL_t resolution) {
+  (void)s;
+  bus.regs[0][MPUREG_TMST_CONFIG] = static_cast<uint8_t>(
+      (bus.regs[0][MPUREG_TMST_CONFIG] &
+       ~BIT_TMST_CONFIG_RESOL_MASK) |
+      static_cast<uint8_t>(resolution) | BIT_TMST_CONFIG_TMST_EN_MASK);
+  return 0;
+}
+
 extern "C" int inv_ixm42xxx_enable_accel_low_noise_mode(
     struct inv_ixm42xxx* s) {
   (void)s;
@@ -323,7 +359,7 @@ extern "C" int inv_ixm42xxx_get_data_from_fifo(struct inv_ixm42xxx* s) {
     }
   }
   vendor.events.clear();
-  vendor.packets = 0;
+  setFifoPackets(0);
   return 0;
 }
 
@@ -400,6 +436,28 @@ void driverConfiguration() {
   bus.regs[0][MPUREG_INTF_CONFIG1] = 0x00;
   require(sensor.readRegister(MPUREG_INTF_CONFIG1) == 0x00,
           "readRegister did not bypass the vendor cache");
+
+  // DS-000440 RTC mode, TMST_RES=1: one tick is one 32 kHz CLKIN period.
+  require(sensor.timestampUs(640) == 20000,
+          "RTC timestamp scaling is not 20 ms per 640 ticks");
+
+  // DS-000440 internal-clock scaling: TMST_RES=1 ticks are 16*32/30 us.
+  require(sensor.begin(false, false), "internal-clock driver begin failed");
+  require(sensor.timestampTicksPerSecond() == 58593,
+          "internal timestamp tick rate is not datasheet-scaled");
+  require(sensor.timestampUs(1172) == 20002,
+          "internal timestamp scaling is not 16*32/30 us");
+
+  // The 16-byte FIFO packet carrying an ODR timestamp exists only when both
+  // accel and gyro fields are enabled, per DS-000440 page 43.
+  require(sensor.configure(50, 4), "driver configure failed");
+  sensor.start();
+  require((bus.regs[0][MPUREG_FIFO_CONFIG1] & BIT_FIFO_CONFIG1_ACCEL_MASK) != 0,
+          "accel FIFO field was not enabled");
+  require((bus.regs[0][MPUREG_FIFO_CONFIG1] & BIT_FIFO_CONFIG1_GYRO_MASK) != 0,
+          "gyro FIFO field needed for timestamp was disabled");
+  require(sensor.fifoPacketBytes() == 16,
+          "timestamp-capable FIFO packet is not 16 bytes");
 }
 
 void fifoOrderAndCount() {
@@ -409,15 +467,25 @@ void fifoOrderAndCount() {
   sensor.start();
   require(sensor.fifoPacketBytes() == 16,
           "capture packet size is not accel+gyro+temp+timestamp");
-  vendor.packets = 2;
+  setFifoPackets(2);
   vendor.events = {{1, 2, 3}, {4, 5, 6}};
+  vendor.fifoTimestamps = {640, 641};
   require(sensor.available() == 2, "FIFO sample count is wrong");
   require(sensor.lastFifoBytes() == 32, "packet size accounting is wrong");
-  AccelSample first{};
-  AccelSample second{};
-  require(sensor.read(first) && first.x == 1 && first.y == 2 && first.z == 3,
+  require(sensor.lastFifoCountRaw() == 2 && sensor.lastFifoCountOk(),
+          "FIFO count diagnostic is wrong");
+  Iim42652::FifoSample first{};
+  Iim42652::FifoSample second{};
+  require(sensor.read(first) && first.accel.x == 1 && first.accel.y == 2 &&
+              first.accel.z == 3,
           "first FIFO sample is wrong");
-  require(sensor.read(second) && second.x == 4 && second.y == 5 && second.z == 6,
+  require(first.header == 0x68 && first.packetBytes == 16 && first.timed &&
+              first.timestamp == 640,
+          "first FIFO timestamp packet was not parsed");
+  require(sensor.timestampUs(first.timestamp) == 20000,
+          "FIFO timestamp scaling is wrong");
+  require(sensor.read(second) && second.accel.x == 4 && second.accel.y == 5 &&
+              second.accel.z == 6 && second.timestamp == 641,
           "second FIFO sample is out of order");
   require(!sensor.read(first), "empty buffer returned a sample");
 }
@@ -427,9 +495,16 @@ void fifoOverflowGuard() {
   Iim42652 sensor;
   require(sensor.begin(false, true), "initialization failed");
   sensor.start();
-  vendor.packets = 200;
+  setFifoPackets(300);
   require(sensor.available() == 0, "oversized FIFO count was accepted");
-  require(!sensor.fifoCountValid(), "oversized FIFO count passed validation");
+  require(!sensor.lastFifoCountOk() && sensor.fifoConsecutiveFailures() == 1,
+          "single FIFO failure was not diagnosed");
+  require(sensor.fifoCountValid(), "one FIFO failure became a fatal fault");
+  require(sensor.available() == 0, "second oversized count was accepted");
+  require(sensor.available() == 0, "third oversized count was accepted");
+  require(sensor.fifoConsecutiveFailures() == 3,
+          "consecutive FIFO failures were not counted");
+  require(!sensor.fifoCountValid(), "three FIFO failures did not become fatal");
 }
 
 void standbyClearsSamples() {
@@ -437,7 +512,7 @@ void standbyClearsSamples() {
   Iim42652 sensor;
   require(sensor.begin(false, true), "initialization failed");
   sensor.start();
-  vendor.packets = 1;
+  setFifoPackets(1);
   vendor.events = {{1, 2, 3}};
   require(sensor.available() == 1, "sample was not buffered");
   sensor.standby();
@@ -465,6 +540,20 @@ void startupPolicy() {
   bad = good;
   bad.dataReadyEdges = 6400;
   require(!startupPassed(bad), "clock-rate IRQ passed startup");
+
+  // Internal-clock mode has no board-side CLKIN and INT1 is optional in the
+  // six-wire setup. A valid FIFO record set must still pass with DRDY=0.
+  StartupCheck internalClock{0, 16, 0, true, true, true};
+  require(startupPassed(internalClock, false),
+          "internal-clock startup rejected without DRDY");
+  require(!startupPassed(internalClock, true),
+          "external-clock startup passed without CLKIN edges");
+  bad = good;
+  bad.fifoSamples = 3;
+  require(!startupPassed(bad), "short FIFO passed startup");
+  bad = good;
+  bad.fifoSamples = 31;
+  require(!startupPassed(bad), "overlong FIFO passed startup");
 }
 
 void recoveryPolicy() {

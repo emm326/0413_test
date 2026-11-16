@@ -40,15 +40,22 @@ class NodeApp {
   uint16_t rate_ = 100;
   uint32_t diagValid_ = 0, diagInvalid_ = 0, diagNoEdge_ = 0, diagResets_ = 0, diagEdges_ = 0;
   uint32_t diagRx_ = 0, diagAck_ = 0, diagStop_ = 0, diagWindow_ = 0, diagSamplesLogged_ = 0;
+  uint32_t diagTimestamped_ = 0, diagTimestampFallback_ = 0, diagTimestampAnomaly_ = 0;
+  uint32_t diagIntervalCount_ = 0, diagIntervalMin_ = 0, diagIntervalMax_ = 0;
+  uint64_t diagIntervalSum_ = 0;
   uint64_t diagLastClock_ = 0;
   uint64_t clockWatchEdges_ = 0;
   uint32_t clockWatchMs_ = 0;
   uint8_t clockWatchFaults_ = 0;
   uint32_t run_ = 0, sequence_ = 0, duration_ = 0, lostSamples_ = 0, lostPackets_ = 0;
   uint32_t replyRun_ = 0, replyAt_ = 0, lastStatus_ = 0, lastLog_ = 0;
+  uint32_t lastFifoPollMs_ = 0;
   uint64_t startEpoch_ = 0, firstEpoch_ = 0, lastEpoch_ = 0, anchorEpoch_ = 0, anchorLocal_ = 0;
+  uint16_t lastFifoTimestampTicks_ = 0;
+  bool haveLastFifoTimestamp_ = false;
   float uplink_ = Config::uplinkMHz;
   bool clockOutputReady_ = false;
+  bool externalClock_ = false;
   bool intAttached_ = false;
   bool sensorReady_ = false, radioReady_ = false, sensorActive_ = false, gap_ = false,
        overflow_ = false;

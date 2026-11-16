@@ -12,6 +12,9 @@ constexpr uint8_t kPwrAccelModeMask = BIT_PWR_MGMT_0_ACCEL_MODE_MASK;
 constexpr uint8_t kPwrAccelModeLowNoise = IXM42XXX_PWR_MGMT_0_ACCEL_MODE_LN;
 // Accelerometer and gyro mode fields together occupy PWR_MGMT0 bits [3:0].
 constexpr uint8_t kPowerModeMask = 0x0F;
+// TMST_CONFIG for an ODR timestamp in every FIFO record:
+// TMST_EN=1, TMST_RES=16us code, TMST_DELTA_EN=1.
+constexpr uint8_t kTimestampConfigWanted = 0x29;
 
 IXM42XXX_ACCEL_CONFIG0_ODR_t odrFor(uint16_t rate) {
   return rate == 100 ? IXM42XXX_ACCEL_CONFIG0_ODR_100_HZ
@@ -60,9 +63,23 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
-  fifoErrors_ = 0;
   overflow_ = false;
   packetBytes_ = 11;
+  lastFifoCountRaw_ = 0;
+  lastFifoCountAttempts_ = 0;
+  lastFifoCountOk_ = true;
+  lastFifoReadOk_ = true;
+  fifoConsecutiveFailures_ = 0;
+  lastFifoIdentity_ = 0;
+  fifoRecoveryTotal_ = 0;
+  fifoErrorTotal_ = 0;
+  lastFifoErrorReason_ = "none";
+  lastFifoTimestamp_ = 0;
+  lastFifoTimestampValid_ = false;
+  timestampConfig_ = 0;
+  timestampRtcMode_ = false;
+  fifoBatchBytes_ = 0;
+  fifoParseOffset_ = 0;
 
   if (!transport_.begin()) {
     Serial.println("SENSOR_VENDOR_INIT,rc=-1,stage=transport");
@@ -78,11 +95,24 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
   serif_.max_write = 16;
   serif_.serif_type = IXM42XXX_UI_SPI4;
 
-  const int rc = inv_ixm42xxx_init(&driver_, &serif_, &Iim42652::eventThunk);
-  Serial.printf(
-      "SENSOR_VENDOR_INIT,rc=%d,reset_requested=%u,soft_reset=1,"
-      "external_clock=%u\n",
-      rc, resetDevice ? 1 : 0, externalClock ? 1 : 0);
+  int rc = INV_ERROR;
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    rc = inv_ixm42xxx_init(&driver_, &serif_, &Iim42652::eventThunk);
+    Serial.printf(
+        "SENSOR_VENDOR_INIT,attempt=%u,rc=%d,reset_requested=%u,"
+        "soft_reset=1,external_clock=%u\n",
+        attempt, rc, resetDevice ? 1 : 0, externalClock ? 1 : 0);
+    if (rc == INV_ERROR_SUCCESS) {
+      break;
+    }
+    if (attempt < 3) {
+      delay(10);
+      transport_.end();
+      if (!transport_.begin()) {
+        break;
+      }
+    }
+  }
   if (rc != INV_ERROR_SUCCESS) {
     transport_.end();
     return false;
@@ -90,7 +120,7 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
 
   uint8_t who = 0;
   for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-    if (!setBank(0) || !directRead(0x75, who)) {
+    if (!setBank(0) || !directRead(MPUREG_WHO_AM_I, who)) {
       who = 0;
       break;
     }
@@ -112,7 +142,14 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
     transport_.end();
     return false;
   }
-  if (!configure(50, 4)) {
+  bool configured = false;
+  for (uint8_t attempt = 1; attempt <= 3 && !configured; ++attempt) {
+    configured = configure(50, 4);
+    if (!configured && attempt < 3) {
+      delay(10);
+    }
+  }
+  if (!configured) {
     initialized_ = false;
     transport_.end();
     return false;
@@ -175,6 +212,7 @@ bool Iim42652::configure(uint16_t rate, uint8_t range) {
   // the hardware disagree; retry with a physical readback.
   rc |= applyAccelConfig(rate, range) ? 0 : INV_ERROR;
   rc |= configureFifo() ? 0 : INV_ERROR;
+  rc |= configureTimestamp() ? 0 : INV_ERROR;
   // The chip can power up with 20-bit FIFO packets while the vendor parser
   // assumes 16-bit packets unless high-resolution mode was requested.
   rc |= forceSixteenBitFifo() ? 0 : INV_ERROR;
@@ -205,6 +243,8 @@ bool Iim42652::configure(uint16_t rate, uint8_t range) {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
+  fifoBatchBytes_ = 0;
+  fifoParseOffset_ = 0;
   if (setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
   }
@@ -302,6 +342,125 @@ bool Iim42652::configureFifo() {
                 fifo, fifo1);
   return false;
 }
+
+bool Iim42652::configureTimestamp() {
+  timestampRtcMode_ = false;
+  uint8_t intf1 = 0;
+  if (setBank(0) && directRead(MPUREG_INTF_CONFIG1, intf1)) {
+    timestampRtcMode_ = (intf1 & BIT_RTC_MODE_MASK) != 0;
+  }
+  bool ok = false;
+  uint8_t applied = 0;
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    if (!writeRaw(MPUREG_TMST_CONFIG, kTimestampConfigWanted)) {
+      delay(1);
+      continue;
+    }
+    delay(1);
+    if (setBank(0) && directRead(MPUREG_TMST_CONFIG, applied) &&
+        applied == kTimestampConfigWanted) {
+      ok = true;
+      break;
+    }
+    delay(1);
+  }
+  if (!ok) {
+    applied = readRegister(MPUREG_TMST_CONFIG);
+  }
+  timestampConfig_ = applied;
+  Serial.printf("SENSOR_TIMESTAMP,config=0x%02X,rtc_mode=%u,enabled=%u,"
+                "resolution_bit=%u,resolution_us_x1000=%lu,ok=%u\n",
+                applied, timestampRtcMode_ ? 1 : 0,
+                (applied & BIT_TMST_CONFIG_TMST_EN_MASK) != 0 ? 1 : 0,
+                (applied & BIT_TMST_CONFIG_RESOL_MASK) != 0 ? 1 : 0,
+                1000000UL / timestampTicksPerSecond(), ok ? 1 : 0);
+  return ok;
+}
+
+uint32_t Iim42652::timestampTicksPerSecond() const {
+  if (timestampRtcMode_) {
+    // In RTC mode TMST_RES=1 counts 32 kHz CLKIN periods. TMST_RES=0 uses the
+    // datasheet's 32.768 kHz / 32 timestamp scaling.
+    return (timestampConfig_ & BIT_TMST_CONFIG_RESOL_MASK) != 0 ? 32000U
+                                                                : 1024U;
+  }
+  // In internal-clock mode TMST_RES=1 is 16 us nominal, scaled by the
+  // datasheet ratio 32/30 (17.067 us per tick). TMST_RES=0 is 1 us.
+  return (timestampConfig_ & BIT_TMST_CONFIG_RESOL_MASK) != 0 ? 58593U
+                                                              : 1000000U;
+}
+
+uint32_t Iim42652::timestampUs(uint16_t ticks) const {
+  const uint32_t perSecond = timestampTicksPerSecond();
+  return static_cast<uint32_t>(
+      (static_cast<uint64_t>(ticks) * 1000000ULL + perSecond / 2U) / perSecond);
+}
+
+bool Iim42652::recoverFifoState() {
+  ++fifoRecoveryTotal_;
+  uint8_t who = 0;
+  if (!setBank(0) || !directRead(MPUREG_WHO_AM_I, who) || who != kWhoAmI) {
+    lastFifoIdentity_ = who;
+    lastFifoErrorReason_ = "recovery_identity_failed";
+    return false;
+  }
+  lastFifoIdentity_ = who;
+
+  // Flush once, then rebuild the FIFO mode and feature bits from scratch.
+  // This handles a wedged FIFO state machine that a single flush does not.
+  inv_ixm42xxx_reset_fifo(&driver_);
+  delay(2);
+  if (!configureFifo() || !configureTimestamp()) {
+    lastFifoErrorReason_ = "recovery_configure_failed";
+    return false;
+  }
+
+  uint8_t power = 0;
+  if (!setBank(0) || !directRead(MPUREG_PWR_MGMT_0, power)) {
+    lastFifoErrorReason_ = "recovery_power_read_failed";
+    return false;
+  }
+  if ((power & kPwrAccelModeMask) != kPwrAccelModeLowNoise) {
+    if (inv_ixm42xxx_enable_accel_low_noise_mode(&driver_) !=
+        INV_ERROR_SUCCESS) {
+      lastFifoErrorReason_ = "recovery_accel_start_failed";
+      return false;
+    }
+    running_ = true;
+  }
+  updateFifoPacketSize();
+  delay(5);
+
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    uint8_t countBytes[2] = {};
+    uint8_t checkWho = 0;
+    if (setBank(0) && directRead(MPUREG_WHO_AM_I, checkWho) &&
+        checkWho == kWhoAmI &&
+        directRead(MPUREG_FIFO_COUNTH, countBytes, sizeof(countBytes))) {
+      const uint16_t packets = static_cast<uint16_t>(countBytes[0]) |
+                               (static_cast<uint16_t>(countBytes[1]) << 8);
+      lastFifoCountRaw_ = packets;
+      if (packets <= maxFifoPackets()) {
+        lastFifoBytes_ = 0;
+        overflow_ = false;
+        lastFifoReadOk_ = false;
+        lastFifoErrorReason_ = "recovered";
+        Serial.printf("SENSOR_FIFO_RESYNC,who=0x%02X,packet_bytes=%u,"
+                      "count_raw=%u,attempt=%u,ok=1\n",
+                      checkWho, packetBytes_, packets, attempt);
+        return true;
+      }
+      lastFifoErrorReason_ = "recovery_count_invalid";
+    } else {
+      lastFifoErrorReason_ = "recovery_count_read_failed";
+    }
+    delay(1);
+  }
+  Serial.printf("SENSOR_FIFO_RESYNC,who=0x%02X,packet_bytes=%u,ok=0\n",
+                lastFifoIdentity_, packetBytes_);
+  return false;
+}
+
 bool Iim42652::forceSixteenBitFifo() {
   const uint8_t mask = static_cast<uint8_t>(
       BIT_FIFO_CONFIG1_HIRES_MASK |
@@ -400,13 +559,23 @@ bool Iim42652::configureInterrupt() {
 }
 
 bool Iim42652::setBank(uint8_t bank) {
-  if (inv_ixm42xxx_set_reg_bank(&driver_, bank) != INV_ERROR_SUCCESS) {
-    return false;
+  // A write to REG_BANK_SEL can complete on SPI without the sensor latching it.
+  // Read the bank register back and retry before any bank-sensitive access.
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    if (inv_ixm42xxx_set_reg_bank(&driver_, bank) != INV_ERROR_SUCCESS) {
+      delayMicroseconds(10);
+      continue;
+    }
+    delayMicroseconds(5);
+    uint8_t applied = 0xff;
+    if (directRead(MPUREG_REG_BANK_SEL, applied) &&
+        (applied & 0x07) == (bank & 0x07)) {
+      return true;
+    }
+    delayMicroseconds(10);
   }
-  // The bank-select write ends one SPI transaction; leave enough time before
-  // the next command so the selected bank is stable on every power-up.
-  delayMicroseconds(5);
-  return true;
+  Serial.printf("SENSOR_BANK_ERROR,requested=%u,ok=0\n", bank);
+  return false;
 }
 
 bool Iim42652::readRaw(uint8_t address, uint8_t& value) {
@@ -466,11 +635,18 @@ uint8_t Iim42652::readRegister(uint8_t address) {
   if (!initialized_) {
     return 0;
   }
-  uint8_t value = 0;
-  if (!setBank(0) || !directRead(address, value)) {
-    return 0;
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    uint8_t value = 0;
+    if (setBank(0) && directRead(address, value)) {
+      // WHO_AM_I is the only read with a known non-zero answer. Retry it so a
+      // single zeroed SPI transfer is not reported as a missing sensor.
+      if (address != MPUREG_WHO_AM_I || value == kWhoAmI) {
+        return value;
+      }
+    }
+    delayMicroseconds(20);
   }
-  return value;
+  return 0;
 }
 
 void Iim42652::start() {
@@ -480,8 +656,9 @@ void Iim42652::start() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
-  fifoErrors_ = 0;
   overflow_ = false;
+  fifoBatchBytes_ = 0;
+  fifoParseOffset_ = 0;
   if (setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
   }
@@ -489,8 +666,9 @@ void Iim42652::start() {
   running_ = rc == INV_ERROR_SUCCESS;
   if (running_) {
     inv_ixm42xxx_reset_fifo(&driver_);
-    // Enabling the accelerometer also enables accel and gyro in FIFO_CONFIG1,
-    // so the packet size must be refreshed after the enable call.
+    // Enabling the accelerometer also enables accel and gyro in FIFO_CONFIG1.
+    // Both fields are required for the 16-byte FIFO packet that carries the
+    // ODR timestamp, so refresh the packet size after the power transition.
     updateFifoPacketSize();
   }
   uint8_t power = 0;
@@ -512,8 +690,9 @@ void Iim42652::standby() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
-  fifoErrors_ = 0;
   overflow_ = false;
+  fifoBatchBytes_ = 0;
+  fifoParseOffset_ = 0;
   if (setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
   }
@@ -524,8 +703,9 @@ void Iim42652::flush() {
   head_ = tail_ = count_ = 0;
   lastFifoBytes_ = 0;
   lastHeader_ = 0;
-  fifoErrors_ = 0;
   overflow_ = false;
+  fifoBatchBytes_ = 0;
+  fifoParseOffset_ = 0;
   if (initialized_ && setBank(0)) {
     inv_ixm42xxx_reset_fifo(&driver_);
   }
@@ -539,47 +719,107 @@ uint16_t Iim42652::available() {
   uint8_t countBytes[2] = {};
   uint16_t packets = 0;
   bool countOk = false;
-  // Immediately after start() the chip can answer FIFO_COUNT with 0xFFFF while
-  // it powers up. Retry before treating that as a real overflow.
-  for (uint8_t attempt = 0; attempt < 3 && !countOk; ++attempt) {
-    if (setBank(0) && readRaw(MPUREG_FIFO_COUNTH, countBytes, 2)) {
+  lastFifoCountAttempts_ = 0;
+  for (uint8_t attempt = 1; attempt <= 3 && !countOk; ++attempt) {
+    lastFifoCountAttempts_ = attempt;
+    if (setBank(0) && directRead(MPUREG_FIFO_COUNTH, countBytes, 2)) {
       packets = static_cast<uint16_t>(countBytes[0]) |
                 (static_cast<uint16_t>(countBytes[1]) << 8);
       countOk = packets <= maxFifoPackets();
     }
-    if (!countOk)
+    if (!countOk) {
       delay(1);
+    }
   }
+  lastFifoCountRaw_ = packets;
+  lastFifoCountOk_ = countOk;
+
   if (!countOk) {
-    overflow_ = true;
-    lastFifoBytes_ = 0xffff;
+    ++fifoConsecutiveFailures_;
+    ++fifoErrorTotal_;
+    lastFifoReadOk_ = false;
+    lastFifoErrorReason_ = "fifo_count_invalid";
+    lastFifoBytes_ = 0;
     head_ = tail_ = count_ = 0;
-    inv_ixm42xxx_reset_fifo(&driver_);
-    return 0;
+    const bool recovered =
+        fifoConsecutiveFailures_ < 3 && recoverFifoState();
+    overflow_ = fifoConsecutiveFailures_ >= 3;
+    Serial.printf("SENSOR_FIFO_ERROR,index=0,count_raw=%u,attempts=%u,"
+                  "buffered=0,header=0x%02X,packet_bytes=%u,consecutive=%u,"
+                  "total=%u,recoveries=%u,reason=%s,recovered=%u,fatal=%u,"
+                  "batch_bytes=%u\n",
+                  lastFifoCountRaw_, lastFifoCountAttempts_, lastHeader_,
+                  packetBytes_, fifoConsecutiveFailures_, fifoErrorTotal_,
+                  fifoRecoveryTotal_, lastFifoErrorReason(), recovered ? 1 : 0,
+                  overflow_ ? 1 : 0, fifoBatchBytes_);
+    return count_;
   }
 
   lastFifoBytes_ = static_cast<uint16_t>(packets * packetBytes_);
   if (packets == 0) {
+    fifoBatchBytes_ = 0;
+    fifoParseOffset_ = 0;
+    lastFifoReadOk_ = true;
     return count_;
   }
 
+  uint32_t bytes = static_cast<uint32_t>(packets) * packetBytes_;
+  if (bytes > kFifoBatchCapacityBytes) {
+    bytes = kFifoBatchCapacityBytes;
+  }
+  fifoBatchBytes_ = static_cast<uint16_t>(bytes);
+  fifoParseOffset_ = 0;
+  if (!setBank(0) ||
+      transport_.read(MPUREG_FIFO_DATA, fifoBatch_, fifoBatchBytes_) != 0) {
+    fifoBatchBytes_ = 0;
+    ++fifoConsecutiveFailures_;
+    ++fifoErrorTotal_;
+    lastFifoReadOk_ = false;
+    lastFifoErrorReason_ = "fifo_batch_read_failed";
+    const bool recovered =
+        fifoConsecutiveFailures_ < 3 && recoverFifoState();
+    overflow_ = fifoConsecutiveFailures_ >= 3;
+    Serial.printf("SENSOR_FIFO_ERROR,index=0,count_raw=%u,attempts=%u,"
+                  "buffered=%u,header=0x%02X,packet_bytes=%u,consecutive=%u,"
+                  "total=%u,recoveries=%u,reason=%s,recovered=%u,fatal=%u,"
+                  "batch_bytes=%u\n",
+                  lastFifoCountRaw_, lastFifoCountAttempts_, count_,
+                  lastHeader_, packetBytes_, fifoConsecutiveFailures_,
+                  fifoErrorTotal_, fifoRecoveryTotal_, lastFifoErrorReason(),
+                  recovered ? 1 : 0, overflow_ ? 1 : 0, fifoBatchBytes_);
+    return count_;
+  }
+
+  uint16_t parsed = 0;
   for (uint16_t i = 0; i < packets; ++i) {
     if (!readFifoPacket()) {
-      // One corrupted record is a gap, not a dead sensor: drop it and let the
-      // caller keep running. Three consecutive failures still raise a fault.
-      ++fifoErrors_;
-      if (fifoErrors_ >= 3) {
-        overflow_ = true;
-      }
-      lastFifoBytes_ = 0;
-      inv_ixm42xxx_reset_fifo(&driver_);
-      Serial.printf("SENSOR_FIFO_ERROR,index=%u,packets=%u,buffered=%u,"
-                    "header=0x%02X,consecutive=%u\n",
-                    i, packets, count_, lastHeader_, fifoErrors_);
+      ++fifoConsecutiveFailures_;
+      ++fifoErrorTotal_;
+      lastFifoReadOk_ = false;
+      const bool recovered =
+          fifoConsecutiveFailures_ < 3 && recoverFifoState();
+      overflow_ = fifoConsecutiveFailures_ >= 3;
+      Serial.printf("SENSOR_FIFO_ERROR,index=%u,count_raw=%u,attempts=%u,"
+                    "buffered=%u,header=0x%02X,packet_bytes=%u,consecutive=%u,"
+                    "total=%u,recoveries=%u,reason=%s,recovered=%u,fatal=%u,"
+                    "batch_bytes=%u\n",
+                    i, lastFifoCountRaw_, lastFifoCountAttempts_, count_,
+                    lastHeader_, packetBytes_, fifoConsecutiveFailures_,
+                    fifoErrorTotal_, fifoRecoveryTotal_, lastFifoErrorReason(),
+                    recovered ? 1 : 0, overflow_ ? 1 : 0, fifoBatchBytes_);
+      Serial.printf("FIFO_RECOVER,reason=%s,available=%u,count_raw=%u,"
+                    "attempts=%u,consecutive=%u,total=%u,header=0x%02X\n",
+                    lastFifoErrorReason(), count_, lastFifoCountRaw_,
+                    lastFifoCountAttempts_, fifoConsecutiveFailures_,
+                    fifoErrorTotal_, lastHeader_);
       return count_;
     }
+    ++parsed;
   }
-  fifoErrors_ = 0;
+  (void)parsed;
+  fifoConsecutiveFailures_ = 0;
+  lastFifoReadOk_ = true;
+  lastFifoErrorReason_ = "none";
   return count_;
 }
 
@@ -605,29 +845,62 @@ uint16_t Iim42652::fifoPacketBytesForHeader(uint8_t header) {
 }
 
 bool Iim42652::readFifoPacket() {
-  if (!setBank(0)) {
+  if (fifoParseOffset_ >= fifoBatchBytes_) {
+    lastFifoErrorReason_ = "fifo_batch_offset_exhausted";
     return false;
   }
-  uint8_t header = 0;
-  if (!directRead(MPUREG_FIFO_DATA, header)) {
-    return false;
-  }
+  uint8_t header = fifoBatch_[fifoParseOffset_++];
   lastHeader_ = header;
   if ((header & FIFO_HEADER_MSG) != 0) {
-    inv_ixm42xxx_reset_fifo(&driver_);
+    lastFifoErrorReason_ = "fifo_message_header";
     return false;
   }
   if ((header & FIFO_HEADER_HEADER_20) != 0) {
+    lastFifoErrorReason_ = "unexpected_20bit_header";
     Serial.printf("SENSOR_FIFO,unexpected_20bit_header=0x%02X\n", header);
-    inv_ixm42xxx_reset_fifo(&driver_);
+    return false;
+  }
+  const bool accel = (header & FIFO_HEADER_ACC) != 0;
+  const bool gyro = (header & FIFO_HEADER_GYRO) != 0;
+  if (!accel && !gyro) {
+    lastFifoErrorReason_ = "header_without_sensor_data";
     return false;
   }
   const uint16_t bytes = fifoPacketBytesForHeader(header);
-  if (bytes > 0 && !directRead(MPUREG_FIFO_DATA, fifoPayload_, bytes)) {
+  if (bytes == 0 ||
+      static_cast<uint32_t>(fifoParseOffset_) + bytes > fifoBatchBytes_) {
+    lastFifoErrorReason_ = "fifo_batch_packet_truncated";
     return false;
   }
+  memcpy(fifoPayload_, &fifoBatch_[fifoParseOffset_], bytes);
+  fifoParseOffset_ = static_cast<uint16_t>(fifoParseOffset_ + bytes);
   packetBytes_ = static_cast<uint16_t>(kFifoHeaderBytes + bytes);
-  if ((header & FIFO_HEADER_ACC) == 0) {
+
+  lastFifoTimestamp_ = 0;
+  lastFifoTimestampValid_ = false;
+  const bool timestampPresent =
+      (header & (FIFO_HEADER_TMST | FIFO_HEADER_FSYNC)) != 0;
+  if (timestampPresent) {
+    uint16_t offset = 0;
+    if (accel) {
+      offset += kFifoAxisBytes;
+    }
+    if (gyro) {
+      offset += kFifoAxisBytes;
+    }
+    offset += kFifoTempBytes;
+    if (offset + kFifoTimeBytes <= bytes) {
+      // The datasheet stores FIFO timestamp MSB first: TimeStamp[15:8],
+      // then TimeStamp[7:0]. This field is the ODR interval, not wall time.
+      lastFifoTimestamp_ =
+          static_cast<uint16_t>((fifoPayload_[offset] << 8) |
+                                fifoPayload_[offset + 1]);
+      lastFifoTimestampValid_ =
+          (header & (FIFO_HEADER_TMST | FIFO_HEADER_FSYNC)) == FIFO_HEADER_TMST;
+    }
+  }
+
+  if (!accel) {
     return true;
   }
   const bool bigEndian =
@@ -646,15 +919,38 @@ bool Iim42652::readFifoPacket() {
   }
   if (count_ >= kSampleCapacity) {
     overflow_ = true;
+    lastFifoErrorReason_ = "sample_queue_overflow";
     return true;
   }
-  samples_[tail_] = sample;
+  samples_[tail_] = {sample, lastFifoTimestamp_, lastHeader_, packetBytes_,
+                     lastFifoTimestampValid_};
   tail_ = static_cast<uint16_t>((tail_ + 1) % kSampleCapacity);
   ++count_;
   return true;
 }
 
 bool Iim42652::read(AccelSample& sample) {
+  FifoSample item = {};
+  if (!read(item)) {
+    return false;
+  }
+  sample = item.accel;
+  return true;
+}
+
+bool Iim42652::read(AccelSample& sample, uint16_t& fifoTimestamp,
+                    bool& timed) {
+  FifoSample item = {};
+  if (!read(item)) {
+    return false;
+  }
+  sample = item.accel;
+  fifoTimestamp = item.timestamp;
+  timed = item.timed;
+  return true;
+}
+
+bool Iim42652::read(FifoSample& sample) {
   if (count_ == 0) {
     return false;
   }
@@ -663,6 +959,7 @@ bool Iim42652::read(AccelSample& sample) {
   --count_;
   return true;
 }
+
 
 bool Iim42652::readDirect(AccelSample& sample) {
   if (!initialized_) {
@@ -708,7 +1005,8 @@ void Iim42652::onEvent(const inv_ixm42xxx_sensor_event_t& event) {
     overflow_ = true;
     return;
   }
-  samples_[tail_] = {event.accel[0], event.accel[1], event.accel[2]};
+  samples_[tail_] = {{event.accel[0], event.accel[1], event.accel[2]}, 0, 0,
+                     0, false};
   tail_ = static_cast<uint16_t>((tail_ + 1) % kSampleCapacity);
   ++count_;
 }
