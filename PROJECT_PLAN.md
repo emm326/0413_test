@@ -4,14 +4,14 @@
 
 - 更新日期：2026-11-16（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`a671bb9`（时钟与启动采样加固）；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：阶段4～5进行中。GPIO36外部32kHz在本板上无法稳定输出，固件已自动回退到IIM42652内部时钟；FIFO内建时间戳已接入样本时间。单节点50Hz连续60秒采样验收通过，无丢样和FIFO错误；正式tx固件射频初始化通过。实际LoRa上行与GNSS/PPS联合验收仍未完成。
+- 本轮 Git 基线：`a4b04ee`（更新项目特点与室外GNSS测试计划）；驱动恢复提交：`4cadadd`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 当前步骤：阶段4～5进行中。室外GNSS/PPS第一步已通过：`fix=1/pps=1/time=1/healthy=1`，PPS间隔约999981µs；GPIO36外部32kHz不可用，传感器使用内部时钟，因此`clock_ok=0`仍阻断正式采样。单节点50Hz连续60秒台架采样已通过；实际LoRa上行和GNSS/PPS联合采样未完成。
 - 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
-- 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36。COM8已完成bench与tx两次烧录。节点1003、±4g、50Hz配置不变。
+- 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
 - 本轮实施范围：把六线验证通过的原厂链路移植到正式驱动，保留NodeApp公共接口；增加物理寄存器读回、FIFO包长统计和安全关闭。IIM42352实现不动。
-- 当前报告：[IIM42652内部时钟与FIFO时间戳恢复](docs/changes/2026-11-16_02_IIM42652内部时钟与FIFO时间戳恢复.md)；[交接文档](docs/HANDOVER.md)。
+- 当前报告：[室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)；[交接文档](docs/HANDOVER.md)。
 - 本轮验收门槛：启动自检`ok=1`；连续60秒采样不进入Fault；有效样本约3000条；相邻样本间隔接近20ms；记录FIFO计数、包头、失败原因和连续失败次数；bench与正式tx环境均构建，烧录和LoRa结果分别记录。
 - 本轮实测（2026-11-16）：20秒run7007 valid=995、60秒run7008 valid=2973；两项测试invalid=0、fifo_errors=0、lost_samples=0、dt_mean=19999µs。60秒测试有2条时间戳异常，按标称20ms回退，无Fault。正式tx启动READY,sensor=1,radio=1；室内gps=0、clock_ok=0，未启动采样；网关192.168.1.10不可达，未完成无线上行。
 - 本轮软件回归（2026-11-16）：tests.test_firmware_sensor 3/3通过；bench与tx环境构建通过。完整unittest 86项中20项通过，66项仅在Windows临时目录清理阶段报PermissionError，无断言失败。
@@ -29,7 +29,7 @@
 - 前轮软件验证（2026-11-11）：EoRa + IIM42652、Heltec + IIM42352 两个代表环境构建通过；EoRa 修复固件烧录及 Flash 校验通过；现有 Python 测试 32/32 通过。此处为2026-11-11历史结果，本轮最小诊断与恢复另列。
 - 历史软件验证：清理前后 E870 测试各 32 项通过；四种正式环境及四种 USB 环境 clean 后全量构建 8/8 通过。历史八环境结果与本轮两环境结果分开记录。
 - 已知边界：严格结束区间尚无样本级终点过滤；手动 STOP 和取消启动均依赖无线接收，不能保证瞬时同时停止或全有全无启动。详见 [设备能力核查](docs/e870_capability_review.md)。
-- 下一步：在室外完成GNSS/PPS锁定后启动正式50Hz采样，确认`gps=1/clock_ok=1`；连接E870网关验证STATUS与SAMPLE实际上行；联合验收通过后再进入8节点100Hz。
+- 下一步：先修正内部时钟模式下`clock_ok`的判定，再启动室外正式50Hz采样；确认`gps=1/clock_ok=1`后连接E870网关验证STATUS与SAMPLE实际上行；联合验收通过后再进入8节点100Hz。
 
 
 ## 当前项目特点
@@ -475,9 +475,19 @@
 - 验证：清理前后各 32 项测试通过，八环境 clean/build 全部通过；保护清单和关键文件哈希无差异；17 个本地文档链接有效，现行依赖检查通过。
 - Git：旧工程保存在清理前标签；本轮提交仅含工程与文档清理，不含日志、数据或构建产物。
 
+## 2026-11-16 室外 GNSS 与 PPS 第一步验收
+
+- 状态：已完成（室外 GNSS 定位和 PPS 锁定）；待修复（内部时钟模式下的正式采样门槛）。
+- Git 基线：`a4b04ee`；本轮新增 `GPS_DIAG` 诊断命令和原始 PPS 边沿计数。
+- 现场条件：设备位于室外，GNSS 模块 PPS 指示灯闪烁；GNSS RX/TX/PPS 分别为 GPIO16/GPIO15/GPIO41。
+- 实机结果：COM8 连续查询 30 秒，`fix=1,pps=1,time=1,healthy=1`；PPS 间隔 `999980～999983µs`；PPS 计数每 2 秒增加 2；`pps_bad` 保持 40122 不再增加；`timer_jumps=0`。
+- 门槛结果：`STATUS` 显示 `gps=1,clock_ok=0,clock_hz=22.9167,ppm=-999283.88`。外部 GPIO36 32kHz 不可用，传感器已回退到内部时钟；该测量无效，不能用于内部时钟健康判定。
+- 结论：GNSS/PPS 第一步通过，正式采样仍被 `clock_ok=0` 阻止；日志和构建产物不提交。
+- 报告：[室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)。
+- 下一步：修正内部时钟模式的 `clock_ok`，重跑正式50Hz采样；再验证 E870 的 STATUS/SAMPLE 上行。
 ## 报告索引
 
-1. [更换传感器后的六线复测](docs/changes/2026-11-15_03_更换传感器后的六线复测.md)
+1. [室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)
 
 已提交的历史轮次报告通过Git查询；changes/只保留当前轮报告。上一轮交接报告已转入diagnostics/，长期诊断文档继续原位保留。
 

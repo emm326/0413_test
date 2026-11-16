@@ -564,6 +564,20 @@ void NodeApp::serialCommands() {
       report(Status);
       continue;
     }
+    if (!strcmp(serialLine_, "GPS_DIAG")) {
+      Serial.printf("GPS_DIAG,fix=%u,pps=%u,time=%u,healthy=%u,"
+                    "pps_count=%lu,pps_interval_us=%lu,age_ms=%lu,"
+                    "pps_bad=%lu,timer_jumps=%lu,last_pps_epoch_us=%llu\n",
+                    gps_.fixValid() ? 1 : 0, gps_.ppsValid() ? 1 : 0,
+                    gps_.timeValid() ? 1 : 0, gps_.healthy() ? 1 : 0,
+                    (unsigned long)gps_.ppsCount(),
+                    (unsigned long)gps_.ppsIntervalUs(),
+                    (unsigned long)gps_.timebaseAgeMs(),
+                    (unsigned long)gps_.ppsBadCount(),
+                    (unsigned long)gps_.localTimerJumpCount(),
+                    (unsigned long long)gps_.epochUsAtLastPps());
+      continue;
+    }
     unsigned long long when = 0;
     unsigned rate = 0, range = 4;
     unsigned long run = 0, duration = 0;

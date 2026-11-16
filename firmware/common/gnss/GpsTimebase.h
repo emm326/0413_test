@@ -25,6 +25,7 @@ class GpsTimebase {
   uint32_t ppsIntervalUs() const;
   uint32_t timebaseAgeMs() const;
   uint32_t ppsBadCount() const;
+  uint32_t ppsCount() const { return ppsCount_; }
   uint32_t localTimerJumpCount() const;
 
  private:
