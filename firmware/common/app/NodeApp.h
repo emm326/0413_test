@@ -26,6 +26,7 @@ class NodeApp {
   void communicate();
   void report(uint8_t type);
   uint16_t flags() const;
+  bool samplingClockHealthy() const;
   uint64_t epoch(uint64_t local) const;
   void resetEdges();
   void detachSensorInterrupt();

@@ -23,6 +23,13 @@ constexpr bool startupPassed(const StartupCheck& check,
          check.fifoSamples >= 4 && check.fifoSamples <= 30 &&
          check.fifoCountValid && check.sampleValid && check.identityValid;
 }
+// External CLKIN must be measured against PPS. In sensor-internal mode the
+// oscillator is qualified by the sensor startup/FIFO checks instead, so a
+// missing GPIO36 carrier is expected and must not block capture.
+constexpr bool clockReadyForCapture(bool externalClock, bool externalMeasured,
+                                    bool sensorReady) {
+  return sensorReady && (!externalClock || externalMeasured);
+}
 constexpr bool canRetry(WireProtocol::State state, bool sensorActive, uint16_t queued) {
   return (state == WireProtocol::Waiting || state == WireProtocol::Fault) &&
          !sensorActive && queued == 0;

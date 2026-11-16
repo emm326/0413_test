@@ -531,6 +531,7 @@ void invalidSettings() {
 
 void startupPolicy() {
   using SensorChecks::StartupCheck;
+  using SensorChecks::clockReadyForCapture;
   using SensorChecks::startupPassed;
   StartupCheck good{12, 12, 3840, true, true, true};
   require(startupPassed(good), "normal startup rejected");
@@ -548,6 +549,14 @@ void startupPolicy() {
           "internal-clock startup rejected without DRDY");
   require(!startupPassed(internalClock, true),
           "external-clock startup passed without CLKIN edges");
+  require(clockReadyForCapture(false, false, true),
+          "internal clock blocked capture after sensor startup");
+  require(!clockReadyForCapture(false, false, false),
+          "internal clock passed before sensor startup");
+  require(!clockReadyForCapture(true, false, true),
+          "unmeasured external clock passed capture gate");
+  require(clockReadyForCapture(true, true, true),
+          "measured external clock failed capture gate");
   bad = good;
   bad.fifoSamples = 3;
   require(!startupPassed(bad), "short FIFO passed startup");

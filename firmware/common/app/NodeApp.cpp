@@ -86,9 +86,10 @@ void NodeApp::begin() {
   // CLKIN pin is unusable.
   state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
   Serial.printf("READY,sensor=%u,radio=%u,clock_output=%u,clock_source=%s,"
-                "clock_measurement=wait_60_pps\n",
+                "clock_measurement=%s\n",
                 sensorReady_, radioReady_, clockOutputReady_,
-                externalClock_ ? "external" : "sensor_internal");
+                externalClock_ ? "external" : "sensor_internal",
+                externalClock_ ? "wait_60_pps" : "sensor_internal_fifo");
   lastStatus_ = millis() + ((Config::nodeId - 1001) % 16) * 120;
 }
 bool NodeApp::initializeSensor(bool resetDevice) {
@@ -280,8 +281,11 @@ uint64_t NodeApp::epoch(uint64_t local) const {
   return value > 0 ? uint64_t(value) : 0;
 }
 uint16_t NodeApp::flags() const {
-  return (gps_.healthy() ? GpsHealthy : 0) | (clock_.healthy() ? ClockHealthy : 0) |
+  return (gps_.healthy() ? GpsHealthy : 0) | (samplingClockHealthy() ? ClockHealthy : 0) |
          (gap_ ? SampleGap : 0) | (overflow_ ? QueueOverflow : 0);
+}
+bool NodeApp::samplingClockHealthy() const {
+  return SensorChecks::clockReadyForCapture(externalClock_, clock_.healthy(), sensorReady_);
 }
 void NodeApp::tick() {
   gps_.update();
@@ -331,7 +335,7 @@ void NodeApp::tick() {
   commands();
   const uint64_t now = epoch(esp_timer_get_time());
   if (state_ == Armed && now && now + Config::warmupUs >= startEpoch_) {
-    if (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !clock_.healthy())) {
+    if (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !samplingClockHealthy())) {
       result_ = NotReady;
       state_ = Waiting;
       replyPending_ = true;
@@ -374,10 +378,12 @@ void NodeApp::tick() {
       diagIntervalMin_, diagIntervalMax_);
     diagEdges_ = edgeTotal; diagLastClock_ = edgesNow;
     Serial.printf(
-        "STATUS,id=%u,state=%u,gps=%u,clock_hz=%.4f,ppm=%.2f,clock_ok=%u,queue=%u,lost_samples=%lu,"
-        "lost_packets=%lu\n",
-        Config::nodeId, state_, gps_.healthy(), clock_.hz(), clock_.ppm(), clock_.healthy(),
-        queue_.size(), (unsigned long)lostSamples_, (unsigned long)lostPackets_);
+        "STATUS,id=%u,state=%u,gps=%u,clock_hz=%.4f,ppm=%.2f,clock_ok=%u,"
+        "clock_source=%s,queue=%u,lost_samples=%lu,lost_packets=%lu\n",
+        Config::nodeId, state_, gps_.healthy(), clock_.hz(), clock_.ppm(),
+        samplingClockHealthy() ? 1 : 0,
+        externalClock_ ? "external" : "sensor_internal", queue_.size(),
+        (unsigned long)lostSamples_, (unsigned long)lostPackets_);
   }
   delay(1);
 }
@@ -394,7 +400,7 @@ void NodeApp::acceptStart(const Header& h, const StartOptions& options) {
     return;
   }
   if (state_ == Fault || !sensorReady_ ||
-      (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !clock_.healthy()))) {
+      (APP_REQUIRE_TIME_SYNC && (!gps_.healthy() || !samplingClockHealthy()))) {
     result_ = NotReady;
     return;
   }

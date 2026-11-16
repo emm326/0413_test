@@ -4,14 +4,14 @@
 
 - 更新日期：2026-11-16（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
-- 本轮 Git 基线：`a4b04ee`（更新项目特点与室外GNSS测试计划）；驱动恢复提交：`4cadadd`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：阶段4～5进行中。室外GNSS/PPS第一步60秒复测通过：30/30次`healthy=1`，PPS间隔999980～999983µs，坏边沿增量为0，STATUS 12/12次`gps=1`；GPIO36外部32kHz不可用，传感器使用内部时钟，因此12/12次`clock_ok=0`仍阻断正式采样。
+- 本轮 Git 基线：`cb099e7`（完成室外GNSS与PPS六十秒复测）；驱动恢复提交：`4cadadd`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 当前步骤：阶段4～5进行中。传感器内部时钟采样门槛已修复；USB测试run7010完成60秒、2973条有效样本，FIFO错误/非法样本/丢样/时间戳异常均为0。正式tx run7011完成10秒、500条有效样本，`READY,sensor=1,radio=1`，`gps=1,clock_ok=1,clock_source=sensor_internal`；实际LoRa上行待网关在线验收。
 - 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
 - 本轮实施范围：把六线验证通过的原厂链路移植到正式驱动，保留NodeApp公共接口；增加物理寄存器读回、FIFO包长统计和安全关闭。IIM42352实现不动。
-- 当前报告：[室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)；[交接文档](docs/HANDOVER.md)。
+- 当前报告：[内部时钟采样门槛修复](docs/changes/2026-11-16_04_内部时钟采样门槛修复.md)；[交接文档](docs/HANDOVER.md)。
 - 本轮验收门槛：启动自检`ok=1`；连续60秒采样不进入Fault；有效样本约3000条；相邻样本间隔接近20ms；记录FIFO计数、包头、失败原因和连续失败次数；bench与正式tx环境均构建，烧录和LoRa结果分别记录。
 - 本轮实测（2026-11-16）：20秒run7007 valid=995、60秒run7008 valid=2973；两项测试invalid=0、fifo_errors=0、lost_samples=0、dt_mean=19999µs。60秒测试有2条时间戳异常，按标称20ms回退，无Fault。正式tx启动READY,sensor=1,radio=1；室内gps=0、clock_ok=0，未启动采样；网关192.168.1.10不可达，未完成无线上行。
 - 本轮软件回归（2026-11-16）：tests.test_firmware_sensor 3/3通过；bench与tx环境构建通过。完整unittest 86项中20项通过，66项仅在Windows临时目录清理阶段报PermissionError，无断言失败。
@@ -29,7 +29,7 @@
 - 前轮软件验证（2026-11-11）：EoRa + IIM42652、Heltec + IIM42352 两个代表环境构建通过；EoRa 修复固件烧录及 Flash 校验通过；现有 Python 测试 32/32 通过。此处为2026-11-11历史结果，本轮最小诊断与恢复另列。
 - 历史软件验证：清理前后 E870 测试各 32 项通过；四种正式环境及四种 USB 环境 clean 后全量构建 8/8 通过。历史八环境结果与本轮两环境结果分开记录。
 - 已知边界：严格结束区间尚无样本级终点过滤；手动 STOP 和取消启动均依赖无线接收，不能保证瞬时同时停止或全有全无启动。详见 [设备能力核查](docs/e870_capability_review.md)。
-- 下一步：先修正内部时钟模式下`clock_ok`的判定，再启动室外正式50Hz采样；确认`gps=1/clock_ok=1`后连接E870网关验证STATUS与SAMPLE实际上行；联合验收通过后再进入8节点100Hz。
+- 下一步：启动E870网关和上位机，对节点1003完成正式50Hz START；核对CONFIRM、STATUS、SAMPLE、到达率和补传率；通过后再进入1→2→4→8节点扩容。
 
 
 ## 当前项目特点
@@ -37,9 +37,9 @@
 - 设备链路：EoRa-S3-400TB + IIM42652 + E870 网关，节点 1003，上行 470.7 MHz，采样 50 Hz、±4 g。
 - 时间基准：优先使用 GPIO36 输出的 32 kHz CLKIN；外部时钟不可用时自动回退到 IIM42652 内部时钟。样本间隔使用 FIFO 内建时间戳，不依赖 INT1 边沿计时。
 - 采样可靠性：FIFO 每 5 ms 轮询一次，SPI 批量读取整批数据；单次 FIFO 故障执行受控恢复，连续 3 次失败才进入 Fault。
-- 启动门槛：正式模式要求 GNSS/PPS 健康；bench 模式允许室内无 GNSS 采样，但 GPS 标志保持 0。
+- 启动门槛：正式模式要求 GNSS/PPS 健康。外部CLKIN模式还要求60秒32kHz测量通过；传感器内部时钟模式要求启动自检和FIFO健康检查通过，`STATUS`用`clock_source`明确来源。bench模式允许室内无GNSS采样，但GPS标志保持0。
 - 构建用途：`eora_s3_400_iim42652_tx` 用于正式部署；`eora_s3_400_iim42652_usb_test` 保留正式时间门槛并输出串口样本；`eora_s3_400_iim42652_bench` 用于无 GNSS 台架诊断。
-- 当前验证边界：单节点 50 Hz 连续 60 秒采样已通过；实际 LoRa 空口收发、GNSS/PPS 联合采样和 8 节点 100 Hz 仍待实测。
+- 当前验证边界：单节点50Hz室外GNSS/PPS联合采样已完成USB 60秒和正式tx 10秒验证；实际LoRa ACK、正式60秒空口联调和8节点100Hz仍待实测。
 
 ## 本次修改内容（提交 4cadadd）
 
@@ -485,9 +485,20 @@
 - 结论：GNSS/PPS 第一步通过，正式采样仍被 `clock_ok=0` 阻止；日志和构建产物不提交。
 - 报告：[室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)。
 - 下一步：修正内部时钟模式的 `clock_ok`，重跑正式50Hz采样；再验证 E870 的 STATUS/SAMPLE 上行。
+## 2026-11-16 内部时钟采样门槛修复
+
+- 状态：已完成（USB 60秒采样与正式tx 10秒采样）；待实测（E870实际上行）。
+- Git基线：`cb099e7`。新增`clockReadyForCapture()`：外部CLKIN要求PPS频率测量通过，内部时钟要求传感器启动自检和FIFO健康检查通过。
+- 文件：`firmware/common/sensor/StartupCheck.h`、`firmware/common/app/NodeApp.cpp/.h`、`tests/firmware_sensor_transport.cpp`。
+- 状态输出：`STATUS`增加`clock_source`；内部模式显示`clock_hz=0.0000,clock_ok=1,clock_source=sensor_internal`，不把0频率误报为故障。
+- 软件：`tests.test_firmware_sensor`3/3通过；USB与tx环境均构建、烧录和Hash校验通过。
+- 实机：run7010为50Hz/±4g/60秒，2973条有效样本，FIFO错误0、非法样本0、丢样0、时间戳异常0，平均间隔19999~20000µs；run7011正式tx为10秒500条有效样本，节点正常standby。
+- 接线和配置不变；当前设备保留正式`eora_s3_400_iim42652_tx`固件。日志、构建产物不提交。
+- 报告：[内部时钟采样门槛修复](docs/changes/2026-11-16_04_内部时钟采样门槛修复.md)。
+- 下一步：E870网关在线后验收CONFIRM、STATUS、SAMPLE和到达率，再进入多节点扩容。
 ## 报告索引
 
-1. [室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)
+1. [内部时钟采样门槛修复](docs/changes/2026-11-16_04_内部时钟采样门槛修复.md)
 
 已提交的历史轮次报告通过Git查询；changes/只保留当前轮报告。上一轮交接报告已转入diagnostics/，长期诊断文档继续原位保留。
 
