@@ -5,7 +5,7 @@
 - 更新日期：2026-11-16（Asia/Hong_Kong）
 - 当前分支：`codex/sensor-recovery-20261114`。
 - 本轮 Git 基线：`a4b04ee`（更新项目特点与室外GNSS测试计划）；驱动恢复提交：`4cadadd`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
-- 当前步骤：阶段4～5进行中。室外GNSS/PPS第一步已通过：`fix=1/pps=1/time=1/healthy=1`，PPS间隔约999981µs；GPIO36外部32kHz不可用，传感器使用内部时钟，因此`clock_ok=0`仍阻断正式采样。单节点50Hz连续60秒台架采样已通过；实际LoRa上行和GNSS/PPS联合采样未完成。
+- 当前步骤：阶段4～5进行中。室外GNSS/PPS第一步60秒复测通过：30/30次`healthy=1`，PPS间隔999980～999983µs，坏边沿增量为0，STATUS 12/12次`gps=1`；GPIO36外部32kHz不可用，传感器使用内部时钟，因此12/12次`clock_ok=0`仍阻断正式采样。
 - 提交约定：本轮阶段1～3完成后提交代码、测试和文档；实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
@@ -480,7 +480,7 @@
 - 状态：已完成（室外 GNSS 定位和 PPS 锁定）；待修复（内部时钟模式下的正式采样门槛）。
 - Git 基线：`a4b04ee`；本轮新增 `GPS_DIAG` 诊断命令和原始 PPS 边沿计数。
 - 现场条件：设备位于室外，GNSS 模块 PPS 指示灯闪烁；GNSS RX/TX/PPS 分别为 GPIO16/GPIO15/GPIO41。
-- 实机结果：COM8 连续查询 30 秒，`fix=1,pps=1,time=1,healthy=1`；PPS 间隔 `999980～999983µs`；PPS 计数每 2 秒增加 2；`pps_bad` 保持 40122 不再增加；`timer_jumps=0`。
+- 实机结果：提交`1b76a12`后从COM8连续复测60秒，30/30次`fix=1,pps=1,time=1,healthy=1`；PPS间隔`999980～999983µs`；`pps_bad_delta=0`；STATUS 12/12次`gps=1`。
 - 门槛结果：`STATUS` 显示 `gps=1,clock_ok=0,clock_hz=22.9167,ppm=-999283.88`。外部 GPIO36 32kHz 不可用，传感器已回退到内部时钟；该测量无效，不能用于内部时钟健康判定。
 - 结论：GNSS/PPS 第一步通过，正式采样仍被 `clock_ok=0` 阻止；日志和构建产物不提交。
 - 报告：[室外GNSS与PPS诊断](docs/changes/2026-11-16_03_室外GNSS与PPS诊断.md)。
