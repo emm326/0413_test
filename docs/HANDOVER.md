@@ -3,6 +3,7 @@
 交接日期：2026-11-16（Asia/Hong_Kong）
 仓库分支：`codex/20261116-baseline`（远程：`origin/codex/20261116-baseline`；后续修改在此分支，不合并 `main`）
 当前功能固件提交：`cb99db0`（fix: 增加传感器启动自动恢复与时钟回退）
+已验证固件说明：`docs/verified_firmware_2026-11-16.md`（标签 `verified/2026-11-16-tx-50hz`）
 交接文档提交：以 `git log -1 --oneline` 为准
 工作区状态：本轮提交后干净
 

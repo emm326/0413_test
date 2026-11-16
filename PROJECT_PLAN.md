@@ -4,14 +4,15 @@
 
 - 更新日期：2026-11-16（Asia/Hong_Kong）
 - 当前分支：`codex/20261116-baseline`（远程：`origin/codex/20261116-baseline`；后续修改都在此分支，不合并到 `main`）。
-- 本轮 Git 基线：`fb35474`（docs(2026-11-16): 记录远程分支与后续提交规则）。驱动与采样逻辑提交：`cb99db0`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 本轮 Git 基线：`16cc1a1`（docs(2026-11-16): 记录正式tx 50Hz采样复测通过）。固件源码提交：`cb99db0`；验证标签：`verified/2026-11-16-tx-50hz`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
 - 当前步骤：阶段4～5进行中。2026-11-16 21:52正式tx固件完成室外50 Hz、60秒采样：valid=2972、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999µs；GNSS为fix=1、pps=1、healthy=1。启动时传感器3次自检均报vendor_init，执行一次SENSOR_RETRY后恢复state=1；采样使用传感器内部时钟，clock_ok=1。
 - 提交约定：从 2026-11-16 起，每次修改都带日期并提交到当前日期分支。分支名使用 `codex/YYYYMMDD-主题`；提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件名以 `YYYY-MM-DD_序号_主题.md` 开头，正文记录更新日期。本分支已推送到 `origin`；后续修改提交后同步推送到该分支，未经明确要求不合并到 `main`。实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
 - 本轮实施范围：核对固件版本一致性，烧录正式tx固件，在室外GNSS健康条件下完成60秒50Hz采样复测；不改驱动、接线和LoRa参数。
-- 当前报告：[正式tx固件50Hz采样复测通过](docs/changes/2026-11-16_09_正式固件采样复测通过.md)；上一轮报告内容保留在 Git 历史；[交接文档](docs/HANDOVER.md)。
+- 当前报告：[成功固件提交与说明](docs/changes/2026-11-16_10_成功固件提交与说明.md)；[已验证固件说明](docs/verified_firmware_2026-11-16.md)；[交接文档](docs/HANDOVER.md)。
+- 已验证固件：固件源码`cb99db0`，Git标签`verified/2026-11-16-tx-50hz`；正式tx环境60秒50Hz采样通过，详细校验值和复现步骤见已验证固件说明。
 - 本轮验收门槛：启动自检`ok=1`；连续60秒采样不进入Fault；有效样本约3000条；相邻样本间隔接近20ms；记录FIFO计数、包头、失败原因和连续失败次数；bench与正式tx环境均构建，烧录和LoRa结果分别记录。
 - 本轮实测（2026-11-16）：20秒run7007 valid=995、60秒run7008 valid=2973；两项测试invalid=0、fifo_errors=0、lost_samples=0、dt_mean=19999µs。60秒测试有2条时间戳异常，按标称20ms回退，无Fault。正式tx启动READY,sensor=1,radio=1；室内gps=0、clock_ok=0，未启动采样；网关192.168.1.10不可达，未完成无线上行。
 - 正式tx复测（2026-11-16 21:52）：run7010，50Hz/±4g保持60秒，valid=2972、invalid=0、lost_samples=0、ts_anomaly=0、fifo_errors=0、dt_mean=19999µs、dt_min=19985µs、dt_max=20002µs；队列119包因E870未上线未获ACK，节点保持state=4。
@@ -31,7 +32,7 @@
 - 历史软件验证：清理前后 E870 测试各 32 项通过；四种正式环境及四种 USB 环境 clean 后全量构建 8/8 通过。历史八环境结果与本轮两环境结果分开记录。
 - 已知边界：严格结束区间尚无样本级终点过滤；手动 STOP 和取消启动均依赖无线接收，不能保证瞬时同时停止或全有全无启动。详见 [设备能力核查](docs/e870_capability_review.md)。
 - 下一步：恢复E870网关和上位机，核对CONFIRM、STATUS、SAMPLE、到达率和补传率；通过后再进入1→2→4→8节点50Hz扩容。
-
+- 下一步：启动E870网关，接收并清除节点队列中的119个测试包，核对CONFIRM、STATUS、SAMPLE和到达率；通过后再进入1→2→4→8节点50Hz扩容。
 
 ## 2026-11-16 启动故障自动恢复
 
