@@ -15,6 +15,8 @@
 #include "sensor/StartupCheck.h"
 #include "sensors/iim42652/Driver.h"
 
+uint8_t readFifoByteForTest();
+
 struct Write {
   uint8_t reg;
   uint8_t value;
@@ -39,6 +41,9 @@ struct Bus {
   }
 
   uint8_t read(uint8_t reg) {
+    if (bank == 0 && reg == MPUREG_FIFO_DATA) {
+      return readFifoByteForTest();
+    }
     return regs[bank][reg & 0x7f];
   }
 
@@ -81,6 +86,10 @@ uint8_t SPIClass::transfer(uint8_t value) {
     return 0;
   }
   if (reading_) {
+    // FIFO_DATA streams bytes without advancing into the next register.
+    if (address_ == MPUREG_FIFO_DATA) {
+      return readFifoByteForTest();
+    }
     return bus.read(address_++);
   }
   bus.write(address_++, value);
@@ -104,6 +113,31 @@ struct VendorState {
   std::vector<AccelSample> events;
 } vendor;
 
+std::vector<uint8_t> fifoStream;
+std::size_t fifoPos = 0;
+
+void buildFifoStream() {
+  fifoStream.clear();
+  fifoPos = 0;
+  for (const AccelSample& sample : vendor.events) {
+    fifoStream.push_back(FIFO_HEADER_ACC | FIFO_HEADER_GYRO | FIFO_HEADER_TMST);
+    const int16_t axis[3] = {sample.x, sample.y, sample.z};
+    for (int16_t value : axis) {
+      fifoStream.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+      fifoStream.push_back(static_cast<uint8_t>(value & 0xff));
+    }
+    for (int i = 0; i < 6 + 1 + 2; ++i) {
+      fifoStream.push_back(0);
+    }
+  }
+}
+
+uint8_t readFifoByteForTest() {
+  if (fifoStream.empty()) {
+    buildFifoStream();
+  }
+  return fifoPos < fifoStream.size() ? fifoStream[fifoPos++] : 0;
+}
 extern "C" int inv_ixm42xxx_init(struct inv_ixm42xxx* s,
                                   struct inv_ixm42xxx_serif* serif,
                                   void (*callback)(inv_ixm42xxx_sensor_event_t*)) {
@@ -111,6 +145,8 @@ extern "C" int inv_ixm42xxx_init(struct inv_ixm42xxx* s,
   s->transport.serif = *serif;
   s->sensor_event_cb = callback;
   s->endianess_data = IXM42XXX_INTF_CONFIG0_DATA_BIG_ENDIAN;
+  // The real chip powers up with 20-bit FIFO packets enabled.
+  bus.regs[0][MPUREG_FIFO_CONFIG1] = BIT_FIFO_CONFIG1_HIRES_MASK;
   return vendor.initRc;
 }
 
@@ -127,9 +163,12 @@ extern "C" int inv_ixm42xxx_read_reg(struct inv_ixm42xxx* s, uint8_t reg,
     const uint8_t address = static_cast<uint8_t>((reg + i) & 0x7f);
     uint8_t value = 0;
     if (bank == 0 && address == MPUREG_FIFO_COUNTH) {
+
       value = static_cast<uint8_t>(vendor.packets & 0xff);
     } else if (bank == 0 && address == MPUREG_FIFO_COUNTH + 1) {
       value = static_cast<uint8_t>((vendor.packets >> 8) & 0xff);
+    } else if (bank == 0 && address == MPUREG_FIFO_DATA) {
+      value = readFifoByteForTest();
     } else {
       value = bus.regs[bank][address];
     }
@@ -182,7 +221,10 @@ extern "C" int inv_ixm42xxx_configure_fifo(
   bus.regs[0][MPUREG_FIFO_CONFIG] =
       static_cast<uint8_t>(IXM42XXX_FIFO_CONFIG_MODE_STOP_ON_FULL);
   bus.regs[0][MPUREG_FIFO_CONFIG1] = static_cast<uint8_t>(
-      BIT_FIFO_CONFIG1_TEMP_MASK | BIT_FIFO_CONFIG1_TMST_FSYNC_MASK);
+      (bus.regs[0][MPUREG_FIFO_CONFIG1] &
+       ~(BIT_FIFO_CONFIG1_ACCEL_MASK | BIT_FIFO_CONFIG1_GYRO_MASK)) |
+      BIT_FIFO_CONFIG1_TEMP_MASK | BIT_FIFO_CONFIG1_TMST_FSYNC_MASK |
+      BIT_FIFO_CONFIG1_WM_GT_TH_MASK);
   return 0;
 }
 
@@ -191,6 +233,12 @@ extern "C" int inv_ixm42xxx_configure_fifo_wm(struct inv_ixm42xxx* s,
   (void)s;
   vendor.watermark = watermark;
   bus.regs[0][MPUREG_FIFO_CONFIG2] = static_cast<uint8_t>(watermark);
+  return 0;
+}
+
+extern "C" int inv_ixm42xxx_disable_high_resolution_fifo(
+    struct inv_ixm42xxx* s) {
+  s->fifo_highres_enabled = 0;
   return 0;
 }
 
@@ -284,6 +332,8 @@ void resetState() {
   bus.mode = 0;
   bus.selected = false;
   vendor = VendorState{};
+  fifoStream.clear();
+  fifoPos = 0;
 }
 
 void require(bool condition, const char* message) {
@@ -329,6 +379,9 @@ void driverConfiguration() {
   require(vendor.fifoConfig == INV_IXM42XXX_FIFO_ENABLED,
           "FIFO was not enabled");
   require(vendor.watermark == 1, "FIFO watermark is not one packet");
+  require((bus.regs[0][MPUREG_FIFO_CONFIG1] &
+           BIT_FIFO_CONFIG1_HIRES_MASK) == 0,
+          "high-resolution FIFO was not disabled");
   require(vendor.int1Fifo == INV_IXM42XXX_ENABLE,
           "INT1 FIFO threshold was not enabled");
 
@@ -345,12 +398,12 @@ void fifoOrderAndCount() {
   Iim42652 sensor;
   require(sensor.begin(false, true), "initialization failed");
   sensor.start();
-  require(sensor.fifoPacketBytes() == 17,
+  require(sensor.fifoPacketBytes() == 16,
           "capture packet size is not accel+gyro+temp+timestamp");
   vendor.packets = 2;
   vendor.events = {{1, 2, 3}, {4, 5, 6}};
   require(sensor.available() == 2, "FIFO sample count is wrong");
-  require(sensor.lastFifoBytes() == 34, "packet size accounting is wrong");
+  require(sensor.lastFifoBytes() == 32, "packet size accounting is wrong");
   AccelSample first{};
   AccelSample second{};
   require(sensor.read(first) && first.x == 1 && first.y == 2 && first.z == 3,

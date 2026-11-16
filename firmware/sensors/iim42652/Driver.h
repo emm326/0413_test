@@ -43,13 +43,19 @@ class Iim42652 final {
   static constexpr uint16_t kFifoCapacityBytes = 2048;
   static constexpr uint16_t kFifoHeaderBytes = 1;
   static constexpr uint16_t kFifoAxisBytes = 6;
-  static constexpr uint16_t kFifoTempBytes = 2;
+  // In 16-bit FIFO mode the temperature field is one byte, not a full int16.
+  static constexpr uint16_t kFifoTempBytes = 1;
   static constexpr uint16_t kFifoTimeBytes = 2;
 
   static Iim42652* active_;
   static void eventThunk(inv_ixm42xxx_sensor_event_t* event);
   void onEvent(const inv_ixm42xxx_sensor_event_t& event);
 
+  bool applyAccelConfig(uint16_t rate, uint8_t range);
+  bool readFifoPacket();
+  static uint16_t fifoPacketBytesForHeader(uint8_t header);
+  bool configureFifo();
+  bool forceSixteenBitFifo();
   bool configureInterrupt();
   bool configureClock(bool enabled);
   bool verifyClock(bool enabled);
@@ -70,6 +76,7 @@ class Iim42652 final {
   inv_ixm42xxx driver_{};
   inv_ixm42xxx_serif serif_{};
   AccelSample samples_[kSampleCapacity]{};
+  uint8_t fifoPayload_[20]{};
 
   uint16_t head_ = 0;
   uint16_t tail_ = 0;

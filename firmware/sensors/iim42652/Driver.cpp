@@ -6,9 +6,12 @@
 
 namespace {
 constexpr uint8_t kWhoAmI = 0x6f;
-// PWR_MGMT0 ACCEL_MODE occupies bits [1:0]: 0=off, 1=low power, 2=low noise.
-constexpr uint8_t kPwrAccelModeMask = 0x03;
-constexpr uint8_t kPwrAccelModeLowNoise = 0x02;
+// PWR_MGMT0 ACCEL_MODE occupies bits [1:0]. Value names come from the vendor
+// header so the log always matches the chip variant.
+constexpr uint8_t kPwrAccelModeMask = BIT_PWR_MGMT_0_ACCEL_MODE_MASK;
+constexpr uint8_t kPwrAccelModeLowNoise = IXM42XXX_PWR_MGMT_0_ACCEL_MODE_LN;
+// Accelerometer and gyro mode fields together occupy PWR_MGMT0 bits [3:0].
+constexpr uint8_t kPowerModeMask = 0x0F;
 
 IXM42XXX_ACCEL_CONFIG0_ODR_t odrFor(uint16_t rate) {
   return rate == 100 ? IXM42XXX_ACCEL_CONFIG0_ODR_100_HZ
@@ -117,12 +120,23 @@ bool Iim42652::begin(bool resetDevice, bool externalClock) {
 }
 
 bool Iim42652::configureClock(bool enabled) {
-  const int rc = inv_ixm42xxx_enable_clkin_rtc(&driver_, enabled ? 1 : 0);
-  if (rc != INV_ERROR_SUCCESS) {
-    Serial.printf("SENSOR_CLOCK_SET,enabled=%u,rc=%d\n", enabled ? 1 : 0, rc);
-    return false;
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    const int rc = inv_ixm42xxx_enable_clkin_rtc(&driver_, enabled ? 1 : 0);
+    if (rc != INV_ERROR_SUCCESS) {
+      Serial.printf("SENSOR_CLOCK_SET,enabled=%u,rc=%d,attempt=%u\n",
+                    enabled ? 1 : 0, rc, attempt);
+      continue;
+    }
+    delay(2);
+    if (verifyClock(enabled)) {
+      return true;
+    }
+    if (attempt < 3) {
+      Serial.printf("SENSOR_CLOCK_RETRY,attempt=%u\n", attempt);
+      delay(2);
+    }
   }
-  return verifyClock(enabled);
+  return false;
 }
 
 bool Iim42652::verifyClock(bool enabled) {
@@ -156,8 +170,28 @@ bool Iim42652::configure(uint16_t rate, uint8_t range) {
 
   int rc = inv_ixm42xxx_set_accel_frequency(&driver_, odrFor(rate));
   rc |= inv_ixm42xxx_set_accel_fsr(&driver_, fsrFor(range));
-  rc |= inv_ixm42xxx_configure_fifo(&driver_, INV_IXM42XXX_FIFO_ENABLED);
-  rc |= inv_ixm42xxx_configure_fifo_wm(&driver_, 1);
+  // Guarantee the chip latched ODR and FSR even when the vendor cache and
+  // the hardware disagree; retry with a physical readback.
+  rc |= applyAccelConfig(rate, range) ? 0 : INV_ERROR;
+  rc |= configureFifo() ? 0 : INV_ERROR;
+  // The chip can power up with 20-bit FIFO packets while the vendor parser
+  // assumes 16-bit packets unless high-resolution mode was requested.
+  rc |= forceSixteenBitFifo() ? 0 : INV_ERROR;
+  // Keep both axes off until start(); a previous session can leave the gyro
+  // running in low-noise mode and that changes FIFO packet timing.
+  bool powerOff = false;
+  for (uint8_t attempt = 0; attempt < 3 && !powerOff; ++attempt) {
+    uint8_t modeBeforeStart = 0;
+    if (setBank(0) && directRead(MPUREG_PWR_MGMT_0, modeBeforeStart) &&
+        writeRaw(MPUREG_PWR_MGMT_0,
+                 static_cast<uint8_t>(modeBeforeStart & ~kPowerModeMask))) {
+      delay(1);
+      uint8_t applied = 0;
+      powerOff = setBank(0) && directRead(MPUREG_PWR_MGMT_0, applied) &&
+                 (applied & kPowerModeMask) == 0;
+    }
+  }
+  rc |= powerOff ? 0 : INV_ERROR;
   rc |= configureInterrupt() ? 0 : INV_ERROR;
   if (rc != INV_ERROR_SUCCESS) {
     Serial.printf("SENSOR_CONFIGURE,rate=%u,range=%u,rc=%d,ok=0\n", rate, range, rc);
@@ -189,37 +223,150 @@ bool Iim42652::configure(uint16_t rate, uint8_t range) {
                      static_cast<uint8_t>(fsrFor(range));
   const bool fifoOk = (fifo & BIT_FIFO_CONFIG_MODE_MASK) ==
                       static_cast<uint8_t>(IXM42XXX_FIFO_CONFIG_MODE_STOP_ON_FULL);
-  const bool ok = readback && odrOk && fsrOk && fifoOk;
+  const bool hiresOk = (fifo1 & BIT_FIFO_CONFIG1_HIRES_MASK) == 0;
+  const bool powerOffOk = (power & kPowerModeMask) == 0;
+  const bool ok =
+      readback && odrOk && fsrOk && fifoOk && hiresOk && powerOffOk;
   Serial.printf("SENSOR_CONFIGURE,rate=%u,range=%u,power=0x%02X,accel=0x%02X,"
                 "fifo=0x%02X,fifo1=0x%02X,readback=%u,odr_ok=%u,fsr_ok=%u,"
-                "fifo_mode_ok=%u,packet_bytes=%u,ok=%u\n",
+                "fifo_mode_ok=%u,hires_ok=%u,power_off_ok=%u,"
+                "packet_bytes=%u,ok=%u\n",
                 rate_, range_, power, accel, fifo, fifo1, readback ? 1 : 0,
-                odrOk ? 1 : 0, fsrOk ? 1 : 0, fifoOk ? 1 : 0, packetBytes_,
+                odrOk ? 1 : 0, fsrOk ? 1 : 0, fifoOk ? 1 : 0,
+                hiresOk ? 1 : 0, powerOffOk ? 1 : 0, packetBytes_,
                 ok ? 1 : 0);
   return ok;
 }
 
-bool Iim42652::configureInterrupt() {
-  inv_ixm42xxx_interrupt_parameter_t config = {};
-  config.INV_IXM42XXX_FIFO_THS = INV_IXM42XXX_ENABLE;
-  const int rc = inv_ixm42xxx_set_config_int1(&driver_, &config);
-  if (rc != INV_ERROR_SUCCESS) {
-    return false;
+bool Iim42652::applyAccelConfig(uint16_t rate, uint8_t range) {
+  const uint8_t mask = static_cast<uint8_t>(BIT_ACCEL_CONFIG0_FS_SEL_MASK |
+                                            BIT_ACCEL_CONFIG0_ODR_MASK);
+  const uint8_t wanted = static_cast<uint8_t>(
+      (static_cast<uint8_t>(fsrFor(range)) & BIT_ACCEL_CONFIG0_FS_SEL_MASK) |
+      (static_cast<uint8_t>(odrFor(rate)) & BIT_ACCEL_CONFIG0_ODR_MASK));
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    uint8_t current = 0;
+    if (setBank(0) && directRead(MPUREG_ACCEL_CONFIG0, current) &&
+        writeRaw(MPUREG_ACCEL_CONFIG0,
+                 static_cast<uint8_t>((current & ~mask) | wanted))) {
+      uint8_t applied = 0;
+      if (setBank(0) && directRead(MPUREG_ACCEL_CONFIG0, applied) &&
+          (applied & mask) == wanted) {
+        return true;
+      }
+    }
+    delay(1);
   }
+  Serial.printf("SENSOR_ACCEL_CONFIG,retry_failed,rate=%u,range=%u,"
+                "wanted=0x%02X\n", rate, range, wanted);
+  return false;
+}
 
-  uint8_t intConfig = 0;
-  if (!setBank(0) || !readRaw(MPUREG_INT_CONFIG, intConfig)) {
-    return false;
+bool Iim42652::configureFifo() {
+  const uint8_t config1Mask = static_cast<uint8_t>(
+      BIT_FIFO_CONFIG1_TEMP_MASK | BIT_FIFO_CONFIG1_TMST_FSYNC_MASK |
+      BIT_FIFO_CONFIG1_WM_GT_TH_MASK);
+  uint8_t fifo = 0;
+  uint8_t fifo1 = 0;
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    int rc = inv_ixm42xxx_configure_fifo(&driver_, INV_IXM42XXX_FIFO_ENABLED);
+    rc |= inv_ixm42xxx_configure_fifo_wm(&driver_, 1);
+    if (rc != INV_ERROR_SUCCESS) {
+      delay(1);
+      continue;
+    }
+    delay(1);
+    const bool read = setBank(0) && directRead(MPUREG_FIFO_CONFIG, fifo) &&
+                      directRead(MPUREG_FIFO_CONFIG1, fifo1);
+    const bool modeOk =
+        (fifo & BIT_FIFO_CONFIG_MODE_MASK) ==
+        static_cast<uint8_t>(IXM42XXX_FIFO_CONFIG_MODE_STOP_ON_FULL);
+    const bool featuresOk = (fifo1 & config1Mask) == config1Mask;
+    if (read && modeOk && featuresOk) {
+      return true;
+    }
   }
-  intConfig &= static_cast<uint8_t>(
-      ~(BIT_INT_CONFIG_INT1_DRIVE_CIRCUIT_MASK | BIT_INT_CONFIG_INT1_POLARITY_MASK));
-  intConfig |= static_cast<uint8_t>(IXM42XXX_INT_CONFIG_INT1_DRIVE_CIRCUIT_PP);
-  intConfig |= static_cast<uint8_t>(IXM42XXX_INT_CONFIG_INT1_POLARITY_HIGH);
-  return writeRaw(MPUREG_INT_CONFIG, intConfig);
+  Serial.printf("SENSOR_FIFO_MODE,retry_failed,fifo=0x%02X,fifo1=0x%02X\n",
+                fifo, fifo1);
+  return false;
+}
+bool Iim42652::forceSixteenBitFifo() {
+  const uint8_t mask = static_cast<uint8_t>(
+      BIT_FIFO_CONFIG1_HIRES_MASK |
+      BIT_FIFO_CONFIG1_RESUME_PARTIAL_RD_MASK);
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    uint8_t fifo1 = 0;
+    if (!setBank(0) || !directRead(MPUREG_FIFO_CONFIG1, fifo1)) {
+      continue;
+    }
+    const uint8_t wanted = static_cast<uint8_t>(
+        (fifo1 | BIT_FIFO_CONFIG1_RESUME_PARTIAL_RD_MASK) &
+        ~BIT_FIFO_CONFIG1_HIRES_MASK);
+    if (!writeRaw(MPUREG_FIFO_CONFIG1, wanted)) {
+      continue;
+    }
+    inv_ixm42xxx_disable_high_resolution_fifo(&driver_);
+    uint8_t applied = 0;
+    if (setBank(0) && directRead(MPUREG_FIFO_CONFIG1, applied) &&
+        (applied & mask) == BIT_FIFO_CONFIG1_RESUME_PARTIAL_RD_MASK) {
+      Serial.printf("SENSOR_FIFO_CONFIG1,applied=0x%02X,hires=0,resume=1,ok=1\n",
+                    applied);
+      return true;
+    }
+    delay(1);
+  }
+  uint8_t applied = 0;
+  if (setBank(0)) {
+    directRead(MPUREG_FIFO_CONFIG1, applied);
+  }
+  Serial.printf("SENSOR_FIFO_CONFIG1,applied=0x%02X,hires=0,resume=1,ok=0\n",
+                applied);
+  return false;
+}
+
+bool Iim42652::configureInterrupt() {
+  const uint8_t mask = static_cast<uint8_t>(
+      BIT_INT_CONFIG_INT1_DRIVE_CIRCUIT_MASK | BIT_INT_CONFIG_INT1_POLARITY_MASK);
+  uint8_t requested = 0;
+  uint8_t applied = 0;
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    inv_ixm42xxx_interrupt_parameter_t config = {};
+    config.INV_IXM42XXX_FIFO_THS = INV_IXM42XXX_ENABLE;
+    if (inv_ixm42xxx_set_config_int1(&driver_, &config) != INV_ERROR_SUCCESS) {
+      delay(1);
+      continue;
+    }
+    if (!setBank(0) || !readRaw(MPUREG_INT_CONFIG, requested)) {
+      delay(1);
+      continue;
+    }
+    requested &= static_cast<uint8_t>(~mask);
+    requested |= static_cast<uint8_t>(IXM42XXX_INT_CONFIG_INT1_DRIVE_CIRCUIT_PP);
+    requested |= static_cast<uint8_t>(IXM42XXX_INT_CONFIG_INT1_POLARITY_HIGH);
+    if (writeRaw(MPUREG_INT_CONFIG, requested)) {
+      delay(1);
+      if (setBank(0) && directRead(MPUREG_INT_CONFIG, applied) &&
+          (applied & mask) == (requested & mask)) {
+        Serial.printf("SENSOR_INT_CONFIG,requested=0x%02X,applied=0x%02X,ok=1\n",
+                      requested, applied);
+        return true;
+      }
+    }
+    delay(1);
+  }
+  Serial.printf("SENSOR_INT_CONFIG,requested=0x%02X,applied=0x%02X,ok=0\n",
+                requested, applied);
+  return false;
 }
 
 bool Iim42652::setBank(uint8_t bank) {
-  return inv_ixm42xxx_set_reg_bank(&driver_, bank) == INV_ERROR_SUCCESS;
+  if (inv_ixm42xxx_set_reg_bank(&driver_, bank) != INV_ERROR_SUCCESS) {
+    return false;
+  }
+  // The bank-select write ends one SPI transaction; leave enough time before
+  // the next command so the selected bank is stable on every power-up.
+  delayMicroseconds(5);
+  return true;
 }
 
 bool Iim42652::readRaw(uint8_t address, uint8_t& value) {
@@ -367,14 +514,88 @@ uint16_t Iim42652::available() {
     return count_;
   }
 
-  const int rc = inv_ixm42xxx_get_data_from_fifo(&driver_);
-  if (rc != INV_ERROR_SUCCESS) {
-    overflow_ = true;
-    lastFifoBytes_ = 0xffff;
-    return count_;
+  for (uint16_t i = 0; i < packets; ++i) {
+    if (!readFifoPacket()) {
+      overflow_ = true;
+      lastFifoBytes_ = 0xffff;
+      Serial.printf("SENSOR_FIFO_ERROR,index=%u,packets=%u,buffered=%u,"
+                    "header=0x%02X\n",
+                    i, packets, count_, lastHeader_);
+      return count_;
+    }
   }
-  lastHeader_ = driver_.fifo_data[0];
   return count_;
+}
+
+uint16_t Iim42652::fifoPacketBytesForHeader(uint8_t header) {
+  const bool accel = (header & FIFO_HEADER_ACC) != 0;
+  const bool gyro = (header & FIFO_HEADER_GYRO) != 0;
+  const bool timed =
+      ((header & FIFO_HEADER_TMST) != 0) || ((header & FIFO_HEADER_FSYNC) != 0);
+  uint16_t bytes = 0;
+  if (accel) {
+    bytes += kFifoAxisBytes;
+  }
+  if (gyro) {
+    bytes += kFifoAxisBytes;
+  }
+  if (accel || gyro) {
+    bytes += kFifoTempBytes;
+  }
+  if (timed) {
+    bytes += kFifoTimeBytes;
+  }
+  return bytes;
+}
+
+bool Iim42652::readFifoPacket() {
+  if (!setBank(0)) {
+    return false;
+  }
+  uint8_t header = 0;
+  if (!directRead(MPUREG_FIFO_DATA, header)) {
+    return false;
+  }
+  lastHeader_ = header;
+  if ((header & FIFO_HEADER_MSG) != 0) {
+    inv_ixm42xxx_reset_fifo(&driver_);
+    return false;
+  }
+  if ((header & FIFO_HEADER_HEADER_20) != 0) {
+    Serial.printf("SENSOR_FIFO,unexpected_20bit_header=0x%02X\n", header);
+    inv_ixm42xxx_reset_fifo(&driver_);
+    return false;
+  }
+  const uint16_t bytes = fifoPacketBytesForHeader(header);
+  if (bytes > 0 && !directRead(MPUREG_FIFO_DATA, fifoPayload_, bytes)) {
+    return false;
+  }
+  packetBytes_ = static_cast<uint16_t>(kFifoHeaderBytes + bytes);
+  if ((header & FIFO_HEADER_ACC) == 0) {
+    return true;
+  }
+  const bool bigEndian =
+      driver_.endianess_data == IXM42XXX_INTF_CONFIG0_DATA_BIG_ENDIAN;
+  auto decode = [bigEndian](const uint8_t* p) -> int16_t {
+    const uint16_t value = bigEndian
+                               ? static_cast<uint16_t>((p[0] << 8) | p[1])
+                               : static_cast<uint16_t>((p[1] << 8) | p[0]);
+    return static_cast<int16_t>(value);
+  };
+  const AccelSample sample = {decode(&fifoPayload_[0]), decode(&fifoPayload_[2]),
+                              decode(&fifoPayload_[4])};
+  if (sample.x == INT16_MIN || sample.y == INT16_MIN ||
+      sample.z == INT16_MIN) {
+    return true;
+  }
+  if (count_ >= kSampleCapacity) {
+    overflow_ = true;
+    return true;
+  }
+  samples_[tail_] = sample;
+  tail_ = static_cast<uint16_t>((tail_ + 1) % kSampleCapacity);
+  ++count_;
+  return true;
 }
 
 bool Iim42652::read(AccelSample& sample) {
@@ -458,6 +679,7 @@ void Iim42652::diagnostic() {
   uint8_t intf0 = 0;
   uint8_t intf1 = 0;
   uint8_t intSource = 0;
+  uint8_t intConfig = 0;
   uint8_t status = 0;
   directRead(MPUREG_WHO_AM_I, who);
   directRead(MPUREG_ACCEL_CONFIG0, accel);
@@ -469,6 +691,7 @@ void Iim42652::diagnostic() {
   directRead(MPUREG_INTF_CONFIG0, intf0);
   directRead(MPUREG_INTF_CONFIG1, intf1);
   directRead(MPUREG_INT_SOURCE0, intSource);
+  directRead(MPUREG_INT_CONFIG, intConfig);
   directRead(MPUREG_INT_STATUS, status);
   setBank(1);
   uint8_t intf5 = 0;
@@ -477,11 +700,11 @@ void Iim42652::diagnostic() {
 
   Serial.printf("SENSOR_DIAG,who=0x%02X,accel=0x%02X,power=0x%02X,fifo_cfg=0x%02X,"
                 "fifo1=0x%02X,fifo2=0x%02X,fifo3=0x%02X,intf0=0x%02X,"
-                "intf1=0x%02X,intf5=0x%02X,int_src=0x%02X,int_status=0x%02X,"
-                "fifo_bytes=%u,packet_bytes=%u,header=0x%02X\n",
+                "intf1=0x%02X,intf5=0x%02X,int_src=0x%02X,int_cfg=0x%02X,"
+                "int_status=0x%02X,fifo_bytes=%u,packet_bytes=%u,header=0x%02X\n",
                 who, accel, power, fifo, fifo1, fifo2, fifo3, intf0, intf1,
-                intf5, intSource, status, lastFifoBytes_, packetBytes_,
-                lastHeader_);
+                intf5, intSource, intConfig, status, lastFifoBytes_,
+                packetBytes_, lastHeader_);
 }
 
 void Iim42652::linkTest() {

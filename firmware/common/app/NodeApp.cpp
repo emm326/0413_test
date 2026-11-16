@@ -53,6 +53,10 @@ void NodeApp::begin() {
                 APP_FIRMWARE_VERSION, Board::name, sensor_.name(), Config::nodeId,
                 Config::uplinkMHz);
   clockOutputReady_ = clock_.begin(Board::clockOut);
+  if (clockOutputReady_) {
+    // Let the LEDC output and PCNT input path settle before measuring.
+    delay(100);
+  }
   gps_.setPpsObserver(SampleClock::onPps);
 #if defined(APP_BOARD_EORA) && defined(APP_SENSOR_IIM42652)
   sensorReady_ = initializeSensor(false);
@@ -82,14 +86,19 @@ bool NodeApp::initializeSensor(bool resetDevice) {
   // Rebind only the sensor SPI bus; do not restart the clock, GNSS, or radio.
   detachInterrupt(digitalPinToInterrupt(Board::sensorInt));
   resetEdges();
-  pinMode(Board::sensorInt, INPUT);
+  // Internal pull-down keeps a floating INT1 line from generating a false edge storm.
+  pinMode(Board::sensorInt, INPUT_PULLDOWN);
   SensorChecks::StartupCheck check = {};
   const bool initialized = clockOutputReady_ && sensor_.begin(resetDevice);
   if (initialized) {
     attachInterrupt(digitalPinToInterrupt(Board::sensorInt), dataReady, RISING);
+    sensor_.start();
+    // Ignore the FIFO/INT1 transient created while the sensor switches into
+    // low-noise mode. Measure only a stable 120 ms window.
+    delay(20);
+    resetEdges();
     const uint32_t before = edgeTotal;
     const uint64_t clockBefore = clock_.edgeCount();
-    sensor_.start();
     delay(120);
     check.dataReadyEdges = edgeTotal - before;
     check.clockEdges = clock_.edgeCount() - clockBefore;
@@ -162,6 +171,8 @@ void NodeApp::sensorSampleTest() {
                 configured, captured, configured && captured == 20);
   // Restore the clock buffer before selecting external RTC mode again.
   clockOutputReady_ = clock_.setOutputEnabled(true);
+  // Ignore the output-matrix reconnect transient.
+  delay(100);
   const uint64_t restoredBefore = clock_.edgeCount();
   delayMicroseconds(2000);
   const uint64_t restoredEdges = clock_.edgeCount() - restoredBefore;
