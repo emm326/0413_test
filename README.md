@@ -1,50 +1,61 @@
-# E870 八节点三轴加速度采集
+# E870 八节点加速度采集
 
-当前固件 v3：EoRa-S3-400TB / Heltec V3.2 LF × IIM-42352 / IIM-42652，ESP32 输出 32000 Hz CLKIN，结合 GNSS/PPS 授时，通过 E870-L470LG12-O 分信道收发并在电脑保存数据。
+本项目使用 ESP32-S3 节点采集 IIM-42352/IIM-42652 三轴加速度，通过 GNSS UTC/PPS 建立时间基准，再经 LoRa 将数据发送到 E870-L470LG12-O 网关。电脑端负责启停、ACK、CSV 保存和质量统计。
 
-- [项目交接与接手顺序](docs/HANDOVER.md)
-- [项目计划与进度](PROJECT_PLAN.md)
-- [四种组合接线及烧录](docs/wiring_and_flash.md)
-- [E870 网关和上位机](docs/e870_setup.md)
-- [协议 v3](docs/protocol_v3.md)
-- [设备能力与当前限制](docs/e870_capability_review.md)
-- [实机验收记录](docs/hardware_acceptance.md)
-- [六线最小IIM42652身份测试](minimal_six_wire_iim42652/README.md)
-- [本轮变更报告](docs/changes/)
+当前已完成节点 1003 的单节点 50 Hz 采样、LoRa 上行、ACK 和补传验收。8 节点扩容、两小时稳定性和 100 Hz 尚未完成。
+
+## 项目入口
+
+- [项目技术总文档](docs/PROJECT_MASTER.md)
+- [当前计划和状态](PROJECT_PLAN.md)
+- [启动上位机](启动E870上位机.cmd)
+
+`docs/PROJECT_MASTER.md` 是唯一技术总文档，包含：
+
+- 当前功能和器件说明
+- 四套硬件组合与固定接线
+- IIM42652 采样、FIFO 和时钟策略
+- GNSS/PPS 时间基准
+- LoRa 协议 v3 和五秒通信周期
+- E870 网关配置和 ACK 时隙
+- 编译、烧录、串口命令和质量验收方法
+- 最新实测结果、已知限制和故障恢复步骤
+
+## 快速开始
+
+打开桌面软件：
+
+```powershell
+.\启动E870上位机.cmd
+```
+
+构建并烧录当前正式节点：
+
+```powershell
+$env:PLATFORMIO_DISABLE_TELEMETRY='1'
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e eora_s3_400_iim42652_tx
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e eora_s3_400_iim42652_tx -t upload --upload-port COM8
+```
+
+运行软件测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+烧录前必须重新确认实际 COM 口，不能默认仍为 COM8。
 
 ## 工程目录
 
 | 目录 | 用途 |
 |---|---|
-| `firmware/` | 当前节点固件；板级适配、公共业务和传感器驱动分别放置 |
-| `host/` | E870 UDP 接入、桌面上位机、运行控制、CSV 和质量报告 |
-| `gateway/` | 与设备原厂配置合并的项目模板；本地设备配置不提交 Git |
-| `tools/` | 节点编号构建脚本及包初始化文件 |
-| `tests/` | 当前 E870 v3 与八节点自动测试 |
-| `docs/` | 当前方案的操作、协议、验收和变更说明 |
+| `firmware/` | 节点固件、板级适配、传感器驱动和公共业务 |
+| `host/` | E870 UDP、桌面软件、CSV 和质量报告 |
+| `gateway/` | 网关配置模板和本地状态 |
+| `tests/` | 协议、网关、桌面控制和固件仿真测试 |
+| `minimal_six_wire_iim42652/` | 六线最小身份测试工程 |
+| `tools/` | 节点号构建辅助 |
+| `docs/` | 唯一项目技术总文档 |
+| `tmp/` | 本机测试数据、日志、手册和临时文件，不进入 Git |
 
-历史采集数据、开题报告、PPT、文献、制作记录和临时资料继续保留原位；它们不属于当前固件构建入口。旧工程已从工作目录移除，可通过 Git 标签 `archive/pre-cleanup-20261108` 查询清理前版本。
-
-## 桌面配置与控制
-
-双击根目录 **启动E870上位机.cmd**。软件包含“网关配置 / 采集控制 / 诊断与测试”，运行环境位于 `.venv/`，日常启动无需联网安装。
-
-- [桌面软件操作说明](docs/e870_desktop.md)
-- 首次通过 USB2 配置，日常可使用网线 SSH；网关目标地址 192.168.1.10，电脑保持 192.168.1.22。
-- 无节点时可验证真实网关链路与专用下发自检，正式开始采集需要节点就绪；自检发射前确认天线连接。
-- 实际通过范围及待实测项以计划和本轮报告为准。
-
-## 构建与运行
-
-在项目根目录执行；四种正式环境和四种 USB 测试环境详见接线与烧录说明。
-
-```powershell
-pio run -e heltec_v32_iim42352_tx
-$env:APP_NODE_ID="1001"
-pio run -e heltec_v32_iim42352_tx
-Remove-Item Env:APP_NODE_ID
-python -m host --gateway-config gateway/state/active.local.json
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-```
-
-`platformio.ini` 是当前唯一固件构建配置。构建及软件测试通过与实机验收分别记录，当前硬件状态以 `PROJECT_PLAN.md` 为准。
+采集数据、日志、构建产物、虚拟环境和本地网关配置不进入 Git。
