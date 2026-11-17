@@ -32,6 +32,16 @@ from .wire import (
 )
 from .recorder import Recorder
 
+# The E870 accepts a PULL_RESP in under 31 ms (TX_ACK) but puts the frame on
+# the air about 400 ms later (measured on 2026-11-17: the host request phases
+# that reached the node were 3.60-3.86 s). Nodes listen for ACKs during
+# 4.000-4.250 s of each 5 s cycle, so hand ACK frames to the gateway at
+# 3.68-3.82 s; they then arrive around 4.08-4.22 s.
+ACK_TX_LEAD_US = 400_000
+# Aim the on-air arrival at 4.08-4.22 s inside the node's 4.000-4.250 s window.
+ACK_REQUEST_START_US = 4_080_000 - ACK_TX_LEAD_US
+ACK_REQUEST_END_US = 4_220_000 - ACK_TX_LEAD_US
+
 
 @dataclass(frozen=True)
 class DiagnosticPacket:
@@ -646,7 +656,7 @@ class GatewayServer:
             elapsed = self.gnss_now_us - self.start_us
             phase = elapsed % 5_000_000
             cycle = elapsed // 5_000_000
-        if phase is not None and 4_030_000 <= phase < 4_100_000 and self.ack_cycle != cycle:
+        if phase is not None and ACK_REQUEST_START_US <= phase < ACK_REQUEST_END_US and self.ack_cycle != cycle:
             self.ack_cycle = cycle
             entries = []
             for node in self.active_targets:

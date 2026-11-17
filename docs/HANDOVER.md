@@ -9,7 +9,7 @@
 
 ## 1. 当前结论
 
-IIM42652 软复位失败问题已修复：驱动改为轮询 `RESET_DONE`，最长约 51 ms，不再在复位完成前只读一次。2026-11-17 正式 tx 冷启动一次通过：`startup_attempts=1`、`startup_failure=none`、`state=1`。外部 32 kHz 存在但实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后节点自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。当前节点处于 Draining，队列 60 包，原因是没有在线 E870 ACK；LoRa DATA 接收测试因电脑以太网适配器 Disconnected、网关 192.168.1.10 不可达，本轮未执行。
+IIM42652 软复位失败问题已修复：驱动改为轮询 `RESET_DONE`，最长约 51 ms，不再在复位完成前只读一次。2026-11-17 正式 tx 冷启动一次通过：`startup_attempts=1`、`startup_failure=none`、`state=1`。外部 32 kHz 存在但实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后节点自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。网关在线后已完成 LoRa 验收：ACK 收不到的根因是 E870 的实际空口发射比主机下发晚约 400 ms，超出节点 4.000～4.250 s 的监听窗口。把网关 ACK 请求窗口改到 3.68～3.82 s 后，30 秒 run 7028 收到 60/60 个包，60 秒 run 7030 收到 119/120 个包，两次重传均为 0，节点最终 state=1、queue=0。当前节点处于待机，队列 0。
 
 | 功能 | 当前状态 | 结论 |
 |---|---|---|
@@ -23,16 +23,17 @@ IIM42652 软复位失败问题已修复：驱动改为轮询 `RESET_DONE`，最�
 | 外部 32 kHz CLKIN | 不可用 | 实测 32257.4 Hz、+8045 ppm，频率超差后自动回退内部时钟 |
 | 内部时钟采样门槛 | 已修复 | `clock_ok=1, clock_source=sensor_internal` |
 | LoRa 射频初始化 | 已通过 | `READY,sensor=1,radio=1` |
-| LoRa 实际收包与 ACK | 待实测 | 电脑以太网适配器 Disconnected，网关不可达；此前被动接收 20 包正常 |
-| 8 节点扩容 | 待实测 | 单节点正式空口验收尚未完成 |
+| LoRa 实际收包与 ACK | 已通过 | 30 秒 60/60 包、60 秒 119/120 包，重传 0，最终 state=1、queue=0 |
+| 网关下行 ACK 时隙 | 已修复 | E870 空口发射晚约 400 ms，ACK 请求窗口改为 3.68～3.82 s |
+| 8 节点扩容 | 待实测 | 单节点空口与 ACK 已通过，扩容前需复测 ACK 时隙 |
 
 ## 2. 当前设备状态
 
-以下为 2026-11-17 30 秒采样结束后的 COM8 实读状态：
+以下为 2026-11-17 60 秒 LoRa 测试（run 7030）结束后的 COM8 实读状态：
 
 ```text
-STATUS,id=1003,state=4,gps=1,clock_hz=32257.4336,ppm=8044.84,
-clock_ok=1,clock_source=sensor_internal,queue=60,
+STATUS,id=1003,state=1,gps=1,clock_hz=0.0000,ppm=-1000000.00,
+clock_ok=1,clock_source=sensor_internal,queue=0,
 lost_samples=0,lost_packets=0,startup_attempts=1,
 startup_failure=none,fault_reason=none
 ```
@@ -40,22 +41,23 @@ startup_failure=none,fault_reason=none
 同一时段的 GNSS 详细状态为：
 
 ```text
-GPS_DIAG,fix=1,pps=1,time=1,healthy=1,pps_count=113,
-pps_interval_us=999982,age_ms=895,pps_bad=0,timer_jumps=0
+GPS_DIAG,fix=1,pps=1,time=1,healthy=1,pps_count=3111,
+pps_interval_us=999980,age_ms=900,pps_bad=7,timer_jumps=0,last_pps_epoch_us=1794897072000000
 ```
 
 解释：
 
-- `state=4`：Draining。采样已结束，队列中的包正在等待 E870 ACK。
+- `state=1`：Waiting。本轮采集结束，ACK 已清空队列，节点等待下一条 START。
 - `gps=1`：该次 `STATUS` 输出时，GNSS/PPS 时间基准判定健康。
 - `gps=0`：该次 `STATUS` 输出时，GNSS/PPS 时间基准不合格。
 - `gps` 会随实时健康判定变化。正式 START 前必须用 `GPS_DIAG` 确认 `healthy=1`，不能依赖上一次 `STATUS`。
 - `clock_ok=1`：当前采样时钟门槛通过。
 - `clock_source=sensor_internal`：使用 IIM42652 内部时钟。
 - `clock_hz` 和 `ppm` 无效：该字段仍在测量已经停用的 GPIO36 外部 32 kHz，不能用于内部时钟判定。
-- `queue=60,lost_samples=0,lost_packets=0`：60 个包等待 ACK；没有丢失样本或数据包。
+- `queue=0,lost_samples=0,lost_packets=0`：队列已清空；本轮没有丢失样本或数据包。
+- `pps_bad=7`：累计的 PPS 间隔异常次数；本次 `healthy=1`，正式 START 前仍需重新读取 `GPS_DIAG`。
 
-如果现在要开始采样，必须发送有效的 `START_AT` 命令或由 E870 上位机下发 START。仅上电不会自动开始采样。队列未清空时不能开始新运行；恢复网关并收到 ACK 后队列会清空。
+如果现在要开始采样，必须发送有效的 `START_AT` 命令或由 E870 上位机下发 START。仅上电不会自动开始采样。当前队列为 0，可以直接开始新运行。
 
 ## 3. 硬件与接线
 
@@ -233,7 +235,47 @@ fault_reason=none
 pass=1
 ```
 
-说明：`state_after=4` 是 Draining，队列 60 包等待 E870 ACK。本轮电脑以太网适配器为 Disconnected，无法启动网关接收端，因此 LoRa DATA 包接收率、RSSI、SNR 和 ACK 没有新增实测数据。
+说明：`state_after=4` 是 Draining，队列 60 包等待 E870 ACK。本轮电脑以太网适配器为 Disconnected，无法启动网关接收端，因此当时没有新增 LoRa 实测数据；同日网关恢复后的空口与 ACK 结果见 5.6。
+
+### 5.6 LoRa 空口与 ACK 验收（2026-11-17）
+
+30 秒 run 7028：
+
+| 项目 | 结果 |
+|---|---:|
+| 唯一 DATA 包 | 60 / 60（100.0%） |
+| 样本数 | 1487 |
+| 重传包 | 0 |
+| RSSI / SNR | -22 dBm / 10.1 dB |
+| 网关 TX / TX_ACK | 7 / 7 |
+| 节点最终状态 | `state=1`、`queue=0` |
+
+60 秒 run 7030：
+
+| 项目 | 结果 |
+|---|---:|
+| 唯一 DATA 包 | 119 / 120（99.2%） |
+| 样本数 | 2971 / 3000（99.0%） |
+| 重传包 | 0 |
+| RSSI / SNR | -22 dBm / 10.3 dB |
+| 网关 TX / TX_ACK | 13 / 13 |
+| 网关无效包 | 0 |
+| 节点最终状态 | `state=1`、`queue=0` |
+
+ACK 时隙结论：
+
+- 节点 ACK 监听窗口：每个 5 秒周期的 4.000～4.250 s。
+- 原始网关调度在 4.03～4.10 s 下发。E870 在 31 ms 内返回 TX_ACK，但实际空口发射晚约 400 ms，到达约 4.43～4.50 s，全部错过窗口。
+- 实测可用下发带约 3.60～3.86 s，宽度约 250 ms，与节点监听窗口宽度一致。
+- 修改后 `host/gateway.py` 在 3.68～3.82 s 下发 ACK，目标空口到达 4.08～4.22 s。
+- 更换网关型号或网关固件后必须重新标定这 400 ms，不能直接沿用。
+
+补传恢复：
+
+- run 7029 采集期间网关提前退出约 45 秒，节点积压 112 包。
+- 网关恢复后只确认已经写入 CSV 的序号，队列从 112 逐步降到 0。
+- 最终 119 个包全部收齐，`lost_samples=0`、`lost_packets=0`。
+- 原则：只 ACK 网关实际收到的序号，不确认未收到的包。
 
 ## 6. 构建与烧录
 当前正式环境：
@@ -288,10 +330,10 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 
 ## 8. 尚未完成
 
-1. E870 网关和上位机需要在线。
-2. 需要验证正式 START 的 CONFIRM、STATUS、SAMPLE 和 ACK。
-3. 需要完成正式 50 Hz 60 秒空口验收。
-4. 需要检查主机 CSV、到达率和补传率。
+1. 400 ms 发射补偿目前固定在 `host/gateway.py`，需要改成配置项，并在更换网关或网关固件后重新标定。
+2. 评估把节点 ACK 监听窗口从 4.000～4.250 s 加宽；该改动需要烧录，单独一轮验证。
+3. 补做 5 分钟连续空口收发和补传稳定性测试。
+4. 8 节点共用同一 ACK 帧的空口占用与时隙余量待验证。
 5. 单节点通过后，再按 1→2→4→8 节点扩容。
 6. 8 节点 50 Hz 连续 2 小时通过后，才进入 100 Hz/SF5。
 
@@ -299,11 +341,11 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 
 1. 先读本文件和根目录 [PROJECT_PLAN.md](../PROJECT_PLAN.md)。
 2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认当前分支为 `codex/20261117-sensor-reset-recovery`，回退点为 `588dc0f`。
-3. 读取[本轮报告](changes/2026-11-17_01_传感器复位轮询与时钟回退.md)。
+3. 读取[本轮报告](changes/2026-11-17_02_LoRa接收与ACK时隙修正.md)。
 4. 识别当前 COM 口和设备，不要默认仍为 COM8。
 5. 读取 STATUS，确认 `state=1,clock_ok=1,startup_failure=none,fault_reason=none`；再单独读取 GPS_DIAG 检查 GNSS/PPS。
 6. 需要验证采样时，先跑 USB 60 秒，再烧录正式 tx。
-7. 需要验证 LoRa 时，先启动 E870 和上位机，再下发正式 START。
+7. 需要验证 LoRa 时，先启动 E870 和上位机，确认 ACK 请求窗口为 3.68～3.82 s（400 ms 发射补偿），再下发正式 START。
 8. 不把 `clock_hz=0` 或低值当作内部时钟故障；内部模式只看传感器自检、FIFO 和错误计数。
 
 ## 10. Git 与本地资料
@@ -314,7 +356,7 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 - 当前功能固件提交：本轮修复提交（以 `git log -1 --oneline` 为准）；上一验证提交：`cb99db0`
 - 关键前序提交：`96cdbe3`、`f9bda89`、`cb099e7`、`4cadadd`
 - 日期化提交：从 2026-11-16 起，提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件以日期开头；长期文档改动更新“更新日期”。
-- 当前报告：[传感器复位轮询与时钟回退](changes/2026-11-17_01_传感器复位轮询与时钟回退.md)
+- 当前报告：[LoRa 数据接收与 ACK 时隙修正](changes/2026-11-17_02_LoRa接收与ACK时隙修正.md)
 - 长期接线文档：[wiring_and_flash.md](wiring_and_flash.md)
 - 协议文档：[protocol_v3.md](protocol_v3.md)
 - 网关操作：[e870_setup.md](e870_setup.md)
@@ -335,4 +377,3 @@ tmp/e870_lora_rx_20261116/local_full_test.log
 ```
 
 这些文件不提交 Git，新电脑或重新克隆仓库后可能不存在。
-

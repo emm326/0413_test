@@ -6,13 +6,14 @@
 - 当前分支：`codex/20261117-sensor-reset-recovery`（从回退基线 `588dc0f` 新建；后续修改都在此分支，不合并到 `main`）。
 - 本轮 Git 基线：`588dc0f`（回退点）；上一验证基线：`16cc1a1`（docs(2026-11-16): 记录正式tx 50Hz采样复测通过）。固件源码提交：`cb99db0`；验证标签：`verified/2026-11-16-tx-50hz`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
 - 当前步骤：阶段4～5进行中。2026-11-16 21:52正式tx固件完成室外50 Hz、60秒采样：valid=2972、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999µs；GNSS为fix=1、pps=1、healthy=1。启动时传感器3次自检均报vendor_init，执行一次SENSOR_RETRY后恢复state=1；采样使用传感器内部时钟，clock_ok=1。
-- 2026-11-17 本轮结果（已完成）：修复 IIM42652 软复位只等待 1 ms 导致 `vendor_init rc=-12` 的问题，改为轮询 `RESET_DONE`（最长约 51 ms）。bringup 实机通过：`WHO_AM_I=0x6F`，248 样本/5 秒，49.6 Hz，SPI 错误 0。正式 tx 冷启动 `startup_attempts=1,startup_failure=none,state=1`。外部 32 kHz 实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。LoRa DATA 接收未执行：电脑以太网适配器当前 Disconnected，网关 192.168.1.10 不可达；此前的被动接收测试仍有效。失败可回退到 `588dc0f`，已验证标签 `verified/2026-11-16-tx-50hz` 保持不动。
+- 2026-11-17 本轮结果（已完成）：修复 IIM42652 软复位只等待 1 ms 导致 `vendor_init rc=-12` 的问题，改为轮询 `RESET_DONE`（最长约 51 ms）。bringup 实机通过：`WHO_AM_I=0x6F`，248 样本/5 秒，49.6 Hz，SPI 错误 0。正式 tx 冷启动 `startup_attempts=1,startup_failure=none,state=1`。外部 32 kHz 实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。当时 LoRa DATA 接收未执行（电脑以太网适配器 Disconnected）；网关恢复后的结果见下一条。失败可回退到 `588dc0f`，已验证标签 `verified/2026-11-16-tx-50hz` 保持不动。
+- 2026-11-17 LoRa 本轮结果（已完成）：网关在线后完成 ACK 时隙定位。E870 收到下发后 31 ms 内返回 TX_ACK，但空口发射晚约 400 ms；原 ACK 调度 4.03～4.10 s 下发，实际到达约 4.43～4.50 s，超出节点 4.000～4.250 s 监听窗口。ACK 请求窗口改为 3.68～3.82 s 后，30 秒 run 7028 收 60/60 包、1487 样本、重传 0；60 秒 run 7030 收 119/120 包、2971 样本、重传 0。两次均 `state=1,queue=0`，RSSI -22 dBm、SNR 10.1～10.3 dB、网关无效包 0。补传恢复 run 7029 从 112 包降到 0，119 包全部收齐。网关回归 35/35 通过。
 - 提交约定：从 2026-11-16 起，每次修改都带日期并提交到当前日期分支。分支名使用 `codex/YYYYMMDD-主题`；提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件名以 `YYYY-MM-DD_序号_主题.md` 开头，正文记录更新日期。是否推送到远程以用户明确授权为准；未经明确要求不合并到 `main`。实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
 - 本轮实施范围：修复传感器软复位等待和外部时钟频率超差回退；保持接线、节点1003、±4g、50Hz和LoRa参数不变；完成bringup、正式tx和本地30秒采样验证。
-- 当前报告：[传感器复位轮询与时钟回退](docs/changes/2026-11-17_01_传感器复位轮询与时钟回退.md)；[已验证固件说明](docs/verified_firmware_2026-11-16.md)；[交接文档](docs/HANDOVER.md)。
+- 当前报告：[LoRa 数据接收与 ACK 时隙修正](docs/changes/2026-11-17_02_LoRa接收与ACK时隙修正.md)；[已验证固件说明](docs/verified_firmware_2026-11-16.md)；[交接文档](docs/HANDOVER.md)。
 - 已验证固件：固件源码`cb99db0`，Git标签`verified/2026-11-16-tx-50hz`；正式tx环境60秒50Hz采样通过，详细校验值和复现步骤见已验证固件说明。
 - 本轮验收门槛：启动自检`ok=1`；连续60秒采样不进入Fault；有效样本约3000条；相邻样本间隔接近20ms；记录FIFO计数、包头、失败原因和连续失败次数；bench与正式tx环境均构建，烧录和LoRa结果分别记录。
 - 本轮实测（2026-11-16）：20秒run7007 valid=995、60秒run7008 valid=2973；两项测试invalid=0、fifo_errors=0、lost_samples=0、dt_mean=19999µs。60秒测试有2条时间戳异常，按标称20ms回退，无Fault。正式tx启动READY,sensor=1,radio=1；室内gps=0、clock_ok=0，未启动采样；网关192.168.1.10不可达，未完成无线上行。
@@ -549,3 +550,15 @@
 - 未通过：样本时间间隔不均匀（0～120 ms），约 5 秒后 FIFO 故障进入 state=5，连续 60 秒和 LoRa 未验收。
 - 报告：`docs/changes/2026-11-16_01_ESP32时钟保留方案与台架采样.md`。
 - 下一步：使用 FIFO 内建 TMST 时间戳或保证每条记录一个中断边沿；定位采集约 5 秒后的 FIFO 故障；再跑 60 秒和 LoRa。
+
+## 2026-11-17 LoRa 数据接收与 ACK 时隙修正
+
+- 状态：已完成（单节点 30 秒与 60 秒空口收发、ACK、补传恢复）；待实测（8 节点扩容、5 分钟稳定性）。
+- 需求变化：无。节点 1003、±4 g、50 Hz、470.7 MHz/SF6BW125、UDP 1700 保持不变。
+- 根因：E870 的 TX_ACK 在 31 ms 内返回，但空口发射比主机下发晚约 400 ms。原 ACK 请求相位 4.03～4.10 s，空口到达约 4.43～4.50 s，超出节点 4.000～4.250 s 的 ACK 监听窗口。
+- 改动：`host/gateway.py` 增加 `ACK_TX_LEAD_US=400000`，ACK 请求窗口改为 3.68～3.82 s；`tests/test_e870_8_node.py` 的相位断言改为 3.75 s。
+- 实测：run 7028（30 秒）60/60 包、1487 样本、重传 0；run 7030（60 秒）119/120 包、2971 样本、重传 0。两次均 `state=1`、`queue=0`、网关无效包 0，RSSI -22 dBm、SNR 10.1～10.3 dB。
+- 补传：run 7029 采集期间网关中断，节点积压 112 包；网关恢复后只确认已保存序号，队列从 112 降到 0，119 包全部收齐。
+- 软件：`tests.test_e870_8_node` 与 `tests.test_desktop_control` 共 35 项全部通过。
+- 报告：`docs/changes/2026-11-17_02_LoRa接收与ACK时隙修正.md`。
+- 下一步：把 400 ms 补偿改为可配置项；评估加宽节点 ACK 监听窗口；8 节点扩容前复测时隙；补做 5 分钟稳定性测试。

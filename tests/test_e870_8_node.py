@@ -161,7 +161,7 @@ class EightNodeGatewayTests(unittest.TestCase):
         self.server.run_id = 77
         for node in self.server.targets:
             self.server._frame(self.data(node, node - 1000), {})
-        self.server.start_us = self.server.gnss_now_us - 4_050_000
+        self.server.start_us = self.server.gnss_now_us - 3_750_000
         self.server.tx_ready = time.monotonic() + 60
         self.server._schedule()
         ack_frames = [item[1] for item in self.server.downlinks if item[1].kind == ACK]
