@@ -2,16 +2,17 @@
 
 ## 当前进度
 
-- 更新日期：2026-11-16（Asia/Hong_Kong）
-- 当前分支：`codex/20261116-baseline`（远程：`origin/codex/20261116-baseline`；后续修改都在此分支，不合并到 `main`）。
-- 本轮 Git 基线：`16cc1a1`（docs(2026-11-16): 记录正式tx 50Hz采样复测通过）。固件源码提交：`cb99db0`；验证标签：`verified/2026-11-16-tx-50hz`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
+- 更新日期：2026-11-17（Asia/Hong_Kong）
+- 当前分支：`codex/20261117-sensor-reset-recovery`（从回退基线 `588dc0f` 新建；后续修改都在此分支，不合并到 `main`）。
+- 本轮 Git 基线：`588dc0f`（回退点）；上一验证基线：`16cc1a1`（docs(2026-11-16): 记录正式tx 50Hz采样复测通过）。固件源码提交：`cb99db0`；验证标签：`verified/2026-11-16-tx-50hz`；阶段1～3提交：`9e988f1`；清理前恢复标签继续保留为`archive/pre-cleanup-20261108`。
 - 当前步骤：阶段4～5进行中。2026-11-16 21:52正式tx固件完成室外50 Hz、60秒采样：valid=2972、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999µs；GNSS为fix=1、pps=1、healthy=1。启动时传感器3次自检均报vendor_init，执行一次SENSOR_RETRY后恢复state=1；采样使用传感器内部时钟，clock_ok=1。
-- 提交约定：从 2026-11-16 起，每次修改都带日期并提交到当前日期分支。分支名使用 `codex/YYYYMMDD-主题`；提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件名以 `YYYY-MM-DD_序号_主题.md` 开头，正文记录更新日期。本分支已推送到 `origin`；后续修改提交后同步推送到该分支，未经明确要求不合并到 `main`。实机结果、日志、镜像和构建产物不提交。
+- 2026-11-17 本轮结果（已完成）：修复 IIM42652 软复位只等待 1 ms 导致 `vendor_init rc=-12` 的问题，改为轮询 `RESET_DONE`（最长约 51 ms）。bringup 实机通过：`WHO_AM_I=0x6F`，248 样本/5 秒，49.6 Hz，SPI 错误 0。正式 tx 冷启动 `startup_attempts=1,startup_failure=none,state=1`。外部 32 kHz 实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。LoRa DATA 接收未执行：电脑以太网适配器当前 Disconnected，网关 192.168.1.10 不可达；此前的被动接收测试仍有效。失败可回退到 `588dc0f`，已验证标签 `verified/2026-11-16-tx-50hz` 保持不动。
+- 提交约定：从 2026-11-16 起，每次修改都带日期并提交到当前日期分支。分支名使用 `codex/YYYYMMDD-主题`；提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件名以 `YYYY-MM-DD_序号_主题.md` 开头，正文记录更新日期。是否推送到远程以用户明确授权为准；未经明确要求不合并到 `main`。实机结果、日志、镜像和构建产物不提交。
 - 当前操作约定：六线接线已完成；当前测试使用VCC/GND/SCK47/MOSI48/MISO39/CSB40，并接INT1 GPIO38和CLKIN GPIO36；GNSS RX=GPIO16、TX=GPIO15、PPS=GPIO41。COM8已完成bench、tx和USB诊断烧录。节点1003、±4g、50Hz配置不变。
 - 前轮节点测试条件（2026-11-11）：用户当时确认接线无误、室内无GNSS信号。本轮用户再次确认接线，COM8已复测；本轮GNSS状态见最终串口记录，正式GNSS/PPS和时钟门槛不变。
 - 8 节点 100 Hz：待开始；50 Hz 实机验收通过前不得标记完成或自动启用。
-- 本轮实施范围：核对固件版本一致性，烧录正式tx固件，在室外GNSS健康条件下完成60秒50Hz采样复测；不改驱动、接线和LoRa参数。
-- 当前报告：[成功固件提交与说明](docs/changes/2026-11-16_10_成功固件提交与说明.md)；[已验证固件说明](docs/verified_firmware_2026-11-16.md)；[交接文档](docs/HANDOVER.md)。
+- 本轮实施范围：修复传感器软复位等待和外部时钟频率超差回退；保持接线、节点1003、±4g、50Hz和LoRa参数不变；完成bringup、正式tx和本地30秒采样验证。
+- 当前报告：[传感器复位轮询与时钟回退](docs/changes/2026-11-17_01_传感器复位轮询与时钟回退.md)；[已验证固件说明](docs/verified_firmware_2026-11-16.md)；[交接文档](docs/HANDOVER.md)。
 - 已验证固件：固件源码`cb99db0`，Git标签`verified/2026-11-16-tx-50hz`；正式tx环境60秒50Hz采样通过，详细校验值和复现步骤见已验证固件说明。
 - 本轮验收门槛：启动自检`ok=1`；连续60秒采样不进入Fault；有效样本约3000条；相邻样本间隔接近20ms；记录FIFO计数、包头、失败原因和连续失败次数；bench与正式tx环境均构建，烧录和LoRa结果分别记录。
 - 本轮实测（2026-11-16）：20秒run7007 valid=995、60秒run7008 valid=2973；两项测试invalid=0、fifo_errors=0、lost_samples=0、dt_mean=19999µs。60秒测试有2条时间戳异常，按标称20ms回退，无Fault。正式tx启动READY,sensor=1,radio=1；室内gps=0、clock_ok=0，未启动采样；网关192.168.1.10不可达，未完成无线上行。

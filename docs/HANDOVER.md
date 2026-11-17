@@ -1,38 +1,38 @@
 # E870 八节点采集项目交接文档
 
-交接日期：2026-11-16（Asia/Hong_Kong）
-仓库分支：`codex/20261116-baseline`（远程：`origin/codex/20261116-baseline`；后续修改在此分支，不合并 `main`）
-当前功能固件提交：`cb99db0`（fix: 增加传感器启动自动恢复与时钟回退）
+交接日期：2026-11-17（Asia/Hong_Kong）
+仓库分支：`codex/20261117-sensor-reset-recovery`（从回退基线 `588dc0f` 新建；后续修改在此分支，不合并 `main`）
+当前功能固件提交：本轮修复提交（以 `git log -1 --oneline` 为准）；上一验证提交：`cb99db0`
 已验证固件说明：`docs/verified_firmware_2026-11-16.md`（标签 `verified/2026-11-16-tx-50hz`）
 交接文档提交：以 `git log -1 --oneline` 为准
 工作区状态：本轮提交后干净
 
 ## 1. 当前结论
 
-IIM42652 传感器已经能够自动启动和正常采样。启动自检最多重试 3 次，无效外部 32 kHz 在空闲状态会自动回退到传感器内部时钟。2026-11-16 21:52 正式 tx 固件在室外完成 60 秒、50 Hz 采样：valid=2972，invalid=0，fifo_errors=0，ts_anomaly=0，dt_mean=19999 µs；GNSS 为 fix=1、pps=1、healthy=1。启动时传感器 3 次自检均报 vendor_init，执行一次 SENSOR_RETRY 后恢复 state=1。当前节点因 119 个测试包未获 E870 ACK 保持 state=4；正式 START 前仍必须实时复读 GPS_DIAG。
+IIM42652 软复位失败问题已修复：驱动改为轮询 `RESET_DONE`，最长约 51 ms，不再在复位完成前只读一次。2026-11-17 正式 tx 冷启动一次通过：`startup_attempts=1`、`startup_failure=none`、`state=1`。外部 32 kHz 存在但实测 32257.4 Hz、+8045 ppm，超过 ±100 ppm 门槛后节点自动回退到传感器内部时钟，`clock_ok=1`。30 秒 50 Hz 采样通过：valid=1489、invalid=0、fifo_errors=0、ts_anomaly=0、dt_mean=19999 µs。当前节点处于 Draining，队列 60 包，原因是没有在线 E870 ACK；LoRa DATA 接收测试因电脑以太网适配器 Disconnected、网关 192.168.1.10 不可达，本轮未执行。
 
 | 功能 | 当前状态 | 结论 |
 |---|---|---|
 | 传感器身份 | 已通过 | WHO_AM_I=`0x6F` |
-| 传感器启动自检 | 已通过 | 有效 FIFO 样本、身份和配置检查均通过 |
-| 启动自动恢复 | 可用 | 本次冷启动 3 次失败，手动 SENSOR_RETRY 1 次后恢复 state=1 |
-| 50 Hz 采样 | 已通过 | 正式 tx 60 秒 2972 样，丢样和 FIFO 错误均为 0 |
+| 传感器启动自检 | 已通过 | 软复位轮询后 `vendor_init rc=0`，冷启动 `attempt=1` |
+| 启动自动恢复 | 已通过 | 本次冷启动第 1 次即成功，不再需要 SENSOR_RETRY |
+| 50 Hz 采样 | 已通过 | 正式 tx 30 秒 1489 样，丢样、FIFO 错误和时间戳异常均为 0 |
 | GNSS 定位 | 已通过（本轮） | 本轮读取 fix=1 |
 | PPS 秒脉冲 | 已通过（本轮） | pps=1，间隔 999984 µs，bad=0 |
 | UTC/PPS 时间映射 | 本轮通过 | healthy=1；每次 START 前仍需复读 |
-| 外部 32 kHz CLKIN | 不可用 | 启动探测和运行时看门狗均会回退到传感器内部时钟 |
+| 外部 32 kHz CLKIN | 不可用 | 实测 32257.4 Hz、+8045 ppm，频率超差后自动回退内部时钟 |
 | 内部时钟采样门槛 | 已修复 | `clock_ok=1, clock_source=sensor_internal` |
 | LoRa 射频初始化 | 已通过 | `READY,sensor=1,radio=1` |
-| LoRa 实际收包与 ACK | 待实测 | 尚无 E870 在线收包证据 |
+| LoRa 实际收包与 ACK | 待实测 | 电脑以太网适配器 Disconnected，网关不可达；此前被动接收 20 包正常 |
 | 8 节点扩容 | 待实测 | 单节点正式空口验收尚未完成 |
 
 ## 2. 当前设备状态
 
-以下为 2026-11-16 冷启动后 COM8 实读状态：
+以下为 2026-11-17 30 秒采样结束后的 COM8 实读状态：
 
 ```text
-STATUS,id=1003,state=1,gps=1,clock_hz=0.0000,ppm=0.00,
-clock_ok=1,clock_source=sensor_internal,queue=0,
+STATUS,id=1003,state=4,gps=1,clock_hz=32257.4336,ppm=8044.84,
+clock_ok=1,clock_source=sensor_internal,queue=60,
 lost_samples=0,lost_packets=0,startup_attempts=1,
 startup_failure=none,fault_reason=none
 ```
@@ -40,22 +40,22 @@ startup_failure=none,fault_reason=none
 同一时段的 GNSS 详细状态为：
 
 ```text
-GPS_DIAG,fix=1,pps=0,time=0,healthy=0,pps_count=43,
-pps_interval_us=865267,pps_bad=12
+GPS_DIAG,fix=1,pps=1,time=1,healthy=1,pps_count=113,
+pps_interval_us=999982,age_ms=895,pps_bad=0,timer_jumps=0
 ```
 
 解释：
 
-- `state=1`：Waiting。节点已就绪，但当前没有运行采样。
+- `state=4`：Draining。采样已结束，队列中的包正在等待 E870 ACK。
 - `gps=1`：该次 `STATUS` 输出时，GNSS/PPS 时间基准判定健康。
 - `gps=0`：该次 `STATUS` 输出时，GNSS/PPS 时间基准不合格。
 - `gps` 会随实时健康判定变化。正式 START 前必须用 `GPS_DIAG` 确认 `healthy=1`，不能依赖上一次 `STATUS`。
 - `clock_ok=1`：当前采样时钟门槛通过。
 - `clock_source=sensor_internal`：使用 IIM42652 内部时钟。
 - `clock_hz` 和 `ppm` 无效：该字段仍在测量已经停用的 GPIO36 外部 32 kHz，不能用于内部时钟判定。
-- `queue=0,lost_samples=0,lost_packets=0`：当前没有积压和丢失。
+- `queue=60,lost_samples=0,lost_packets=0`：60 个包等待 ACK；没有丢失样本或数据包。
 
-如果现在要开始采样，必须发送有效的 `START_AT` 命令或由 E870 上位机下发 START。仅上电不会自动开始采样。
+如果现在要开始采样，必须发送有效的 `START_AT` 命令或由 E870 上位机下发 START。仅上电不会自动开始采样。队列未清空时不能开始新运行；恢复网关并收到 ACK 后队列会清空。
 
 ## 3. 硬件与接线
 
@@ -81,6 +81,7 @@ pps_interval_us=865267,pps_bad=12
 - 外部时钟不可用时关闭 CLKIN，重新用 `external_clock=0` 初始化 IIM42652。
 - 启动自检最多执行 3 次完整初始化，每次失败后等待 300 ms。
 - 外部时钟在空闲运行时连续失败，会关闭 CLKIN 并自动回退内部时钟。
+- 外部时钟存在但 60 秒频率测量超过 ±100 ppm 时，空闲节点也会自动回退内部时钟。
 - 采样进行中或队列非空时不会无提示切换时基；这种情况仍进入 Fault。
 - 内部时钟模式不要求 GPIO36 边沿，也不要求外部 60 秒频率测量。
 - 内部时钟模式仍要求传感器启动自检、有效 FIFO 样本、有效 XYZ 和 WHO_AM_I。
@@ -184,17 +185,57 @@ tmp/logs/startup_retry_bench_50hz_60s_20261116.log
 tmp/logs/startup_retry_tx_final_20261116.log
 ```
 
-正式 tx 固件已恢复到 COM8，当前状态：
+正式 tx 固件已恢复到 COM8。30 秒测试结束后节点处于 Draining，队列 60 包等待网关 ACK：
 
 ```text
-STATUS,id=1003,state=1,gps=0,clock_ok=1,
-clock_source=sensor_internal,queue=0,
-lost_samples=0,lost_packets=0,startup_attempts=1,
+STATUS,id=1003,state=4,gps=1,clock_ok=1,clock_source=sensor_internal,
+queue=60,lost_samples=0,lost_packets=0,startup_attempts=1,
 startup_failure=none,fault_reason=none
 ```
 
-## 6. 构建与烧录
+### 5.5 软复位与时钟回退修复（2026-11-17）
 
+bringup 实机结果：
+
+```text
+PREFLIGHT,config=hspi_mode0_100k,who1=0x6F,who2=0x6F,who3=0x6F,stable=1
+DRIVER_STEP,vendor_init,rc=0,OK
+WHO_AM_I,value=0x6F,expected=0x6F,ok=1
+SAMPLING,samples=248,elapsed_us=5000002,rate_hz=49.600,spi_errors=0,mean_g=1.0140
+BRINGUP_RESULT,result=PASS
+```
+
+正式 tx 冷启动与内部时钟回退：
+
+```text
+CLOCK_SOURCE,source=sensor_internal,pad_usable=1,reason=external_frequency_out_of_range,hz=32257.4492,ppm=8045.32
+SENSOR_STARTUP_END,trigger=clock_frequency,ok=1,attempt=1
+STATUS,id=1003,state=1,gps=1,clock_ok=1,clock_source=sensor_internal,
+startup_attempts=1,startup_failure=none,fault_reason=none
+```
+
+30 秒 50 Hz 采样：
+
+```text
+valid=1489
+invalid=0
+fifo_errors=0
+ts_anomaly=0
+lost_samples=0
+lost_packets=0
+dt_mean_us=19999
+dt_min_us=19985
+dt_max_us=20002
+state_after=4
+queue=60
+startup_failure=none
+fault_reason=none
+pass=1
+```
+
+说明：`state_after=4` 是 Draining，队列 60 包等待 E870 ACK。本轮电脑以太网适配器为 Disconnected，无法启动网关接收端，因此 LoRa DATA 包接收率、RSSI、SNR 和 ACK 没有新增实测数据。
+
+## 6. 构建与烧录
 当前正式环境：
 
 ```text
@@ -257,8 +298,8 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 ## 9. 新对话接手顺序
 
 1. 先读本文件和根目录 [PROJECT_PLAN.md](../PROJECT_PLAN.md)。
-2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认当前分支为 `codex/20261116-baseline`，并与 `origin/codex/20261116-baseline` 同步。
-3. 读取[本轮报告](changes/2026-11-16_07_远程分支推送与后续工作分支.md)。
+2. 运行 `git status --short --branch`、`git log -5 --oneline`，确认当前分支为 `codex/20261117-sensor-reset-recovery`，回退点为 `588dc0f`。
+3. 读取[本轮报告](changes/2026-11-17_01_传感器复位轮询与时钟回退.md)。
 4. 识别当前 COM 口和设备，不要默认仍为 COM8。
 5. 读取 STATUS，确认 `state=1,clock_ok=1,startup_failure=none,fault_reason=none`；再单独读取 GPS_DIAG 检查 GNSS/PPS。
 6. 需要验证采样时，先跑 USB 60 秒，再烧录正式 tx。
@@ -267,13 +308,13 @@ $env:PLATFORMIO_DISABLE_TELEMETRY='1'
 
 ## 10. Git 与本地资料
 
-- 当前分支：`codex/20261116-baseline`
-- 远程分支：`origin/codex/20261116-baseline`
-- 分支规则：后续修改都在此分支提交并推送；未经明确要求不合并到 `main`。
-- 当前功能固件提交：`cb99db0`
+- 当前分支：`codex/20261117-sensor-reset-recovery`
+- 远程分支：尚未推送；需要用户明确授权后才能推送
+- 分支规则：后续修改都在此分支提交；推送需要用户明确授权；未经明确要求不合并到 `main`。
+- 当前功能固件提交：本轮修复提交（以 `git log -1 --oneline` 为准）；上一验证提交：`cb99db0`
 - 关键前序提交：`96cdbe3`、`f9bda89`、`cb099e7`、`4cadadd`
 - 日期化提交：从 2026-11-16 起，提交信息使用 `类型(YYYY-MM-DD): 内容`；修改报告文件以日期开头；长期文档改动更新“更新日期”。
-- 当前报告：[远程分支推送与后续工作分支](changes/2026-11-16_07_远程分支推送与后续工作分支.md)
+- 当前报告：[传感器复位轮询与时钟回退](changes/2026-11-17_01_传感器复位轮询与时钟回退.md)
 - 长期接线文档：[wiring_and_flash.md](wiring_and_flash.md)
 - 协议文档：[protocol_v3.md](protocol_v3.md)
 - 网关操作：[e870_setup.md](e870_setup.md)
@@ -288,6 +329,9 @@ tmp/logs/startup_retry_bench_50hz_60s_20261116.log
 tmp/logs/startup_retry_tx_final_20261116.log
 tmp/logs/run7010_internal_clock_60s_20261116.log
 tmp/logs/tx7011_internal_clock_short_20261116.log
+tmp/e870_lora_rx_20261116/bringup_fixed.log
+tmp/e870_lora_rx_20261116/clock_fallback.log
+tmp/e870_lora_rx_20261116/local_full_test.log
 ```
 
 这些文件不提交 Git，新电脑或重新克隆仓库后可能不存在。

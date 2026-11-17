@@ -347,6 +347,27 @@ bool NodeApp::samplingClockHealthy() const {
 void NodeApp::tick() {
   gps_.update();
   clock_.update(gps_.healthy());
+  // The board-side 32 kHz carrier can pass presence checks but fail the
+  // frequency tolerance. If that happens while idle, switch to the sensor's
+  // internal oscillator instead of leaving capture blocked forever.
+  if (externalClock_ && gps_.healthy() && clock_.measured() &&
+      !clock_.healthy() && state_ == Waiting && !sensorActive_ &&
+      queue_.size() == 0) {
+    Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
+                  "reason=external_frequency_out_of_range,hz=%.4f,ppm=%.2f\n",
+                  clock_.padUsable() ? 1 : 0, clock_.hz(), clock_.ppm());
+    clock_.setOutputEnabled(false);
+    clockOutputReady_ = false;
+    clockOutputBlocked_ = true;
+    externalClock_ = false;
+    sensorReady_ = startSensorWithRecovery("clock_frequency", false);
+    state_ = sensorReady_ && radioReady_ ? Waiting : Fault;
+    faultReason_ = sensorReady_ ? (radioReady_ ? "none" : "radio_init")
+                                : "sensor_startup";
+    Serial.printf("CLOCK_FREQUENCY_FALLBACK,sensor_ready=%u,state=%u,"
+                  "fault_reason=%s\n",
+                  sensorReady_, state_, faultReason_);
+  }
   if (gps_.healthy()) {
     anchorEpoch_ = gps_.epochUsAtLastPps();
     anchorLocal_ = gps_.localUs64AtLastPps();

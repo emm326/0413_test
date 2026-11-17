@@ -95,23 +95,30 @@ int inv_ixm42xxx_device_reset(struct inv_ixm42xxx * s)
 	if(status)
 		return status;
 
-	/* Wait 1000us for soft reset to be effective before trying to perform any further read */
+	/* The soft reset can take longer than 1 ms. Wait for the RESET_DONE
+	 * bit instead of checking it only once. Poll for up to about 51 ms.
+	 */
 	inv_ixm42xxx_sleep_us(1000);
-
-	status |= inv_ixm42xxx_set_reg_bank(s, 1);
-	status |= inv_ixm42xxx_write_reg(s, MPUREG_INTF_CONFIG4_B1, 1, &intf_cfg4_reg);
-	status |= inv_ixm42xxx_set_reg_bank(s, 0);
-
-	/* Check the Int Reset Done bit */
-	status |= inv_ixm42xxx_read_reg(s, MPUREG_INT_STATUS, 1, &data);
-	if (0 == (data & BIT_INT_STATUS_RESET_DONE)) {
-		return INV_ERROR_UNEXPECTED;
+	for (int reset_poll = 0; reset_poll <= 50; reset_poll++) {
+		int rc = inv_ixm42xxx_read_reg(s, MPUREG_INT_STATUS, 1, &data);
+		if (rc != INV_ERROR_SUCCESS) {
+			return rc;
+		}
+		if (data & BIT_INT_STATUS_RESET_DONE) {
+			break;
+		}
+		if (reset_poll == 50) {
+			return INV_ERROR_UNEXPECTED;
+		}
+		inv_ixm42xxx_sleep_us(1000);
 	}
 
 	/* Init transport layer */
 	inv_ixm42xxx_init_transport(s);
-	
+
+	/* Restore the saved interface configuration after reset completes. */
 	status |= inv_ixm42xxx_set_reg_bank(s, 1);
+	status |= inv_ixm42xxx_write_reg(s, MPUREG_INTF_CONFIG4_B1, 1, &intf_cfg4_reg);
 	status |= inv_ixm42xxx_write_reg(s, MPUREG_INTF_CONFIG6_B1, 1, &intf_cfg6_reg);
 	/* Configure FSYNC on INT2=pin 9 */
 	status |= inv_ixm42xxx_read_reg(s, MPUREG_INTF_CONFIG5_B1, 1, &data);
