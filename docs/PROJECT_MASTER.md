@@ -74,7 +74,7 @@ E870-L470LG12-O 网关
 
 | 组合 | 开发板 | 传感器 | 正式环境 | 默认节点 | 实机状态 |
 |---|---|---|---:|---:|---|
-| A | Heltec V3.2 LF | IIM-42352 | `heltec_v32_iim42352_tx` | 1002 | 启动自检和 50 Hz 采样测试已通过；GNSS、LoRa、ACK 待验收 |
+| A | Heltec V3.2 LF | IIM-42352 | `heltec_v32_iim42352_tx` | 1002 | 2026-11-20 曾通过启动自检和 50 Hz 采样；接入 GNSS 后传感器总线读数变为 `0x00`，待恢复；GNSS 已在 115200 收到 NMEA |
 | B | Heltec V3.2 LF | IIM-42652 | `heltec_v32_iim42652_tx` | 1004 | 曾烧录 1004，自检失败；当前不作已通过 |
 | C | EoRa-S3-400TB | IIM-42352 | `eora_s3_400_iim42352_tx` | 1001 | 未完成该组合实机验收 |
 | D | EoRa-S3-400TB | IIM-42652 | `eora_s3_400_iim42652_tx` | 1003 | 当前已通过单节点采样和 LoRa 验收 |
@@ -142,6 +142,18 @@ Heltec 板载 CP2102 使用 UART0。EoRa 使用原生 USB CDC。两者串口配�
 - 状态：`STATUS,id=1002,state=1,...,fault_reason=none`。
 - 采样：`SENSOR_SAMPLE_TEST_END,configured=1,samples=20,target=20,ok=1`，样本间隔约 20 ms。
 - 限制：该次测试没有接入 GNSS，`gps=0`；LoRa 和 ACK 未验收。
+
+2026-11-20 接入 GNSS 后的补充结果：
+
+- GNSS 串口确认工作：`GPS_SCAN` 在 `115200` 收到 716 字节/2 秒、24 个 `$`、2 条 RMC，示例为 `$GNGGA,...`。
+- GNSS 定位尚未建立：连续观察约 3.5 分钟后仍为 `fix=0,pps=0`，GGA 卫星数为 0，因此没有 PPS。
+- 传感器当前无响应：`SENSOR_PROBE` 全部返回 `identity=0x00`，`SENSOR_I2C_SCAN,found=0`。
+- 该现象发生在接入 GNSS 之后，接入前同一块板已通过身份 `0x6D`、启动自检和 20 条样本测试。
+- 当前判断：GNSS 代码和串口正常；传感器需要检查模块供电、GND 和模块本体，不能继续按软件参数排查。
+
+### 3.4 GNSS 波特率诊断
+
+固件提供 `GPS_SCAN` 命令，用于在 115200、9600、38400、57600、19200、4800 六个波特率下各接收 2 秒，输出字节数、`$` 数量和 RMC 数量。该命令只用于诊断，会暂停 GNSS 解析约 12 秒。
 
 ## 4. IIM42652 / IIM42352 功能与采样实现
 
@@ -292,6 +304,7 @@ GNSS UART 固定 `115200`，当前只解析带有效校验的 RMC 语句。PPS �
 |---|---|---|
 | `STATUS` | 请求并输出状态 | 每 5 秒也会自动输出 STATUS |
 | `GPS_DIAG` | 输出 GNSS/PPS 详细状态 | START 前必须检查 |
+| `GPS_SCAN` | 扫描 GNSS 常见波特率并统计收到的字节和 RMC 语句 | 只读诊断；会暂停 GNSS 解析约 12 秒 |
 | `DIAG` | 输出传感器寄存器诊断 | 只读 |
 | `SENSOR_RETRY` | 重新执行完整传感器启动 | 会操作寄存器；只在空闲时执行 |
 | `SENSOR_LINK_TEST` | 软件 SPI 只读链路对照 | 会改变现场状态；只在空闲时执行 |

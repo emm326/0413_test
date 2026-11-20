@@ -11,6 +11,8 @@ class GpsTimebase {
   }
   bool begin(int8_t rxPin, int8_t txPin, int8_t ppsPin, uint32_t baud);
   void update();
+  // Diagnostic only: probe common GNSS baud rates and report received bytes.
+  void scanBaud();
   bool fixValid() const;
   bool ppsValid() const;
   bool timeValid() const;
@@ -40,6 +42,9 @@ class GpsTimebase {
   void (*ppsObserver_)(uint64_t) = nullptr;
   HardwareSerial& serial_;
   int8_t ppsPin_;
+  int8_t rxPin_;
+  int8_t txPin_;
+  uint32_t baud_;
   char line_[LINE_CAPACITY];
   size_t lineLen_;
   bool fixValid_;

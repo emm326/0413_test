@@ -697,6 +697,14 @@ void NodeApp::serialCommands() {
       report(Status);
       continue;
     }
+    if (!strcmp(serialLine_, "GPS_SCAN")) {
+      if (sensorActive_ || queue_.size()) {
+        Serial.println("GPS_SCAN,ok=0,reason=busy");
+        continue;
+      }
+      gps_.scanBaud();
+      continue;
+    }
     if (!strcmp(serialLine_, "GPS_DIAG")) {
       Serial.printf("GPS_DIAG,fix=%u,pps=%u,time=%u,healthy=%u,"
                     "pps_count=%lu,pps_interval_us=%lu,age_ms=%lu,"
@@ -727,7 +735,7 @@ void NodeApp::serialCommands() {
       acceptStart(h, options);
     } else
       Serial.println(
-          "COMMANDS: DIAG; SENSOR_RETRY; SENSOR_SAMPLE_TEST; SENSOR_LINK_TEST; SENSOR_I2C_SCAN; START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
+          "COMMANDS: DIAG; SENSOR_RETRY; SENSOR_SAMPLE_TEST; SENSOR_LINK_TEST; SENSOR_I2C_SCAN; GPS_DIAG; GPS_SCAN; START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
   }
 }
 void NodeApp::acquire() {

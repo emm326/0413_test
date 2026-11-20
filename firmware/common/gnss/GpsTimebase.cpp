@@ -9,6 +9,9 @@ GpsTimebase* GpsTimebase::activeInstance_ = nullptr;
 GpsTimebase::GpsTimebase(HardwareSerial& serial)
     : serial_(serial),
       ppsPin_(-1),
+      rxPin_(-1),
+      txPin_(-1),
+      baud_(115200),
       line_{},
       lineLen_(0),
       fixValid_(false),
@@ -29,6 +32,9 @@ GpsTimebase::GpsTimebase(HardwareSerial& serial)
 
 bool GpsTimebase::begin(int8_t rxPin, int8_t txPin, int8_t ppsPin, uint32_t baud) {
   ppsPin_ = ppsPin;
+  rxPin_ = rxPin;
+  txPin_ = txPin;
+  baud_ = baud;
   serial_.begin(baud, SERIAL_8N1, rxPin, txPin);
   pinMode(ppsPin_, INPUT);
   activeInstance_ = this;
@@ -91,6 +97,65 @@ void GpsTimebase::update() {
   lastMappedPpsLocalUs_ = ppsLocalUs;
   lastMappedPpsLocalMs_ = millis();
   timeValid_ = true;
+}
+
+void GpsTimebase::scanBaud() {
+  // Diagnostic only. GNSS modules ship with different UART defaults, so probe
+  // the common rates and report whether any bytes or RMC sentences arrive.
+  static const uint32_t rates[] = {115200, 9600, 38400, 57600, 19200, 4800};
+  lineLen_ = 0;
+  line_[0] = '\0';
+  Serial.printf("GPS_BAUD_SCAN_BEGIN,rx=%d,tx=%d,current=%lu\n", rxPin_, txPin_,
+                (unsigned long)baud_);
+  for (uint8_t i = 0; i < sizeof(rates) / sizeof(rates[0]); ++i) {
+    const uint32_t rate = rates[i];
+    serial_.end();
+    serial_.begin(rate, SERIAL_8N1, rxPin_, txPin_);
+    delay(50);
+    uint32_t bytes = 0;
+    uint32_t dollars = 0;
+    uint32_t rmc = 0;
+    char sample[81] = {};
+    size_t sampleLen = 0;
+    char line[128] = {};
+    size_t lineLen = 0;
+    const uint32_t started = millis();
+    while (millis() - started < 2000UL) {
+      while (serial_.available()) {
+        const char ch = static_cast<char>(serial_.read());
+        ++bytes;
+        if (sampleLen + 1 < sizeof(sample) && ch >= 32 && ch < 127) {
+          sample[sampleLen++] = ch;
+        }
+        if (ch == '$') {
+          ++dollars;
+        }
+        if (ch == '\r') {
+          continue;
+        }
+        if (ch == '\n') {
+          line[lineLen] = '\0';
+          if (strstr(line, "RMC") != nullptr) {
+            ++rmc;
+          }
+          lineLen = 0;
+        } else if (lineLen + 1 < sizeof(line)) {
+          line[lineLen++] = ch;
+        }
+      }
+      delay(1);
+    }
+    sample[sampleLen] = '\0';
+    Serial.printf(
+        "GPS_BAUD_SCAN,baud=%lu,bytes=%lu,dollars=%lu,rmc=%lu,sample=%s\n",
+        (unsigned long)rate, (unsigned long)bytes, (unsigned long)dollars,
+        (unsigned long)rmc, sampleLen ? sample : "-");
+  }
+  serial_.end();
+  serial_.begin(baud_, SERIAL_8N1, rxPin_, txPin_);
+  lineLen_ = 0;
+  line_[0] = '\0';
+  Serial.printf("GPS_BAUD_SCAN_END,restored_baud=%lu\n", (unsigned long)baud_);
 }
 
 bool GpsTimebase::fixValid() const {
