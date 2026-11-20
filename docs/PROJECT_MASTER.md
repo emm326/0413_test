@@ -15,13 +15,16 @@
 
 项目目标是构建一套 8 节点三轴加速度同步采集系统。每个 ESP32 节点使用 IIM-42352 或 IIM-42652 采集加速度，使用 GNSS UTC 和 PPS 建立时间基准，通过 LoRa 将数据发到一台 E870 网关，再由电脑保存为 CSV 并生成质量报告。
 
-当前已经完成单节点端到端验证。节点 `1003` 使用 EoRa-S3-400TB 和 YBX-IIM42652，完成了启动自检、50 Hz 采样、GNSS/PPS 健康检查、470.7 MHz LoRa 上行、E870 ACK 和补传恢复。8 节点并行、两小时稳定性和 100 Hz 尚未验收。
+当前已经完成单节点端到端验证。节点 `1003` 使用 EoRa-S3-400TB 和 YBX-IIM42652，完成了启动自检、50 Hz 采样、GNSS/PPS 健康检查、470.7 MHz LoRa 上行、E870 ACK 和补传恢复。2026-11-20 补充验证 Heltec V3.2 LF + IIM-42352 节点 `1002`：外部 32 kHz CLKIN、身份 `WHO_AM_I=0x6D`、启动自检和 20 条 50 Hz 加速度样本均已通过；GNSS、LoRa 和 ACK 尚未在该组合验收。8 节点并行、两小时稳定性和 100 Hz 尚未验收。
 
 | 功能 | 当前状态 | 当前结论 |
 |---|---|---|
 | IIM42652 身份 | 已通过 | `WHO_AM_I=0x6F` |
 | IIM42652 启动自检 | 已通过 | 软复位等待 `RESET_DONE` 后 `vendor_init rc=0` |
 | 启动自动恢复 | 已通过 | 最多 3 次完整初始化，每次失败等待 300 ms |
+| IIM42352 身份 | 已通过 | Heltec 节点 1002 实测 `WHO_AM_I=0x6D` |
+| IIM42352 启动自检 | 已通过 | 连续 3 次复位均在首次尝试通过，外部 CLKIN 边沿 3871/120 ms |
+| IIM42352 50 Hz 采样 | 已通过 | `SENSOR_SAMPLE_TEST` 20/20 条有效样本，间隔约 20 ms |
 | 外部 32 kHz CLKIN | 不可用 | 实测约 `32257.4 Hz`、`+8045 ppm`，超过 ±100 ppm 门槛 |
 | 传感器内部时钟采样 | 已通过 | `clock_ok=1,clock_source=sensor_internal` |
 | 50 Hz 单节点采样 | 已通过 | 60 秒有效样本 2973，FIFO 错误、非法样本和时间戳异常均为 0 |
@@ -71,7 +74,7 @@ E870-L470LG12-O 网关
 
 | 组合 | 开发板 | 传感器 | 正式环境 | 默认节点 | 实机状态 |
 |---|---|---|---:|---:|---|
-| A | Heltec V3.2 LF | IIM-42352 | `heltec_v32_iim42352_tx` | 1002 | 未完成该组合实机验收 |
+| A | Heltec V3.2 LF | IIM-42352 | `heltec_v32_iim42352_tx` | 1002 | 启动自检和 50 Hz 采样测试已通过；GNSS、LoRa、ACK 待验收 |
 | B | Heltec V3.2 LF | IIM-42652 | `heltec_v32_iim42652_tx` | 1004 | 曾烧录 1004，自检失败；当前不作已通过 |
 | C | EoRa-S3-400TB | IIM-42352 | `eora_s3_400_iim42352_tx` | 1001 | 未完成该组合实机验收 |
 | D | EoRa-S3-400TB | IIM-42652 | `eora_s3_400_iim42652_tx` | 1003 | 当前已通过单节点采样和 LoRa 验收 |
@@ -130,7 +133,17 @@ EoRa OLED 使用 GPIO17/18，当前不占用。固件使用串口输出状态，
 
 Heltec 板载 CP2102 使用 UART0。EoRa 使用原生 USB CDC。两者串口配置不能互用。
 
-## 4. IIM42652 功能与采样实现
+2026-11-20 在 COM6 完成 Heltec V3.2 LF + IIM-42352 测试：
+
+- 固件环境：`heltec_v32_iim42352_usb_test`，版本字符串 `3.0.1`。
+- 身份读数：`SENSOR_ID,name=IIM-42352,expected=0x6D,actual=0x6D,ok=1`。
+- 启动自检：连续 3 次复位均在首次尝试通过，`fifo_samples=33`、`clock_edges=3871`。
+- 时钟：`clock_source=external`、`clock_output=1`。
+- 状态：`STATUS,id=1002,state=1,...,fault_reason=none`。
+- 采样：`SENSOR_SAMPLE_TEST_END,configured=1,samples=20,target=20,ok=1`，样本间隔约 20 ms。
+- 限制：该次测试没有接入 GNSS，`gps=0`；LoRa 和 ACK 未验收。
+
+## 4. IIM42652 / IIM42352 功能与采样实现
 
 ### 4.1 当前采样配置
 
@@ -181,7 +194,7 @@ IIM42652 正式驱动使用原厂 Ixm42xxx 1.1.1 高层 API。旧手写初始化
 
 - 身份寄存器正确。
 - FIFO 计数有效。
-- 启动窗口内 FIFO 样本数量合理。
+- 启动窗口内 FIFO 样本数量在 4–64 之间。启动窗口包含切换低噪声模式时的短暂积压，因此上限不能按稳态单次读取量设置。
 - 至少读取到一组有效 XYZ。
 - DRDY 数量不得形成异常中断风暴。
 - 外部时钟模式还要求板端 32 kHz 回波计数合理。
@@ -192,7 +205,7 @@ IIM42652 正式驱动使用原厂 Ixm42xxx 1.1.1 高层 API。旧手写初始化
 
 1. 尝试建立外部 32 kHz CLKIN。
 2. 用 500 ms 窗口检查外部时钟是否存在。
-3. 外部时钟不可用时关闭 CLKIN，改用传感器内部时钟。
+3. 只有实测外部时钟边沿超出允许范围时，才关闭 CLKIN 并改用传感器内部时钟。启动自检因其他原因失败时，不得关闭已经正常工作的外部时钟。
 4. 最多执行 3 次完整传感器启动自检。
 5. 每次失败后等待 300 ms。
 6. 任意一次成功，节点进入 Waiting。
@@ -631,10 +644,11 @@ run 7029 在采集期间停止网关约 45 秒，节点积压 112 包。网关�
 1. 读取完整 BOOT 日志。
 2. 发送 `STATUS`，检查 `startup_attempts`、`startup_failure` 和 `fault_reason`。
 3. 发送 `DIAG`，检查 `WHO_AM_I`、`ACCEL_CONFIG0`、`PWR_MGMT0` 和 FIFO 配置。
-4. 确认 `WHO_AM_I=0x6F`。
-5. 确认节点处于 Waiting 且队列为 0。
-6. 必要时发送 `SENSOR_RETRY`。
-7. 如果仍失败，停止修改采样参数，执行六线最小测试。
+4. 确认 `WHO_AM_I=0x6F`（IIM42652）；IIM-42352 的预期值为 `0x6D`。
+5. 查看 `SENSOR_CHECK_ATTEMPT` 的 `drdy`、`fifo_samples`、`clock_edges`、`sample_valid` 和 `identity_ok`，先定位失败条件，再调整硬件或参数。
+6. 确认节点处于 Waiting 且队列为 0。
+7. 必要时发送 `SENSOR_RETRY`。
+8. 如果仍失败，停止修改采样参数，执行六线最小测试。
 
 `SENSOR_RETRY` 不允许在 Armed、Capturing 或 Draining 状态执行。
 

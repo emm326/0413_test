@@ -1,6 +1,6 @@
 # E870 八节点无线采集当前计划
 
-- 更新日期：2026-11-17（Asia/Hong_Kong）
+- 更新日期：2026-11-20（Asia/Hong_Kong）
 - 当前分支：`codex/20261117-sensor-reset-recovery`
 - 当前技术总文档：`docs/PROJECT_MASTER.md`
 - 当前验证标签：`verified/2026-11-16-tx-50hz`
@@ -13,6 +13,7 @@
 | 项目 | 当前值 |
 |---|---|
 | 当前实机节点 | EoRa-S3-400TB + YBX-IIM42652，节点 1003 |
+| 当前新增测试节点 | Heltec V3.2 LF + IIM-42352，节点 1002，COM6 |
 | 正式固件环境 | `eora_s3_400_iim42652_tx` |
 | 采样配置 | 50 Hz、±4 g、加速度 only |
 | 采样时钟 | IIM42652 内部时钟；外部 32 kHz 当前超差 |
@@ -38,6 +39,7 @@
 | 6 | 8 节点 50 Hz 连续两小时 | 待实测 | 尚未开始 |
 | 7 | 100 Hz/SF5 | 待开始 | 以步骤 6 通过为前置条件 |
 | 8 | 文档和 `tmp` 清理 | 已完成 | 已合并为一份总文档；`tmp` 从 1403 个文件、296.87 MB 清理到 97 个文件、12.78 MB |
+| 9 | Heltec V3.2 + IIM-42352 功能对齐 | 进行中 | COM6 已通过身份 `0x6D`、外部 CLKIN、启动自检和 20 条 50 Hz 采样；GNSS、LoRa、ACK 待验收 |
 
 ## 最近关键结果
 
@@ -47,6 +49,20 @@
 - 补传 run 7029：节点积压 112 包，网关恢复后队列降至 0，119 个唯一包全部收齐。
 - 外部 32 kHz 实测约 32257.4 Hz、+8045 ppm，节点使用内部时钟完成 50 Hz 采样。
 - GNSS/PPS 在 run 7031 前后均为 `fix=1,pps=1,time=1,healthy=1`。
+- 2026-11-20 Heltec V3.2 LF + IIM-42352（节点 1002，COM6）：连续 3 次复位均在首次启动自检通过，`WHO_AM_I=0x6D`、`fifo_samples=33`、`clock_edges=3871`、`clock_source=external`。
+- 2026-11-20 `SENSOR_SAMPLE_TEST`：20/20 条有效样本，间隔约 20 ms，恢复外部时钟后状态回到 `state=1`。
+- 2026-11-20 回归编译通过：`heltec_v32_iim42352_tx`、`heltec_v32_iim42652_tx`、`eora_s3_400_iim42652_tx`；软件测试 3/3 通过。
+
+## 本轮记录（2026-11-20）
+
+- 做了什么：定位 Heltec V3.2 + IIM-42352 启动失败原因，修正启动自检 FIFO 窗口和外部时钟回退条件，完成 COM6 实机验证。
+- 文件变化：`StartupCheck.h`、`NodeApp.cpp`、`IimBase.h`、`IimBase.cpp`、`tests/firmware_sensor_transport.cpp`、项目文档。
+- 接线：Heltec V3.2 LF + IIM-42352，传感器接线不变；USB 串口 COM6，460800 波特率。
+- 烧录：`heltec_v32_iim42352_usb_test`，使用 `--upload-port COM6`。
+- 编译结果：`heltec_v32_iim42352_usb_test`、`heltec_v32_iim42352_tx`、`heltec_v32_iim42652_tx`、`eora_s3_400_iim42652_tx` 全部成功；软件测试 3/3 通过。
+- 实机结果：连续 3 次复位均在首次启动自检通过；最终固件复核 `WHO_AM_I=0x6D`、`fifo_samples=33`、`clock_edges=3871`、`state=1`；`SENSOR_SAMPLE_TEST` 20/20 条有效样本。
+- Git 基线：提交前 `9100e8e`。
+- 下一步：接入 GNSS，验证 LoRa 上行、E870 接收和 ACK。
 
 ## 已知限制
 
@@ -61,9 +77,10 @@
 
 ## 下一步
 
-1. 复测单节点 5 分钟 LoRa 连续收发与补传。
-2. 将 400 ms ACK 发射补偿改为配置项。
-3. 评估并测试更宽的节点 ACK 接收窗口。
-4. 按 1→2→4→8 节点逐步扩容。
-5. 8 节点 50 Hz 两小时通过后，再制定 100 Hz/SF5 验收。
-
+1. 为 Heltec 节点 1002 接入 GNSS，确认 `GPS_DIAG` 的 `healthy=1`。
+2. 在 Heltec 节点 1002 上验证 LoRa 上行、E870 接收和 ACK。
+3. 复测单节点 5 分钟 LoRa 连续收发与补传。
+4. 将 400 ms ACK 发射补偿改为配置项。
+5. 评估并测试更宽的节点 ACK 接收窗口。
+6. 按 1→2→4→8 节点逐步扩容。
+7. 8 节点 50 Hz 两小时通过后，再制定 100 Hz/SF5 验收。

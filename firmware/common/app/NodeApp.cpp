@@ -197,7 +197,14 @@ bool NodeApp::initializeSensor(bool resetDevice) {
   // leave the node faulted: stop CLKIN, let the sensor use its internal
   // oscillator, and rerun the same startup evidence checks. External clock is
   // preferred, but a stable internal-clock node is usable.
-  if (!passed && externalClock_) {
+  // Fall back only when the measured external clock is outside the allowed
+  // edge band. A failed check with a healthy clock (for example a FIFO count
+  // outside the startup window) must not disable a working CLKIN.
+  const bool externalClockOutOfRange =
+      !initialized ||
+      last.clockEdges < SensorChecks::startupExternalClockMinEdges ||
+      last.clockEdges > SensorChecks::startupExternalClockMaxEdges;
+  if (!passed && externalClock_ && externalClockOutOfRange) {
     Serial.printf("CLOCK_SOURCE,source=sensor_internal,pad_usable=%u,"
                   "reason=external_runtime_failed\n",
                   clock_.padUsable() ? 1 : 0);
@@ -643,9 +650,24 @@ void NodeApp::serialCommands() {
       sensorSampleTest();
       continue;
     }
+    if (!strcmp(serialLine_, "SENSOR_I2C_SCAN")) {
+      if (sensorActive_ || queue_.size()) {
+        Serial.println("SENSOR_I2C_SCAN,ok=0,reason=busy");
+        continue;
+      }
+#ifdef APP_SENSOR_IIM42352
+      sensor_.i2cScan();
+#else
+      // The formal IIM42652 driver uses vendor SPI only and has no I2C scanner.
+      Serial.println("SENSOR_I2C_SCAN,ok=0,reason=unsupported_sensor");
+#endif
+      continue;
+    }
     if (!strcmp(serialLine_, "SENSOR_LINK_TEST")) {
-      if (!sensorReady_ || !SensorChecks::canRetry(state_, sensorActive_, queue_.size())) {
-        Serial.println("SENSOR_LINK_TEST,ok=0,reason=not_idle");
+      // This command is read-only and intentionally remains available in
+      // Fault so an unresponsive sensor can still be diagnosed at boot.
+      if (sensorActive_ || queue_.size()) {
+        Serial.println("SENSOR_LINK_TEST,ok=0,reason=busy");
         continue;
       }
       sensor_.linkTest();
@@ -705,7 +727,7 @@ void NodeApp::serialCommands() {
       acceptStart(h, options);
     } else
       Serial.println(
-          "COMMANDS: DIAG; SENSOR_RETRY; SENSOR_SAMPLE_TEST; SENSOR_LINK_TEST; START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
+          "COMMANDS: DIAG; SENSOR_RETRY; SENSOR_SAMPLE_TEST; SENSOR_LINK_TEST; SENSOR_I2C_SCAN; START_AT epoch_us 50|100 [range_g] [run_id] [duration_s]; STOP; STATUS");
   }
 }
 void NodeApp::acquire() {
@@ -770,7 +792,7 @@ void NodeApp::acquire() {
       sensor_.timestampTicksPerSecond() / rate_);
   const uint64_t nominalIntervalUs = 1000000ULL / rate_;
   for (uint16_t i = 0; i < available; ++i) {
-    Iim42652::FifoSample item = {};
+    AccelDriver::FifoSample item = {};
     const bool valid = sensor_.read(item);
     const uint64_t local = esp_timer_get_time();
     if (!valid) {

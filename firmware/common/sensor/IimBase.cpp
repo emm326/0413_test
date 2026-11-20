@@ -1,5 +1,7 @@
 #include "IimBase.h"
 
+#include <Wire.h>
+
 #include "SelectedBoard.h"
 #include "sensor/Registers.h"
 IimBase::IimBase(const char* name, uint8_t identity)
@@ -85,6 +87,12 @@ bool IimBase::begin(bool resetDevice, bool externalClock) {
   spi_.end();
   spi_.begin(Board::sensorSck, Board::sensorMiso, Board::sensorMosi, Board::sensorCs);
   lastFifoBytes_ = 0;
+  lastFifoCountRaw_ = 0;
+  lastFifoCountAttempts_ = 0;
+  lastFifoCountOk_ = true;
+  lastFifoReadOk_ = true;
+  fifoConsecutiveFailures_ = 0;
+  lastFifoErrorReason_ = "none";
   lastHeader_ = 0;
   delay(5);
   uint8_t observedIdentity = 0xff;
@@ -199,30 +207,68 @@ uint16_t IimBase::available() {
   // COUNTL latches both bytes. Read it again after COUNTH and retry if the
   // two low-byte observations disagree, which avoids a carry crossing the
   // high/low read boundary.
-  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+  lastFifoCountOk_ = false;
+  lastFifoReadOk_ = true;
+  lastFifoErrorReason_ = "none";
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    lastFifoCountAttempts_ = attempt;
     const uint8_t lowBefore = readRegister(IimRegister::FIFO_COUNTL);
     const uint8_t high = readRegister(IimRegister::FIFO_COUNTH);
     const uint8_t lowAfter = readRegister(IimRegister::FIFO_COUNTL);
-    if (lowBefore != lowAfter)
+    if (lowBefore != lowAfter) {
+      lastFifoErrorReason_ = "count_unstable";
       continue;
-    lastFifoBytes_ = (uint16_t(high) << 8) | lowAfter;
-    return fifoCountValid() ? lastFifoBytes_ / 8 : 0;
+    }
+    lastFifoCountRaw_ = (uint16_t(high) << 8) | lowAfter;
+    lastFifoBytes_ = lastFifoCountRaw_;
+    if (!fifoCountValid()) {
+      lastFifoErrorReason_ = "count_range";
+      break;
+    }
+    lastFifoCountOk_ = true;
+    fifoConsecutiveFailures_ = 0;
+    return lastFifoBytes_ / fifoPacketBytes();
   }
+  ++fifoErrorTotal_;
+  ++fifoConsecutiveFailures_;
   lastFifoBytes_ = 0xffff;
+  lastFifoReadOk_ = false;
   return 0;
 }
 bool IimBase::read(AccelSample& s) {
   uint8_t b[8];
   readBytes(IimRegister::FIFO_DATA, b, 8);
   lastHeader_ = b[0];
-  if ((b[0] & 0x80) || !(b[0] & 0x40) || (b[0] & 0x20))
+  lastFifoReadOk_ = false;
+  if ((b[0] & 0x80) || !(b[0] & 0x40) || (b[0] & 0x20)) {
+    lastFifoErrorReason_ = "packet_header";
+    ++fifoErrorTotal_;
+    ++fifoConsecutiveFailures_;
     return false;
+  }
   s.x = int16_t((uint16_t(b[1]) << 8) | b[2]);
   s.y = int16_t((uint16_t(b[3]) << 8) | b[4]);
   s.z = int16_t((uint16_t(b[5]) << 8) | b[6]);
-  return s.x != INT16_MIN && s.y != INT16_MIN && s.z != INT16_MIN;
+  if (s.x == INT16_MIN || s.y == INT16_MIN || s.z == INT16_MIN) {
+    lastFifoErrorReason_ = "invalid_sample";
+    ++fifoErrorTotal_;
+    ++fifoConsecutiveFailures_;
+    return false;
+  }
+  lastFifoReadOk_ = true;
+  lastFifoErrorReason_ = "none";
+  fifoConsecutiveFailures_ = 0;
+  return true;
 }
 
+bool IimBase::read(FifoSample& sample) {
+  sample = {};
+  sample.packetBytes = fifoPacketBytes();
+  sample.timed = false;
+  const bool valid = read(sample.accel);
+  sample.header = lastHeader_;
+  return valid;
+}
 bool IimBase::readDirect(AccelSample& sample) {
   if (!(readRegister(IimRegister::INT_STATUS) & 0x08))
     return false;
@@ -261,52 +307,124 @@ void IimBase::linkTest() {
   const uint8_t hardwareBefore = readRegister(IimRegister::WHO_AM_I);
   digitalWrite(Board::sensorCs, HIGH);
   spi_.end();
-  pinMode(Board::sensorCs, OUTPUT);
+
+  struct Wiring {
+    const char* label;
+    int sck;
+    int miso;
+    int mosi;
+    int cs;
+  };
+  // Try the documented wiring first. The swapped case catches modules whose
+  // SDI/SDO labels were connected to the opposite board pins.
+  const Wiring wirings[] = {
+      {"standard", Board::sensorSck, Board::sensorMiso, Board::sensorMosi,
+       Board::sensorCs},
+      {"miso_mosi_swapped", Board::sensorSck, Board::sensorMosi,
+       Board::sensorMiso, Board::sensorCs},
+  };
+
+  for (const Wiring& wiring : wirings) {
+    pinMode(wiring.cs, OUTPUT);
+    digitalWrite(wiring.cs, HIGH);
+    pinMode(wiring.sck, OUTPUT);
+    pinMode(wiring.mosi, OUTPUT);
+    pinMode(wiring.miso, INPUT);
+    Serial.printf(
+        "SENSOR_PIN_STATE,wiring=%s,sck=%d,miso=%d,mosi=%d,cs=%d,"
+        "miso_level=%d,int1=%d\n",
+        wiring.label, wiring.sck, wiring.miso, wiring.mosi, wiring.cs,
+        digitalRead(wiring.miso), digitalRead(Board::sensorInt));
+
+    for (uint8_t mode : {uint8_t(SPI_MODE0), uint8_t(SPI_MODE3)}) {
+      const bool idleHigh = mode == SPI_MODE3;
+      for (uint8_t halfPeriodUs : {uint8_t(5), uint8_t(20)}) {
+        auto transfer = [&](uint8_t output) {
+          uint8_t input = 0;
+          for (uint8_t mask = 0x80; mask; mask >>= 1) {
+            if (idleHigh)
+              digitalWrite(wiring.sck, LOW);
+            digitalWrite(wiring.mosi, output & mask ? HIGH : LOW);
+            delayMicroseconds(halfPeriodUs);
+            digitalWrite(wiring.sck, HIGH);
+            delayMicroseconds(halfPeriodUs);
+            input = (input << 1) | (digitalRead(wiring.miso) ? 1 : 0);
+            if (!idleHigh)
+              digitalWrite(wiring.sck, LOW);
+          }
+          return input;
+        };
+        uint8_t matched = 0;
+        uint8_t last = 0;
+        for (uint8_t attempt = 0; attempt < 4; ++attempt) {
+          digitalWrite(wiring.sck, idleHigh ? HIGH : LOW);
+          delayMicroseconds(20);
+          digitalWrite(wiring.cs, LOW);
+          delayMicroseconds(20);
+          transfer(IimRegister::WHO_AM_I | 0x80);
+          last = transfer(0);
+          delayMicroseconds(20);
+          digitalWrite(wiring.cs, HIGH);
+          delayMicroseconds(20);
+          matched += last == identity_;
+          Serial.printf(
+              "SENSOR_SOFT_SPI,wiring=%s,mode=%u,half_period_us=%u,attempt=%u,"
+              "who=0x%02X\n",
+              wiring.label, mode, halfPeriodUs, attempt + 1, last);
+        }
+        Serial.printf(
+            "SENSOR_SOFT_RESULT,wiring=%s,mode=%u,half_period_us=%u,matches=%u,"
+            "total=4\n",
+            wiring.label, mode, halfPeriodUs, matched);
+      }
+    }
+  }
+
   digitalWrite(Board::sensorCs, HIGH);
+  pinMode(Board::sensorCs, OUTPUT);
   pinMode(Board::sensorSck, OUTPUT);
   pinMode(Board::sensorMosi, OUTPUT);
   pinMode(Board::sensorMiso, INPUT);
-  for (uint8_t mode : {uint8_t(SPI_MODE0), uint8_t(SPI_MODE3)}) {
-    const bool idleHigh = mode == SPI_MODE3;
-    for (uint8_t halfPeriodUs : {uint8_t(5), uint8_t(20)}) {
-      auto transfer = [&](uint8_t output) {
-        uint8_t input = 0;
-        for (uint8_t mask = 0x80; mask; mask >>= 1) {
-          if (idleHigh)
-            digitalWrite(Board::sensorSck, LOW);
-          digitalWrite(Board::sensorMosi, output & mask ? HIGH : LOW);
-          delayMicroseconds(halfPeriodUs);
-          digitalWrite(Board::sensorSck, HIGH);
-          delayMicroseconds(halfPeriodUs);
-          input = (input << 1) | (digitalRead(Board::sensorMiso) ? 1 : 0);
-          if (!idleHigh)
-            digitalWrite(Board::sensorSck, LOW);
-        }
-        return input;
-      };
-      uint8_t matched = 0;
-      uint8_t last = 0;
-      for (uint8_t attempt = 0; attempt < 4; ++attempt) {
-        digitalWrite(Board::sensorSck, idleHigh ? HIGH : LOW);
-        delayMicroseconds(20);
-        digitalWrite(Board::sensorCs, LOW);
-        delayMicroseconds(20);
-        transfer(IimRegister::WHO_AM_I | 0x80);
-        last = transfer(0);
-        delayMicroseconds(20);
-        digitalWrite(Board::sensorCs, HIGH);
-        delayMicroseconds(20);
-        matched += last == identity_;
-        Serial.printf("SENSOR_SOFT_SPI,mode=%u,half_period_us=%u,attempt=%u,who=0x%02X\n",
-                      mode, halfPeriodUs, attempt + 1, last);
-      }
-      Serial.printf("SENSOR_SOFT_RESULT,mode=%u,half_period_us=%u,matches=%u,total=4\n",
-                    mode, halfPeriodUs, matched);
-    }
-  }
-  digitalWrite(Board::sensorCs, HIGH);
   spi_.begin(Board::sensorSck, Board::sensorMiso, Board::sensorMosi, Board::sensorCs);
   const uint8_t hardwareAfter = readRegister(IimRegister::WHO_AM_I);
   Serial.printf("SENSOR_LINK_TEST,hardware_before=0x%02X,hardware_after=0x%02X,"
                 "spi_restored=1,sensor_reset=0\n", hardwareBefore, hardwareAfter);
+}
+
+void IimBase::i2cScan() {
+  // Diagnostic only: CSB high selects I2C. SDA uses the module SDI pin and
+  // SCL uses SCLK. Restore the SPI bus before returning.
+  digitalWrite(Board::sensorCs, HIGH);
+  spi_.end();
+  pinMode(Board::sensorCs, OUTPUT);
+  digitalWrite(Board::sensorCs, HIGH);
+  pinMode(Board::sensorMosi, INPUT_PULLUP);
+  pinMode(Board::sensorSck, INPUT_PULLUP);
+  Wire.begin(Board::sensorMosi, Board::sensorSck, 100000U);
+
+  uint8_t found = 0;
+  for (uint8_t address = 0x08; address <= 0x77; ++address) {
+    Wire.beginTransmission(address);
+    const uint8_t result = Wire.endTransmission();
+    if (result == 0) {
+      ++found;
+      uint8_t who = 0xFF;
+      Wire.beginTransmission(address);
+      Wire.write(IimRegister::WHO_AM_I);
+      if (Wire.endTransmission(false) == 0 && Wire.requestFrom(address, uint8_t(1)) == 1)
+        who = Wire.read();
+      Serial.printf("SENSOR_I2C_DEVICE,address=0x%02X,who=0x%02X\n", address, who);
+    }
+  }
+  if (!found)
+    Serial.println("SENSOR_I2C_SCAN,found=0,sda=48,scl=47,cs=34");
+
+  Wire.end();
+  pinMode(Board::sensorSck, OUTPUT);
+  pinMode(Board::sensorMosi, OUTPUT);
+  pinMode(Board::sensorMiso, INPUT);
+  pinMode(Board::sensorCs, OUTPUT);
+  digitalWrite(Board::sensorCs, HIGH);
+  spi_.begin(Board::sensorSck, Board::sensorMiso, Board::sensorMosi, Board::sensorCs);
+  Serial.printf("SENSOR_I2C_SCAN_DONE,found=%u,spi_restored=1\n", found);
 }

@@ -561,7 +561,11 @@ void startupPolicy() {
   bad.fifoSamples = 3;
   require(!startupPassed(bad), "short FIFO passed startup");
   bad = good;
-  bad.fifoSamples = 31;
+  bad.fifoSamples = 33;
+  require(startupPassed(bad), "startup transient FIFO rejected");
+  bad.fifoSamples = 64;
+  require(startupPassed(bad), "FIFO at startup limit rejected");
+  bad.fifoSamples = 65;
   require(!startupPassed(bad), "overlong FIFO passed startup");
 }
 
