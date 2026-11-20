@@ -17,17 +17,22 @@ constexpr uint8_t kBitTmstEnable = 0x01;
 constexpr uint8_t kBitTmstResol = 0x08;
 constexpr uint8_t kBitRtcMode = 0x04;
 constexpr uint8_t kFifoConfigStopOnFull = 0x80;
-constexpr uint8_t kFifoConfig1Base = 0x65;
-constexpr uint8_t kFifoConfig1Timestamp = 0x08;
+// IIM-42352 FIFO_PACKET_EN[1:0] selects a packet format, not gyro enable.
+// Packet 2 has six reserved bytes and a timestamp at bytes 14..15 (16 total).
+constexpr uint8_t kFifoConfig1Base = 0x64;
+constexpr uint8_t kFifoPacketMask = 0x03;
+constexpr uint8_t kFifoPacketAccel = 0x01;
+constexpr uint8_t kFifoPacketTimed = 0x03;
 constexpr uint8_t kIntfConfig0Mask = 0x70;
 constexpr uint8_t kIntfConfig0RecordBig = 0x50;
 constexpr uint8_t kIntConfigWanted = 0x03;
 constexpr uint8_t kIntSource0Fifo = 0x04;
 
 constexpr uint8_t kFifoHeaderMsg = 0x80;
-constexpr uint8_t kFifoHeaderAccel = 0x40;
-constexpr uint8_t kFifoHeaderGyro = 0x20;
-constexpr uint8_t kFifoHeaderHeader20 = 0x10;
+constexpr uint8_t kFifoHeaderFormatMask = 0x70;
+constexpr uint8_t kFifoHeaderPacket1 = 0x40;
+constexpr uint8_t kFifoHeaderPacket2 = 0x60;
+constexpr uint8_t kFifoHeaderPacket3 = 0x70;
 constexpr uint8_t kFifoHeaderTmst = 0x08;
 constexpr uint8_t kFifoHeaderFsync = 0x04;
 
@@ -173,8 +178,8 @@ bool Iim42352::resetDeviceAndWait() {
     identityOk = who == kWhoAmI;
   }
   Serial.printf("SENSOR_RESET,identity=0x%02X,reset_done=%u,ok=%u\n", who,
-                resetDone ? 1 : 0, identityOk ? 1 : 0);
-  return identityOk;
+                resetDone ? 1 : 0, (resetDone && identityOk) ? 1 : 0);
+  return resetDone && identityOk;
 }
 
 bool Iim42352::configureInterface() {
@@ -210,7 +215,8 @@ bool Iim42352::configureClock(bool externalClock) {
   if (!setBank(0) || !readRegisters(IimRegister::INTF_CONFIG1, &current, 1)) {
     return false;
   }
-  const uint8_t bits = externalClock ? 0x05 : 0x01;
+  // CLKSEL=00 selects the RC oscillator; 01/10 are reserved on IIM-42352.
+  const uint8_t bits = externalClock ? 0x04 : 0x00;
   const bool clockOk = writeVerified(
       IimRegister::INTF_CONFIG1, static_cast<uint8_t>((current & ~0x07) | bits),
       0x07, "clock_source");
@@ -253,7 +259,7 @@ bool Iim42352::configureTimestamp() {
                 applied, timestampRtcMode_ ? 1 : 0,
                 (applied & kBitTmstEnable) != 0 ? 1 : 0,
                 (applied & kBitTmstResol) != 0 ? 1 : 0,
-                (unsigned long)(1000000UL / timestampTicksPerSecond()),
+                (unsigned long)(1000000000UL / timestampTicksPerSecond()),
                 timestampSupported_ ? 1 : 0, ok ? 1 : 0);
   return ok;
 }
@@ -263,7 +269,7 @@ bool Iim42352::configureFifo() {
     return false;
   }
   const uint8_t fifo1 = static_cast<uint8_t>(
-      kFifoConfig1Base | (timestampSupported_ ? kFifoConfig1Timestamp : 0));
+      kFifoConfig1Base | (timestampSupported_ ? kFifoPacketTimed : kFifoPacketAccel));
   const bool modeOk =
       writeVerified(IimRegister::FIFO_CONFIG, kFifoConfigStopOnFull, 0xc0,
                     "fifo_mode");
@@ -461,7 +467,7 @@ bool Iim42352::begin(bool resetDevice, bool externalClock) {
   initialized_ = false;
   running_ = false;
   clearQueue();
-  packetBytes_ = 10;
+  packetBytes_ = 16;
   lastFifoBytes_ = 0;
   lastFifoCountRaw_ = 0;
   lastFifoCountAttempts_ = 0;
@@ -551,23 +557,17 @@ void Iim42352::updateFifoPacketSize() {
       !readRegisters(IimRegister::FIFO_CONFIG1, &fifo1, 1)) {
     return;
   }
-  const bool accel = (fifo1 & 0x01) != 0;
-  const bool gyro = (fifo1 & 0x02) != 0;
-  const bool timed = (fifo1 & kFifoConfig1Timestamp) != 0;
-  uint16_t size = kFifoHeaderBytes;
-  if (accel) {
-    size += kFifoAxisBytes;
+  switch (fifo1 & kFifoPacketMask) {
+    case kFifoPacketAccel:
+      packetBytes_ = 8;
+      break;
+    case kFifoPacketTimed:
+      packetBytes_ = (fifo1 & 0x10) != 0 ? 20 : 16;
+      break;
+    default:
+      packetBytes_ = 0;
+      break;
   }
-  if (gyro) {
-    size += kFifoAxisBytes;
-  }
-  if (accel || gyro) {
-    size += kFifoTempBytes;
-  }
-  if (timed) {
-    size += kFifoTimeBytes;
-  }
-  packetBytes_ = size;
 }
 
 uint16_t Iim42352::maxFifoPackets() const {
@@ -692,23 +692,15 @@ uint16_t Iim42352::available() {
   return count_;
 }
 uint16_t Iim42352::fifoPacketBytesForHeader(uint8_t header) {
-  const bool accel = (header & kFifoHeaderAccel) != 0;
-  const bool gyro = (header & kFifoHeaderGyro) != 0;
-  const bool timed = (header & (kFifoHeaderTmst | kFifoHeaderFsync)) != 0;
-  uint16_t bytes = 0;
-  if (accel) {
-    bytes += kFifoAxisBytes;
+  switch (header & kFifoHeaderFormatMask) {
+    case kFifoHeaderPacket1:
+      // Packet 1 never has a timestamp, even if FIFO_TMST_FSYNC_EN is set.
+      return (header & (kFifoHeaderTmst | kFifoHeaderFsync)) == 0 ? 8 : 0;
+    case kFifoHeaderPacket2:
+      return 16;
+    default:
+      return 0;
   }
-  if (gyro) {
-    bytes += kFifoAxisBytes;
-  }
-  if (accel || gyro) {
-    bytes += kFifoTempBytes;
-  }
-  if (timed) {
-    bytes += kFifoTimeBytes;
-  }
-  return bytes;
 }
 
 bool Iim42352::readFifoPacket() {
@@ -722,50 +714,32 @@ bool Iim42352::readFifoPacket() {
     lastFifoErrorReason_ = "fifo_message_header";
     return false;
   }
-  if ((header & kFifoHeaderHeader20) != 0) {
-    lastFifoErrorReason_ = "unexpected_20bit_header";
-    Serial.printf("SENSOR_FIFO,unexpected_20bit_header=0x%02X\n", header);
+  const uint16_t packetBytes = fifoPacketBytesForHeader(header);
+  if (packetBytes == 0 || packetBytes != packetBytes_) {
+    lastFifoErrorReason_ =
+        (header & kFifoHeaderFormatMask) == kFifoHeaderPacket3
+            ? "unexpected_20bit_header" : "unexpected_packet_format";
     return false;
   }
-  const bool accel = (header & kFifoHeaderAccel) != 0;
-  const bool gyro = (header & kFifoHeaderGyro) != 0;
-  if (!accel && !gyro) {
-    lastFifoErrorReason_ = "header_without_sensor_data";
-    return false;
-  }
-  const uint16_t bytes = fifoPacketBytesForHeader(header);
-  if (bytes == 0 ||
-      static_cast<uint32_t>(fifoParseOffset_) + bytes > fifoBatchBytes_) {
+  const uint16_t bytes = packetBytes - kFifoHeaderBytes;
+  if (static_cast<uint32_t>(fifoParseOffset_) + bytes > fifoBatchBytes_) {
     lastFifoErrorReason_ = "fifo_batch_packet_truncated";
     return false;
   }
   memcpy(fifoPayload_, &fifoBatch_[fifoParseOffset_], bytes);
   fifoParseOffset_ = static_cast<uint16_t>(fifoParseOffset_ + bytes);
-  packetBytes_ = static_cast<uint16_t>(kFifoHeaderBytes + bytes);
 
   lastFifoTimestamp_ = 0;
   lastFifoTimestampValid_ = false;
-  if ((header & (kFifoHeaderTmst | kFifoHeaderFsync)) != 0) {
-    uint16_t offset = 0;
-    if (accel) {
-      offset += kFifoAxisBytes;
-    }
-    if (gyro) {
-      offset += kFifoAxisBytes;
-    }
-    offset += kFifoTempBytes;
-    if (offset + kFifoTimeBytes <= bytes) {
-      lastFifoTimestamp_ =
-          static_cast<uint16_t>((fifoPayload_[offset] << 8) |
-                                fifoPayload_[offset + 1]);
-      lastFifoTimestampValid_ =
-          (header & (kFifoHeaderTmst | kFifoHeaderFsync)) == kFifoHeaderTmst;
-    }
+  if (packetBytes == 16) {
+    // Payload excludes the header: reserved bytes occupy offsets 6..11,
+    // temperature is at 12, and the timestamp is at 13..14.
+    lastFifoTimestamp_ =
+        static_cast<uint16_t>((fifoPayload_[13] << 8) | fifoPayload_[14]);
+    lastFifoTimestampValid_ =
+        (header & (kFifoHeaderTmst | kFifoHeaderFsync)) == kFifoHeaderTmst;
   }
 
-  if (!accel) {
-    return true;
-  }
   auto decode = [](const uint8_t* p) -> int16_t {
     return static_cast<int16_t>(static_cast<uint16_t>((p[0] << 8) | p[1]));
   };
@@ -937,18 +911,21 @@ uint8_t Iim42352::readRegister(uint8_t address) {
 }
 
 uint32_t Iim42352::timestampTicksPerSecond() const {
-  if (timestampRtcMode_) {
-    return (timestampConfig_ & kBitTmstResol) != 0 ? 32000U : 1024U;
-  }
-  return (timestampConfig_ & kBitTmstResol) != 0 ? 58593U : 1000000U;
+  // DS-000436 section 12.7: nominal timestamp intervals must be scaled by
+  // 32.768/30 with CLKIN, or by 32/30 with the internal oscillator.
+  const uint32_t resolution = (timestampConfig_ & kBitTmstResol) != 0 ? 16 : 1;
+  const uint32_t scale = timestampRtcMode_ ? 32768U : 32000U;
+  const uint32_t divisor = resolution * scale;
+  return static_cast<uint32_t>((30000000000ULL + divisor / 2U) / divisor);
 }
 
 uint32_t Iim42352::timestampUs(uint16_t ticks) const {
-  const uint32_t perSecond = timestampTicksPerSecond();
+  const uint32_t resolution = (timestampConfig_ & kBitTmstResol) != 0 ? 16 : 1;
+  const uint32_t scale = timestampRtcMode_ ? 32768U : 32000U;
   return static_cast<uint32_t>(
-      (static_cast<uint64_t>(ticks) * 1000000ULL + perSecond / 2U) /
-      perSecond);
+      (static_cast<uint64_t>(ticks) * resolution * scale + 15000ULL) / 30000ULL);
 }
+
 void Iim42352::diagnostic() {
   if (!initialized_) {
     Serial.println("SENSOR_DIAG,initialized=0");
@@ -1010,8 +987,6 @@ void Iim42352::linkTest() {
   const Wiring wirings[] = {
       {"standard", Board::sensorSck, Board::sensorMiso, Board::sensorMosi,
        Board::sensorCs},
-      {"miso_mosi_swapped", Board::sensorSck, Board::sensorMosi,
-       Board::sensorMiso, Board::sensorCs},
   };
 
   for (const Wiring& wiring : wirings) {
@@ -1025,6 +1000,18 @@ void Iim42352::linkTest() {
         "miso_level=%d,int1=%d\n",
         wiring.label, wiring.sck, wiring.miso, wiring.mosi, wiring.cs,
         digitalRead(wiring.miso), digitalRead(Board::sensorInt));
+
+    // Weak pulls distinguish an undriven MISO from a line held low/high.
+    // Never drive the confirmed sensor MISO as an output.
+    pinMode(wiring.miso, INPUT_PULLUP);
+    delayMicroseconds(20);
+    const int misoPullUp = digitalRead(wiring.miso);
+    pinMode(wiring.miso, INPUT_PULLDOWN);
+    delayMicroseconds(20);
+    const int misoPullDown = digitalRead(wiring.miso);
+    pinMode(wiring.miso, INPUT);
+    Serial.printf("SENSOR_MISO_IDLE,cs_high=%d,pull_up=%d,pull_down=%d\n",
+                  digitalRead(wiring.cs), misoPullUp, misoPullDown);
 
     for (uint8_t mode : {uint8_t(SPI_MODE0), uint8_t(SPI_MODE3)}) {
       const bool idleHigh = mode == SPI_MODE3;

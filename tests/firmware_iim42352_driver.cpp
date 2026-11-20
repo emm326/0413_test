@@ -22,6 +22,7 @@ struct Bus {
   bool selected = false;
   bool started = false;
   bool ignoreTimestampWrites = false;
+  bool signalResetDone = true;
 
   void defaults() {
     std::memset(regs, 0, sizeof(regs));
@@ -29,6 +30,7 @@ struct Bus {
     selected = false;
     started = false;
     ignoreTimestampWrites = false;
+    signalResetDone = true;
     regs[0][IimRegister::WHO_AM_I] = 0x6d;
     regs[0][IimRegister::INT_CONFIG1] = 0x10;
   }
@@ -48,11 +50,14 @@ struct Bus {
       bank = value & 0x07;
       return;
     }
+    if (reg == IimRegister::INTF_CONFIG1 && (value & 0x03) != 0) {
+      throw std::runtime_error("reserved CLKSEL written on IIM-42352");
+    }
     if (reg == 0x54 && ignoreTimestampWrites) {
       return;
     }
     regs[bank][reg & 0x7f] = value;
-    if (reg == IimRegister::DEVICE_CONFIG && (value & 0x01) != 0) {
+    if (reg == IimRegister::DEVICE_CONFIG && (value & 0x01) != 0 && signalResetDone) {
       regs[0][IimRegister::INT_STATUS] |= 0x10;
     }
   }
@@ -67,13 +72,17 @@ void buildFifoTimed(const AccelSample* samples, const uint16_t* timestamps,
   fifo.clear();
   fifoPos = 0;
   for (std::size_t i = 0; i < count; ++i) {
-    fifo.push_back(0x48);  // ACCEL + TMST.
+    fifo.push_back(0x68);  // Packet 2 + ODR timestamp (DS-000436 section 6).
     const int16_t axes[3] = {samples[i].x, samples[i].y, samples[i].z};
     for (int16_t axis : axes) {
       fifo.push_back(static_cast<uint8_t>((axis >> 8) & 0xff));
       fifo.push_back(static_cast<uint8_t>(axis & 0xff));
     }
-    fifo.push_back(0);  // Temperature.
+    // Six reserved bytes must not be decoded as axes or as a timestamp.
+    for (uint8_t reserved = 0; reserved < 6; ++reserved) {
+      fifo.push_back(static_cast<uint8_t>(0xa0 + reserved));
+    }
+    fifo.push_back(0);  // Temperature at byte 13.
     fifo.push_back(static_cast<uint8_t>((timestamps[i] >> 8) & 0xff));
     fifo.push_back(static_cast<uint8_t>(timestamps[i] & 0xff));
   }
@@ -113,11 +122,12 @@ void require(bool condition, const char* message) {
 
 TestSerial Serial;
 TwoWire Wire;
-unsigned long millis() { return 0; }
+unsigned long testMillis = 0;
+unsigned long millis() { return testMillis; }
 void pinMode(int, int) {}
 void digitalWrite(int, int value) { bus.selected = value == LOW; }
 int digitalRead(int) { return 0; }
-void delay(unsigned long) {}
+void delay(unsigned long ms) { testMillis += ms; }
 void delayMicroseconds(unsigned int) {}
 
 SPIClass::SPIClass(uint8_t) {}
@@ -170,8 +180,12 @@ void timedFifoAndInterface() {
   require(sensor.readRegister(IimRegister::WHO_AM_I) == 0x6d,
           "identity register mismatch");
   require(sensor.timestampSupported(), "timestamp configuration was not accepted");
-  require(sensor.fifoPacketBytes() == 10, "timed packet size is not 10 bytes");
+  require(sensor.fifoPacketBytes() == 16, "timed packet size is not 16 bytes");
 
+  require((bus.regs[0][IimRegister::FIFO_CONFIG1] & 0x1b) == 0x03,
+          "Packet 2 must be selected without high resolution or FSYNC");
+  require((bus.regs[0][IimRegister::INTF_CONFIG1] & 0x07) == 0x04,
+          "external clock must use RTC_MODE=1 and CLKSEL=00");
   sensor.start();
   const AccelSample expected[] = {{100, -200, 300}, {400, -500, 600}};
   const uint16_t timestamps[] = {320, 640};
@@ -187,10 +201,12 @@ void timedFifoAndInterface() {
             "timed FIFO axes were decoded incorrectly");
     require(item.timed && item.timestamp == timestamps[i],
             "FIFO timestamp was not decoded");
-    require(item.packetBytes == 10, "parsed packet size is not 10 bytes");
+    require(item.packetBytes == 16, "parsed packet size is not 16 bytes");
   }
-  require(sensor.timestampUs(320) == 10000,
-          "32 kHz timestamp conversion is not 10 ms for 320 ticks");
+  require(sensor.timestampTicksPerSecond() == 57220,
+          "external timestamp tick rate does not apply datasheet scaling");
+  require(sensor.timestampUs(1875) == 32768,
+          "external timestamps must scale 30000 nominal us to 32768 us");
 
   sensor.standby();
   AccelSample stale{};
@@ -205,6 +221,10 @@ void untimedFallback() {
   require(!sensor.timestampSupported(), "unsupported timestamp was reported valid");
   require(sensor.fifoPacketBytes() == 8, "fallback packet size is not 8 bytes");
 
+  require((bus.regs[0][IimRegister::FIFO_CONFIG1] & 0x03) == 0x01,
+          "fallback must select Packet 1");
+  require((bus.regs[0][IimRegister::INTF_CONFIG1] & 0x07) == 0,
+          "internal clock must use RTC_MODE=0 and CLKSEL=00");
   sensor.start();
   const AccelSample expected[] = {{7, 8, 9}};
   buildFifoUntimed(expected, 1);
@@ -221,6 +241,10 @@ void invalidSettingsAndOverflow() {
   bus.defaults();
   Iim42352 sensor;
   require(sensor.begin(false, false), "initialization failed");
+  require(sensor.timestampTicksPerSecond() == 58594,
+          "internal timestamp tick rate does not apply datasheet scaling");
+  require(sensor.timestampUs(1875) == 32000,
+          "internal timestamps must scale 30000 nominal us to 32000 us");
   require(!sensor.configure(60, 4), "invalid rate was accepted");
   require(!sensor.configure(50, 3), "invalid range was accepted");
   sensor.start();
@@ -229,6 +253,32 @@ void invalidSettingsAndOverflow() {
   require(!sensor.lastFifoCountOk(), "oversized FIFO count was not diagnosed");
   require(sensor.fifoConsecutiveFailures() == 1,
           "FIFO failure counter did not increment");
+}
+
+void invalidPacketFormat() {
+  bus.defaults();
+  Iim42352 sensor;
+  require(sensor.begin(false, false), "initialization failed");
+  sensor.start();
+  const AccelSample expected[] = {{1, 2, 3}};
+  const uint16_t timestamps[] = {100};
+  buildFifoTimed(expected, timestamps, 1);
+  fifo[0] = 0x48;  // Nonexistent 10-byte layout accepted by the old driver.
+  setFifoPackets(1);
+  require(sensor.available() == 0, "invalid packet format was accepted");
+  require(sensor.fifoErrorTotal() == 1, "packet format error was not recorded");
+}
+
+void resetCompletionRequired() {
+  bus.defaults();
+  Iim42352 sensor;
+  require(sensor.begin(true, false), "completed reset should succeed");
+  bus.defaults();
+  bus.signalResetDone = false;
+  require(!sensor.begin(true, false), "identity alone must not confirm reset");
+  bus.defaults();
+  bus.regs[0][IimRegister::WHO_AM_I] = 0;
+  require(!sensor.begin(false, false), "zero identity must not initialize");
 }
 
 int main() {
@@ -240,6 +290,8 @@ int main() {
       {"timed_fifo_and_interface", timedFifoAndInterface},
       {"untimed_fallback", untimedFallback},
       {"invalid_settings_and_overflow", invalidSettingsAndOverflow},
+      {"invalid_packet_format", invalidPacketFormat},
+      {"reset_completion_required", resetCompletionRequired},
   };
 
   unsigned failures = 0;

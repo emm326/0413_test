@@ -22,4 +22,5 @@ struct TestSerial {
 extern TestSerial Serial;
 
 constexpr int INPUT_PULLUP = 3;
+constexpr int INPUT_PULLDOWN = 4;
 unsigned long millis();

@@ -110,7 +110,7 @@ class Iim42352 final {
 
   uint16_t rate_ = 50;
   uint8_t range_ = 4;
-  uint16_t packetBytes_ = 10;
+  uint16_t packetBytes_ = 16;
   uint16_t lastFifoBytes_ = 0;
   uint16_t lastFifoCountRaw_ = 0;
   uint8_t lastFifoCountAttempts_ = 0;
