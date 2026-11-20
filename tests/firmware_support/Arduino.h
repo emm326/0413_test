@@ -20,3 +20,6 @@ struct TestSerial {
   void println(const char* text) { output+=text;output+='\n'; }
 };
 extern TestSerial Serial;
+
+constexpr int INPUT_PULLUP = 3;
+unsigned long millis();

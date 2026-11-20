@@ -44,6 +44,28 @@ class FirmwareSensorTransportTests(unittest.TestCase):
         self.assertIn("soft_reset=1", driver)
         self.assertIn("packetBytes_", driver)
 
+    def test_iim42352_independent_driver_contracts(self):
+        compiler = shutil.which("g++")
+        if not compiler:
+            self.skipTest("g++ is required to execute native firmware regression tests")
+        output = ROOT / "tmp" / "iim42352_tests"
+        output.mkdir(parents=True, exist_ok=True)
+        executable = output / "driver_tests.exe"
+        command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                   "-DAPP_BOARD_HELTEC=1", "-I" + str(ROOT / "tests/firmware_support"),
+                   "-I" + str(ROOT / "firmware"), "-I" + str(ROOT / "firmware/common"),
+                   str(ROOT / "tests/firmware_iim42352_driver.cpp"),
+                   str(ROOT / "firmware/sensors/iim42352/Driver.cpp"),
+                   "-o", str(executable)]
+        built = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, text=True)
+        (output / "result.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        header = (ROOT / "firmware/sensors/iim42352/Driver.h").read_text(encoding="utf-8")
+        self.assertNotIn(": public IimBase", header)
+        self.assertIn("timestampSupported", header)
 if __name__ == "__main__":
     unittest.main()
 
