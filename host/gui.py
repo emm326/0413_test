@@ -50,6 +50,8 @@ class App:
         self.bind = tk.StringVar(value=bind)
         self.port = tk.StringVar(value=str(port))
         self.output = tk.StringVar(value=output)
+        sync_mode = saved.get("sync_mode", "原始节点时间")
+        self.sync_mode = tk.StringVar(value=sync_mode if sync_mode in ("原始节点时间", "PPS同步") else "原始节点时间")
         self.ids = tk.StringVar(value=",".join(map(str,nodes)))
         self.rate = tk.StringVar(value="50")
         self.sf = tk.StringVar(value="6")
@@ -117,6 +119,10 @@ class App:
         ttk.Button(row,text="启动接收服务",command=self.connect).pack(side="left",padx=5)
         ttk.Button(row,text="断开接收",command=self.disconnect_receiver).pack(side="left")
         ttk.Button(row,text="查询节点",command=lambda:self.command("discover")).pack(side="left",padx=5)
+        row=ttk.Frame(control);row.pack(fill="x",pady=(0,8))
+        self.sync_mode_combo=self._field(row,"接收保存模式",self.sync_mode,values=["原始节点时间","PPS同步"],width=14)
+        self.sync_mode_combo.configure(state="readonly")
+        ttk.Label(row,text="PPS同步使用预约START时刻生成统一时间轴；原始节点时间文件始终保留。").pack(side="left")
         ttk.Label(control,textvariable=self.gateway).pack(anchor="w",pady=10)
         row=ttk.Frame(control);row.pack(fill="x")
         self._field(row,"目标节点",self.ids,width=43)
@@ -269,13 +275,15 @@ class App:
         try:
             targets=[int(x.strip()) for x in self.ids.get().split(",")]
             allowed=verify_gateway_file(self.gateway_config)
-            server=GatewayServer(self.bind.get(),int(self.port.get()),self.output.get(),targets,lambda k,v:self.events.put((k,v)),tx_range_verified=allowed)
+            sync_mode="pps" if self.sync_mode.get()=="PPS同步" else "raw"
+            server=GatewayServer(self.bind.get(),int(self.port.get()),self.output.get(),targets,lambda k,v:self.events.put((k,v)),tx_range_verified=allowed,sync_mode=sync_mode)
             if Path(self.gateway_config).is_file():
                 from .configure_gateway import strip_comments
                 config=json.loads(strip_comments(Path(self.gateway_config).read_text(encoding="utf-8")))
                 server.expected_eui=config.get("gateway_conf",{}).get("gateway_ID","").lower() or None
             server.start();self.server=server;self.tx_range_verified=allowed
-            self.gateway.set("电脑接收服务已启动；等待真实网关心跳；"+("文件允许下发，实测单列" if allowed else "仅接收"))
+            self.sync_mode_combo.configure(state="disabled")
+            self.gateway.set(f"电脑接收服务已启动；保存模式：{self.sync_mode.get()}；等待真实网关心跳；"+("文件允许下发，实测单列" if allowed else "仅接收"))
         except Exception as exc:messagebox.showerror("接收服务启动失败",str(exc))
 
     def disconnect_receiver(self):
@@ -283,7 +291,7 @@ class App:
         if self.server.run_id or self.server.cancel_run:messagebox.showinfo("仍有运行","请先停止并确认节点回到待机。");return
         if self.busy:messagebox.showinfo("正在测试","请等待当前诊断结束。");return
         server=self.server
-        def done(_):self.server=None;self.gateway.set("接收服务已停止；端口已释放")
+        def done(_):self.server=None;self.sync_mode_combo.configure(state="readonly");self.gateway.set("接收服务已停止；端口已释放")
         self._job("关闭接收服务…",server.close,done)
 
     def command(self,action,**options):
@@ -321,7 +329,7 @@ class App:
     def export(self):
         path=filedialog.asksaveasfilename(title="导出检查报告",defaultextension=".json",initialfile="E870检查报告.json",filetypes=[("JSON","*.json")])
         if not path:return
-        report={"generated_utc":time.time(),"mode":"real_gateway", "stats":self.last_stats,
+        report={"generated_utc":time.time(),"mode":"real_gateway", "sync_mode":self.sync_mode.get(), "stats":self.last_stats,
                 "commands":self.command_rows,"self_test":self.manager.last_tx_test if self.manager else None,
                 "node_hardware_acceptance":"待实测","events":list(self.history)}
         Path(path).write_text(json.dumps(report,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
@@ -335,7 +343,7 @@ class App:
 
     def _save_preferences(self):
         self.state_dir.mkdir(parents=True,exist_ok=True)
-        self.preferences.write_text(json.dumps({"serial_port":self.serial_port.get(),"ssh_host":self.ssh_host.get(),"computer":self.computer.get(),"cidr":self.cidr.get()},ensure_ascii=False,indent=2),encoding="utf-8")
+        self.preferences.write_text(json.dumps({"serial_port":self.serial_port.get(),"ssh_host":self.ssh_host.get(),"computer":self.computer.get(),"cidr":self.cidr.get(),"sync_mode":self.sync_mode.get()},ensure_ascii=False,indent=2),encoding="utf-8")
 
     def refresh(self):
         for _ in range(400):

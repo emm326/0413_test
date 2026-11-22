@@ -112,6 +112,81 @@ class RecorderTests(unittest.TestCase):
             rec.close()
             self.assertEqual(rec.stats[(1001, 12)]["unresolved_packet_gaps"], 2)
 
+    @staticmethod
+    def pps_frame(node, run, seq, count=25, rate=50, start_us=1_800_000_000_000_000):
+        return Frame(
+            DATA,
+            node,
+            flags=3,
+            run=run,
+            sequence=seq,
+            epoch_us=start_us + seq * 25 * 1_000_000 // rate,
+            rate=rate,
+            count=count,
+            range_g=4,
+            payload=struct.pack("<hhh", seq, node - 1000, -seq) * count,
+        )
+
+    def test_pps_sync_uses_common_overlap_and_matching_timestamps(self):
+        start_us = 1_800_000_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Recorder(tmp, mode="pps")
+            rec.register_run(12, start_us, (1001, 1002), 50)
+            for seq in range(119):
+                rec.record(self.pps_frame(1001, 12, seq, 20 if seq == 118 else 25), {})
+            for seq in range(121):
+                rec.record(self.pps_frame(1002, 12, seq, 18 if seq == 120 else 25), {})
+            result = rec.finalize_run(12, (1001, 1002))
+            rec.close()
+            self.assertTrue(result["valid"], result["reasons"])
+            self.assertFalse(result["physical_sample_sync"])
+            self.assertEqual(
+                result["time_axis_source"], "scheduled_start_plus_sample_index"
+            )
+            self.assertEqual(result["nodes"]["1001"]["raw_start_offset_us"], 0)
+            self.assertEqual(result["nodes"]["1002"]["raw_start_offset_us"], 0)
+            self.assertEqual(result["rows"], 2970)
+            self.assertEqual(result["common_first_index"], 0)
+            self.assertEqual(result["common_last_index"], 2969)
+            stamped = {}
+            for node in (1001, 1002):
+                path = Path(tmp) / "run_12" / "pps_sync" / f"sensor{node}" / "acceleration.csv"
+                with path.open(encoding="utf-8") as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 2970)
+                stamped[node] = [row["datetime"] for row in rows]
+                raw = Path(tmp) / "run_12" / f"sensor{node}" / "acceleration.csv"
+                with raw.open(encoding="utf-8") as stream:
+                    self.assertEqual(len(list(csv.DictReader(stream))), 3018 if node == 1002 else 2970)
+            self.assertEqual(stamped[1001], stamped[1002])
+            self.assertEqual(stamped[1001][0], "2027-01-15T08:00:00.000000+00:00")
+            aligned = Path(tmp) / "run_12" / "pps_sync" / "aligned_acceleration.csv"
+            with aligned.open(encoding="utf-8") as stream:
+                aligned_rows = list(csv.DictReader(stream))
+            self.assertEqual(len(aligned_rows), 2970)
+            self.assertEqual(
+                list(aligned_rows[0]),
+                ["datetime", "sensor1001_ax", "sensor1001_ay", "sensor1001_az",
+                 "sensor1002_ax", "sensor1002_ay", "sensor1002_az"],
+            )
+
+    def test_pps_sync_rejects_unresolved_packet_gap(self):
+        start_us = 1_800_000_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Recorder(tmp, mode="pps")
+            rec.register_run(13, start_us, (1001, 1002), 50)
+            for seq in (0, 2):
+                rec.record(self.pps_frame(1001, 13, seq, count=1), {})
+            for seq in (0, 1):
+                rec.record(self.pps_frame(1002, 13, seq, count=1), {})
+            result = rec.finalize_run(13, (1001, 1002))
+            rec.close()
+            self.assertFalse(result["valid"])
+            self.assertTrue(any("1001" in reason and "缺口1" in reason for reason in result["reasons"]))
+            self.assertFalse(
+                (Path(tmp) / "run_13" / "pps_sync" / "aligned_acceleration.csv").exists()
+            )
+
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +257,53 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(f.node, BROADCAST)
         self.assertEqual(START_OPTIONS.unpack(f.payload)[-1], 3)
         self.assertGreater(f.epoch_us, int(time.time() * 1e6) + 9_000_000)
+        self.assertIn(self.server.run_id, self.server.recorder.runs)
+
+    def test_pps_mode_is_passed_to_recorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = GatewayServer(
+                "127.0.0.1", 0, tmp, nodes=(1001, 1002), sync_mode="pps"
+            )
+            try:
+                self.assertEqual(server.sync_mode, "pps")
+                self.assertEqual(server.recorder.mode, "pps")
+            finally:
+                server.close()
+
+    def test_pps_run_finalizes_after_all_nodes_return_to_waiting(self):
+        start_us = 1_800_000_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            server = GatewayServer(
+                "127.0.0.1", 0, tmp, nodes=(1001, 1002), sync_mode="pps",
+                emit=lambda kind, payload: self.events.append((kind, payload)),
+            )
+            try:
+                server.run_id = 99
+                server.start_us = start_us
+                server.start_reported = True
+                server.active_targets = (1001, 1002)
+                server.awaiting_start = set()
+                server.recorder.register_run(99, start_us, (1001, 1002), 50)
+                for node in (1001, 1002):
+                    frame = Frame(
+                        DATA, node, flags=3, run=99, sequence=0,
+                        epoch_us=start_us, rate=50, count=1, range_g=4,
+                        payload=struct.pack("<hhh", 1, 2, 3),
+                    )
+                    server._frame(frame, {})
+                    status = Frame(
+                        STATUS, node, flags=3, run=99, epoch_us=start_us,
+                        payload=STATUS_PAYLOAD.pack(32000, 0, 0, 0, 0, 1, 0),
+                    )
+                    server._frame(status, {"datr": "SF6BW125"})
+                self.assertEqual(server.run_id, 0)
+                result = server.recorder.pps_results[99]
+                self.assertTrue(result["valid"], result["reasons"])
+                self.assertEqual(result["rows"], 1)
+                manifest = Path(tmp) / "run_99" / "pps_sync" / "manifest.json"
+                self.assertTrue(manifest.is_file())
+            finally:
+                server.close()
 
     def test_stop_cancels_start_repeats(self):
         self.server._queue(start_frame(12, 1_800_000_000_000_000), "START")

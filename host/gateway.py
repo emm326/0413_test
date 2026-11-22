@@ -86,8 +86,12 @@ class GatewayServer:
         nodes=tuple(range(1001, 1009)),
         emit=None,
         tx_range_verified=False,
+        sync_mode="raw",
     ):
+        if sync_mode not in ("raw", "pps"):
+            raise ValueError("sync_mode must be raw or pps")
         self.bind, self.port = bind, port
+        self.sync_mode = sync_mode
         self.targets = tuple(int(n) for n in nodes)
         if (
             not self.targets
@@ -97,7 +101,7 @@ class GatewayServer:
             raise ValueError("use unique node ids 1001..1008")
         self.nodes = {n: Node(n, channel=NODE_FREQUENCIES[n]) for n in self.targets}
         self.emit = emit or (lambda kind, payload: None)
-        self.recorder = Recorder(output)
+        self.recorder = Recorder(output, mode=sync_mode)
         self.requests = queue.Queue()
         self.stop_event = threading.Event()
         self.socket = None
@@ -408,6 +412,12 @@ class GatewayServer:
         ):
             return
         finished_run = self.run_id
+        pps_result = self.recorder.finalize_run(finished_run, self.active_targets)
+        if self.sync_mode == "pps":
+            if pps_result.get("valid"):
+                self.emit("log", f"run={finished_run} PPS同步文件已生成，公共{pps_result.get('rows',0)}行")
+            else:
+                self.emit("log", f"run={finished_run} PPS同步未生成：{'；'.join(pps_result.get('reasons',[]))}")
         for n in self.active_targets:
             self.nodes[n].confirmed = False
         self.run_id = 0
@@ -519,6 +529,7 @@ class GatewayServer:
             self.run_id = secrets.randbits(32) or 1
             self.start_us = ((self.gnss_now_us + 10_000_000 + 999999) // 1_000_000) * 1_000_000
             self.active_targets = targets
+            self.recorder.register_run(self.run_id, self.start_us, targets, rate)
             self.pending_acks.clear()
             self.ack_cycle = -1
             self.awaiting_start = set(targets)

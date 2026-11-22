@@ -8,6 +8,7 @@ __pycache__/
 .vscode/ipch
 .reasonix
 tmp
+.testtmp/
 data_usb_pps_sync
 .codex-ppt-inspect
 .codex-wang-ppt-build

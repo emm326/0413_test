@@ -16,6 +16,10 @@ def main():
         help="E870原始或已生成配置；用于验证470.3MHz下行范围",
     )
     parser.add_argument("--headless", action="store_true", help="仅接收和保存；默认打开桌面界面")
+    parser.add_argument(
+        "--sync-mode", choices=("raw", "pps"), default="raw",
+        help="raw=原始节点时间；pps=PPS同步时间轴",
+    )
     args = parser.parse_args()
     nodes = [int(n.strip()) for n in args.nodes.split(",")]
     try:
@@ -36,6 +40,7 @@ def main():
             nodes,
             lambda kind, p: print(kind, p, flush=True),
             tx_range_verified=tx_range_verified,
+            sync_mode=args.sync_mode,
         )
         server.start()
         try:

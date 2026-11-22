@@ -260,6 +260,7 @@ IIM42652 软复位后必须轮询 `RESET_DONE`，最长约 51 ms。不能只等�
 - 频率偏差必须在 ±100 ppm 内。
 - 外部时钟输出异常时，空闲节点可以重建 MCPWM 输出。
 - 外部时钟持续失效时，空闲节点自动回退内部时钟。
+- 后续计划使用 SI5351 生成稳定 32 kHz CLKIN。当前代码和接线尚未接入 SI5351。
 
 内部时钟模式：
 
@@ -499,7 +500,7 @@ START 和 STOP 也遵守控制窗口。主机必须收齐全部目标节点的�
 
 ### 10.1 采集流程
 
-1. 启动接收服务，确认网关 PULL 心跳正常。
+1. 选择“原始节点时间”或“PPS同步”接收保存模式，再启动接收服务并确认网关 PULL 心跳正常。
 2. 选择目标节点 1001–1008。
 3. 查询节点状态。
 4. 检查全部目标节点处于 Waiting。
@@ -515,8 +516,14 @@ START 和 STOP 也遵守控制窗口。主机必须收齐全部目标节点的�
 ```text
 data/e870/run_<run>/sensor<node>/acceleration.csv
 data/e870/run_<run>/sensor<node>/packets.csv
+data/e870/run_<run>/sensor<node>/pps_samples.csv
+data/e870/run_<run>/pps_sync/sensor<node>/acceleration.csv
+data/e870/run_<run>/pps_sync/aligned_acceleration.csv
+data/e870/run_<run>/pps_sync/manifest.json
 data/e870/capture_report.json
 ```
+
+`pps_samples.csv`、`pps_sync/sensor<node>/acceleration.csv`、`pps_sync/aligned_acceleration.csv` 和 `pps_sync/manifest.json` 只在 PPS 同步模式生成。原始 `acceleration.csv` 和 `packets.csv` 在两种模式下都保存。
 
 质量报告包含：
 
@@ -560,12 +567,12 @@ data/e870/capture_report.json
 1. 给两台节点接好传感器、GNSS 和 LoRa 天线，再上电。
 2. 从两台节点的串口分别读取启动日志，确认 `WHO_AM_I=0x6F`、`READY,sensor=1,radio=1`。
 3. 确认网关和电脑网络正常。网关 EUI 应为 `0000000000000923`，上位机应收到 `PULL_DATA`。
-4. 打开上位机。在“目标节点”中填写 `1003,1004`，然后启动接收服务。目标列表必须在启动接收服务之前填好；接收服务运行后再改列表，需要先断开再重新启动。
+4. 打开上位机。选择“原始节点时间”或“PPS同步”，在“目标节点”中填写 `1003,1004`，然后启动接收服务。目标列表和保存模式必须在启动接收服务之前确定；运行后再改列表或模式，需要先断开接收服务。
 5. 点击“查询节点”。等待两台节点都显示：在线、待机、GNSS/PPS 正常。
 6. 确认两台节点的 `STATUS` 都有 `gps=1`、`pps=1`、`time=1`、`healthy=1`，且 `clock_ok=1`。节点 1004 当前使用内部时钟，`clock_hz=0` 是已知状态。
 7. 点击“预约开始采集”。上位机广播 START，并等待 1003 和 1004 都返回 CONFIRM。缺少任一确认时，上位机会取消启动。
 8. 运行期间查看两行的包数、队列、RSSI 和 SNR。停止后等待两台节点都回到“待机”且 `queue=0`。
-9. 核对输出：`data/e870/run_<run>/sensor1003/` 与 `sensor1004/` 下的 `acceleration.csv`、`packets.csv`，以及 `data/e870/capture_report.json`。
+9. 核对输出：`data/e870/run_<run>/sensor1003/` 与 `sensor1004/` 下的 `acceleration.csv`、`packets.csv`，以及 `data/e870/capture_report.json`。PPS同步模式还要核对 `data/e870/run_<run>/pps_sync/manifest.json`。
 
 本阶段已经通过“两台设备都能通过网关收到数据”。2026-11-21 的 run 607279163 完成 60 秒双节点接收，详见 12.6。两台节点当前都用内部时钟：1003 的时间轴偏慢，1004 的时间轴偏快。两者的时间轴方向相反，不能把双节点数据判为跨节点时间同步合格。
 
@@ -574,6 +581,26 @@ data/e870/capture_report.json
 ```powershell
 .\.venv\Scripts\python.exe -m host --nodes 1003,1004 --gateway-config gateway/state/active.local.json
 ```
+
+### 10.5 PPS同步接收模式
+
+“PPS同步”是上位机的接收保存模式，与“原始节点时间”模式并列。节点固件不修改，也不需要重新烧录。
+
+- 共同零点：使用本次运行START报文中的预约UTC整秒时刻 `run_start_us`。
+- 样本序号：网关按节点、运行编号和包序号排序去重，再按每包 `count` 累加样本数。
+- 样本时间：`run_start_us + sample_index × 1_000_000 ÷ rate`。
+- 公共区间：运行结束后，在所有目标节点中取首样本序号最大值和末样本序号最小值，只输出公共区间。
+- 有效性：包序号必须连续，不能有未补齐缺口、迟到样本或缺失节点。否则 `manifest.json` 写入 `valid=false`，不生成对齐宽表。
+- 原始文件：`acceleration.csv` 和 `packets.csv` 始终按原始节点时间保存，不覆盖、不替换。
+- 对齐文件：`pps_sync/sensor<node>/acceleration.csv` 和 `pps_sync/aligned_acceleration.csv` 只包含公共区间的原始加速度值，不插值、不补点。
+- 结果标记：`manifest.json` 写入 `time_axis_source=scheduled_start_plus_sample_index` 和 `physical_sample_sync=false`，并记录各节点原始首末时间相对预约起点的偏移。
+- 命令行：`python -m host --headless --sync-mode pps`。默认值为 `raw`。
+
+限制：
+
+- 该模式统一的是输出时间标签，不改变传感器真实采样时刻。
+- 传感器内部时钟的漂移仍然存在；两台节点在当前1003/1004数据中的原始时间跨度不同。
+- 如果要真正提高物理同步精度，需要让传感器使用稳定外部时钟或统一触发。用户计划后续增加 SI5351 模块，可用于生成稳定 CLKIN；接入 SI5351 后仍需重新验收外部时钟频率、PPS相位和跨节点同步，当前代码不包含 SI5351 驱动。
 
 ## 11. 构建、烧录和软件测试
 
@@ -929,6 +956,8 @@ LoRa 和 ACK 结论：
 13. `clock_hz` 和 `ppm` 在内部时钟模式下没有判定意义。
 14. 数据、日志、构建产物和网关本地配置不进入 Git。
 15. 当前分支尚未推送到远程，合并 `main` 前必须获得明确授权。
+16. PPS同步接收模式已在软件中实现并通过91/91软件测试，尚未完成1003/1004实机验收。
+17. PPS同步只统一输出时间标签，不修正传感器内部时钟漂移；真正物理同步仍需稳定外部时钟或统一触发，后续计划增加 SI5351 模块。
 
 ## 14. 故障排查与恢复
 
@@ -1084,14 +1113,15 @@ Git 不提交：
 
 ## 16. 当前下一步
 
-1. 完成 1003+1004 双节点 5 分钟连续收发，确认队列、到达率和延迟没有随时间恶化。
-2. 调查 run 607279163 网关统计中的 1 个无效报文，确认是否可复现。
-3. 修正外部 32 kHz 频率或时间戳换算；修正前不开展跨节点同步精度验收。
-4. 先完成当前 Heltec + IIM-42352 的完整断电重启及身份复测；恢复 `0x6D` 后验证启动自检、16 字节 FIFO 和 50 Hz 连续采样。
-5. 把 400 ms ACK 发射补偿改为可配置项。
-6. 评估加宽节点 ACK 接收窗口，降低对网关固定延迟的依赖。
-7. 按 1→2→4→8 节点逐级扩容。
-8. 8 节点 50 Hz 连续两小时通过后，再设计 100 Hz/SF5 验收。
+1. 使用 1003/1004 当前固件执行60秒PPS同步双节点验收，确认公共区间时间戳逐行一致、无缺口、`manifest.json` 为 `valid=true`。
+2. 完成 1003+1004 双节点 5 分钟连续收发，确认队列、到达率和延迟没有随时间恶化。
+3. 调查 run 607279163 网关统计中的 1 个无效报文，确认是否可复现。
+4. 评估增加 SI5351，生成稳定外部 CLKIN；接入后重新验收外部时钟频率、PPS相位和跨节点物理同步。
+5. 先完成当前 Heltec + IIM-42352 的完整断电重启及身份复测；恢复 `0x6D` 后验证启动自检、16 字节 FIFO 和 50 Hz 连续采样。
+6. 把 400 ms ACK 发射补偿改为可配置项。
+7. 评估加宽节点 ACK 接收窗口，降低对网关固定延迟的依赖。
+8. 按 1→2→4→8 节点逐级扩容。
+9. 8 节点 50 Hz 连续两小时通过后，再设计 100 Hz/SF5 验收。
 9. 需要合并 `main` 时，先取得用户明确授权。
 
 ## 17. 文档维护规则
