@@ -39,7 +39,7 @@ internal static partial class BuildNodeEnclosure
         return AssembleDual(parts, MeasClip, PowerY, PowerZ, true);
     }
 
-    private static ModelDoc2 MeasuredBase()
+    private static ModelDoc2 MeasuredBase(string name = "DM_Base")
     {
         var doc = NewDoc(false);
         Add(doc, "84 x 66 floor with case screw and battery strap holes", 0, DualFloor, s =>
@@ -90,7 +90,7 @@ internal static partial class BuildNodeEnclosure
         DualPort(doc, "USB reserve 13 x 11 at lower end of PCB", 42, 11, 13, s => Rect(s, -42.4, -13, -39, 0));
         AddMeasuredRoundPort(doc);
         VerifyPart(doc, 84, 66, DualRim);
-        return SavePart(doc, "DM_Base", new[] { .26, .32, .36 });
+        return SavePart(doc, name, new[] { .26, .32, .36 });
     }
 
     private static void MeasuredShelfPads(SketchManager s, bool pilots)
@@ -132,7 +132,7 @@ internal static partial class BuildNodeEnclosure
         return SavePart(doc, "DM_Upper_Shelf", new[] { .23, .51, .52 });
     }
 
-    private static ModelDoc2 MeasuredLid()
+    private static ModelDoc2 MeasuredLid(string name = "DM_Lid")
     {
         var doc = NewDoc(false);
         Add(doc, "84 x 66 cover - four D2.8 holes", 0, DualLidT, s =>
@@ -141,10 +141,10 @@ internal static partial class BuildNodeEnclosure
             Circles(s, MeasLid, 1.4);
         });
         VerifyPart(doc, 84, 66, DualLidT);
-        return SavePart(doc, "DM_Lid", new[] { .32, .39, .42 });
+        return SavePart(doc, name, new[] { .32, .39, .42 });
     }
 
-    private static ModelDoc2 MeasuredReferences()
+    private static ModelDoc2 MeasuredReferences(bool printable = false)
     {
         var doc = NewDoc(false);
         ReferenceBox(doc, "Battery holder 69 x 34 x 18", -34.5, -29.75, DualFloor + BatteryRest,
@@ -158,9 +158,11 @@ internal static partial class BuildNodeEnclosure
                 { right + 3, 20 }, { right, 20 }, { right, GnssY + GnssD }, { GnssX, GnssY + GnssD } });
             Circles(s, MeasGnss, 1);
         }, .13, .39, .73);
-        ReferenceBox(doc, "Power board 59.5 x 25.8", -29.75, PowerY - 3.8, PowerZ - 12.9,
-            29.75, PowerY - 2.2, PowerZ + 12.9, .24, .32, .44);
-        ReferenceBox(doc, "Power horizontal connector allowance", -13, 9.5, 30, 18, PowerY - 3.8, 35, .19, .21, .26);
+        double powerStand = printable ? PrintPowerStand : 0;
+        ReferenceBox(doc, "Power board 59.5 x 25.8", -29.75, PowerY - 3.8 - powerStand, PowerZ - 12.9,
+            29.75, PowerY - 2.2 - powerStand, PowerZ + 12.9, .24, .32, .44);
+        ReferenceBox(doc, "Power horizontal connector allowance", -13, 9.5 - powerStand, 30,
+            18, PowerY - 3.8 - powerStand, 35, .19, .21, .26);
         ReferenceShape(doc, "EoRa 64 x 27 - top projection 3 x 5.5", BoardTopZ - BoardT, BoardTopZ, s =>
         {
             double top = BoardBottomX + 64, yMid = BoardEdgeY + BoardWidth / 2;
@@ -168,6 +170,18 @@ internal static partial class BuildNodeEnclosure
                 { top + 3, yMid - 2.75 }, { top + 3, yMid + 2.75 }, { top, yMid + 2.75 },
                 { top, BoardEdgeY + BoardWidth }, { BoardBottomX, BoardEdgeY + BoardWidth } });
         }, .10, .54, .39);
+        if (!printable) AddAntennaReference(doc);
+        ReferenceBox(doc, "EoRa jumper allowance A", -9.6, -19.7, BoardTopZ, -2, -17, BoardTopZ + PlugSeat + Dupont, .18, .2, .24);
+        ReferenceBox(doc, "EoRa jumper allowance B", 3, 3.5, BoardTopZ, 14, 6.4, BoardTopZ + PlugSeat + Dupont, .18, .2, .24);
+        Require(doc.ForceRebuild3(false), "Measured reference rebuild.");
+        Require(Solids(doc).Length == (printable ? 9 : 11), "Unexpected layout envelope count.");
+        View(doc);
+        Save(doc, printable ? "DP_Layout_References.SLDPRT" : "DM_Layout_References.SLDPRT");
+        return doc;
+    }
+
+    private static void AddAntennaReference(ModelDoc2 doc)
+    {
         var seat = ReferenceBody(doc, "EoRa antenna housing 6 x 9 x 10.6", BoardTopZ, BoardTopZ + AntennaSeatH,
             s => Rect(s, AntennaX - 3, BoardEdgeY, AntennaX + 3, BoardEdgeY + 9), .61, .48, .24);
         const string gaugeName = "D6.5 antenna passage gauge - length not a part dimension";
@@ -175,18 +189,10 @@ internal static partial class BuildNodeEnclosure
         var gauge = doc.FeatureManager.FeatureExtrusion3(true, false, false, 0, 0, M(MeasHalfY + BoardEdgeY), 0,
             false, false, false, false, 0, 0, false, false, false, false, false, false, true, 0, 0, false);
         CheckFeature(gauge, gaugeName);
-        var gaugeBody = PaintReference(gauge, gaugeName, .65, .49, .17);
-        var box = (double[])gaugeBody.GetBodyBox();
+        var box = (double[])PaintReference(gauge, gaugeName, .65, .49, .17).GetBodyBox();
         Near(box[1] * 1000, -MeasHalfY, "Gauge outer end");
         Near(box[4] * 1000, BoardEdgeY, "Gauge inner end");
         Near((box[3] - box[0]) * 1000, AntennaDiameter, "Gauge diameter");
-        ReferenceBox(doc, "EoRa jumper allowance A", -9.6, -19.7, BoardTopZ, -2, -17, BoardTopZ + PlugSeat + Dupont, .18, .2, .24);
-        ReferenceBox(doc, "EoRa jumper allowance B", 3, 3.5, BoardTopZ, 14, 6.4, BoardTopZ + PlugSeat + Dupont, .18, .2, .24);
-        Require(doc.ForceRebuild3(false), "Measured reference rebuild.");
-        Require(Solids(doc).Length == 11, "Expected eleven measured arrangement bodies.");
-        View(doc);
-        Save(doc, "DM_Layout_References.SLDPRT");
-        return doc;
     }
 
     private static void AddMeasuredRoundPort(ModelDoc2 doc)

@@ -28,6 +28,9 @@ internal static partial class BuildNodeEnclosure
             if (args.Length == 2 && args[1] == "--measured") return BuildMeasured(args[0]);
             if (args.Length == 2 && args[1] == "--measured-assemble") return BuildMeasured(args[0], true);
             if (args.Length == 2 && args[1] == "--measured-verify") return VerifySavedDual(args[0], true);
+            if (args.Length == 2 && args[1] == "--printable") return BuildPrintable(args[0]);
+            if (args.Length == 2 && args[1] == "--printable-assemble") return BuildPrintable(args[0], true);
+            if (args.Length == 2 && args[1] == "--printable-verify") return VerifyPrintable(args[0]);
             bool assembleOnly = args.Length == 2 && args[1] == "--assemble";
             if (args.Length != 1 && !assembleOnly) throw new ArgumentException("Specify an empty output directory or an existing part directory followed by --assemble.");
             output = Path.GetFullPath(args[0]);
