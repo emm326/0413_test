@@ -16,6 +16,8 @@ kaiti
 outputs
 ppt_editable_build
 report-extract.txt
+/mechanical/
+/tools/cad/
 data/
 data1
 data2
