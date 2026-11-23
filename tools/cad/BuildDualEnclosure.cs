@@ -33,14 +33,21 @@ internal static partial class BuildNodeEnclosure
         var parts = assembleOnly ? new[] { LoadPart("DL_Base"), LoadPart("DL_Upper_Shelf"), LoadPart("DL_Edge_Clip"),
             LoadPart("DL_Power_Plate"), LoadPart("DL_Lid"), LoadPart("DL_Layout_References") }
             : new[] { DualBase(), DualShelf(), DualClip(), DualPowerPlate(), DualLid(), DualReferences() };
+        return AssembleDual(parts, ClipHoles, 30.3, 23.2, false);
+    }
+
+    private static int AssembleDual(ModelDoc2[] parts, double[,] clips, double powerY, double powerZ, bool measured)
+    {
+        string prefix = measured ? "DM_" : "DL_";
+        string file = measured ? MeasuredFile : DualFile;
         var doc = NewDoc(true);
         var assembly = (AssemblyDoc)doc;
         doc.IGetActiveConfiguration().Name = DualClosed;
         PlaceDual(doc, parts[0], XY, 0, 0, 0);
         PlaceDual(doc, parts[1], XY, 0, 0, ShelfZ);
-        for (int i = 0; i < ClipHoles.GetLength(0); i++)
-            PlaceDual(doc, parts[2], i < 2 ? XY : HalfTurn, ClipHoles[i, 0], ClipHoles[i, 1], ShelfZ + ShelfT);
-        PlaceDual(doc, parts[3], Vertical, 0, 30.3, 23.2);
+        for (int i = 0; i < clips.GetLength(0); i++)
+            PlaceDual(doc, parts[2], i < 2 ? XY : HalfTurn, clips[i, 0], clips[i, 1], ShelfZ + ShelfT);
+        PlaceDual(doc, parts[3], Vertical, 0, powerY, powerZ);
         PlaceDual(doc, parts[4], XY, 0, 0, DualRim);
         var reference = PlaceDual(doc, parts[5], XY, 0, 0, 0);
         string referenceName = reference.Name2;
@@ -49,27 +56,27 @@ internal static partial class BuildNodeEnclosure
         AddDualConfig(doc, DualLayout, "Lid removed; shows the nominal electronic envelopes");
         ActivateConfiguration(doc, DualClosed);
         AddDualConfig(doc, DualService, "Lid, upper shelf, clips and electronic envelopes removed");
-        SetDualSuppression(doc, PartComponents(assembly, "DL_Lid").Single());
-        foreach (var item in PartComponents(assembly, "DL_Upper_Shelf").Concat(PartComponents(assembly, "DL_Edge_Clip")))
+        SetDualSuppression(doc, PartComponents(assembly, prefix + "Lid").Single());
+        foreach (var item in PartComponents(assembly, prefix + "Upper_Shelf").Concat(PartComponents(assembly, prefix + "Edge_Clip")))
             SetDualSuppression(doc, item);
         SetDualSuppression(doc, assembly.GetComponentByName(referenceName));
         ActivateConfiguration(doc, DualClosed);
         SetDualSuppression(doc, assembly.GetComponentByName(referenceName));
         ActivateConfiguration(doc, DualLayout);
-        SetDualSuppression(doc, PartComponents(assembly, "DL_Lid").Single());
-        VerifyDual(doc);
+        SetDualSuppression(doc, PartComponents(assembly, prefix + "Lid").Single());
+        VerifyDual(doc, prefix);
         ActivateConfiguration(doc, DualLayout);
         View(doc);
-        Save(doc, DualFile);
+        Save(doc, file);
         sw.CloseDoc(doc.GetTitle());
         foreach (var part in parts) sw.CloseDoc(part.GetTitle());
-        return VerifySavedDual(output);
+        return VerifySavedDual(output, measured);
     }
 
-    private static int VerifySavedDual(string directory)
+    private static int VerifySavedDual(string directory, bool measured = false)
     {
         output = Path.GetFullPath(directory);
-        string path = Path.Combine(output, DualFile);
+        string path = Path.Combine(output, measured ? MeasuredFile : DualFile);
         Require(File.Exists(path), "Missing assembly: " + path);
         sw = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
         var previous = (ModelDoc2)sw.GetOpenDocumentByName(path);
@@ -91,7 +98,7 @@ internal static partial class BuildNodeEnclosure
             Require(string.Equals(Path.GetDirectoryName(componentPath), output, StringComparison.OrdinalIgnoreCase) &&
                 File.Exists(componentPath), "Unresolved or nonlocal reference: " + componentPath);
         }
-        VerifyDual(reopened);
+        VerifyDual(reopened, measured ? "DM_" : "DL_");
         ActivateConfiguration(reopened, DualLayout);
         View(reopened);
         Require(reopened.Save3((int)swSaveAsOptions_e.swSaveAsOptions_Silent, ref err, ref warn) && err == 0 && warn == 0,
@@ -183,7 +190,7 @@ internal static partial class BuildNodeEnclosure
         return SavePart(doc, "DL_Upper_Shelf", new[] { .23, .51, .52 });
     }
 
-    private static ModelDoc2 DualClip()
+    private static ModelDoc2 DualClip(string name = "DL_Edge_Clip")
     {
         var doc = NewDoc(false);
         Add(doc, "M2 screw clip body", 0, 5.8, s =>
@@ -193,10 +200,10 @@ internal static partial class BuildNodeEnclosure
         });
         Add(doc, "Board edge retaining toe", 3.9, 1.9, s => Rect(s, -3.5, 1.8, 3.5, 3.1));
         VerifyPart(doc, 7, 4.8, 5.8);
-        return SavePart(doc, "DL_Edge_Clip", new[] { .63, .66, .66 });
+        return SavePart(doc, name, new[] { .63, .66, .66 });
     }
 
-    private static ModelDoc2 DualPowerPlate()
+    private static ModelDoc2 DualPowerPlate(string name = "DL_Power_Plate")
     {
         var doc = NewDoc(false);
         Add(doc, "Four 3.4 mm power PCB slots - nominal pattern 50 x 17", 0, 2.2, s =>
@@ -206,7 +213,7 @@ internal static partial class BuildNodeEnclosure
                 foreach (var y in new[] { -8.5d, 8.5d }) Slot(s, x, y, 5.6, 3.4);
         });
         VerifyPart(doc, 64, 22.8, 2.2);
-        return SavePart(doc, "DL_Power_Plate", new[] { .26, .46, .56 });
+        return SavePart(doc, name, new[] { .26, .46, .56 });
     }
 
     private static ModelDoc2 DualLid()
@@ -248,14 +255,32 @@ internal static partial class BuildNodeEnclosure
     private static void ReferenceBox(ModelDoc2 doc, string name, double x, double y, double z, double x2, double y2,
         double z2, double r, double g, double b)
     {
-        Sketch(doc, name, s => Rect(s, x, y, x2, y2));
+        ReferenceShape(doc, name, z, z2, s => Rect(s, x, y, x2, y2), r, g, b);
+    }
+
+    private static void ReferenceShape(ModelDoc2 doc, string name, double z, double z2, Action<SketchManager> profile,
+        double r, double g, double b)
+    {
+        ReferenceBody(doc, name, z, z2, profile, r, g, b);
+    }
+
+    private static Body2 ReferenceBody(ModelDoc2 doc, string name, double z, double z2, Action<SketchManager> profile,
+        double r, double g, double b)
+    {
+        Sketch(doc, name, profile);
         var feat = doc.FeatureManager.FeatureExtrusion3(true, false, false, 0, 0, M(z2 - z), 0,
             false, false, false, false, 0, 0, false, false, false, false, false, false, true, 3, M(z), false);
         CheckFeature(feat, name);
+        return PaintReference(feat, name, r, g, b);
+    }
+
+    private static Body2 PaintReference(Feature feat, string name, double r, double g, double b)
+    {
         var faces = (object[])feat.GetFaces();
         var body = (Body2)((Face2)faces[0]).GetBody();
         body.Name = name;
         body.MaterialPropertyValues2 = new double[] { r, g, b, .75, .8, .25, .15, 0, 0 };
+        return body;
     }
 
     private static void Posts(ModelDoc2 doc, string name, double[,] points, double r, double pilot,
@@ -323,12 +348,12 @@ internal static partial class BuildNodeEnclosure
         doc.ClearSelection2(true);
     }
 
-    private static void VerifyDual(ModelDoc2 doc)
+    private static void VerifyDual(ModelDoc2 doc, string prefix)
     {
         ActivateConfiguration(doc, DualClosed);
         CheckDualState(doc, 8, true);
         var asm = (AssemblyDoc)doc;
-        var lid = PartComponents(asm, "DL_Lid").Single();
+        var lid = PartComponents(asm, prefix + "Lid").Single();
         Near(1000 * ((double[])lid.Transform2.ArrayData)[11] + DualLidT, 60, "Closed height");
         ActivateConfiguration(doc, DualLayout);
         CheckDualState(doc, 8, true);
