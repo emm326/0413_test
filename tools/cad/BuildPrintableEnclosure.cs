@@ -8,10 +8,17 @@ using SolidWorks.Interop.swconst;
 
 internal static partial class BuildNodeEnclosure
 {
-    private const string PrintableFile = "Dual_Layer_Printable_84x66.SLDASM";
+    private const string PrintableFile = "双层传感器盒总装.SLDASM";
+    private const string PrintableBase = "盒体";
+    private const string PrintableUsb = "二层接口端支架";
+    private const string PrintableBolt = "二层螺栓端支架";
+    private const string PrintableClip = "开发板压片";
+    private const string PrintableHanging = "悬浮电源板支架";
+    private const string PrintableLid = "盒盖";
+    private const string PrintableReference = "器件占位参考（不打印）";
     private const double PrintPowerStand = 3.2;
     private static readonly double[,] UsbClipHoles = { { -29, -22.2 }, { -29, 9.2 } };
-    private static readonly string[] PrintableParts = { "DP_Base", "DP_Upper_USB", "DP_Upper_Bolt", "DP_Edge_Clip", "DP_Hanging_Plate", "DP_Lid" };
+    private static readonly string[] PrintableParts = { PrintableBase, PrintableUsb, PrintableBolt, PrintableClip, PrintableHanging, PrintableLid };
 
     private static int BuildPrintable(string directory, bool assembleOnly = false)
     {
@@ -22,10 +29,10 @@ internal static partial class BuildNodeEnclosure
         sw = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
         var parts = assembleOnly ? PrintableParts.Select(LoadPart).ToArray() : new[]
         {
-            MeasuredBase("DP_Base"), PrintUsbEnd(), PrintBoltEnd(), DualClip("DP_Edge_Clip"),
-            PrintHangingPlate(), MeasuredLid("DP_Lid")
+            MeasuredBase(PrintableBase), PrintUsbEnd(), PrintBoltEnd(), DualClip(PrintableClip),
+            PrintHangingPlate(), MeasuredLid(PrintableLid)
         };
-        var reference = assembleOnly ? LoadPart("DP_Layout_References") : MeasuredReferences(true);
+        var reference = assembleOnly ? LoadPart(PrintableReference) : MeasuredReferences(true);
         ExportPrintableParts(parts);
         var doc = NewDoc(true);
         var asm = (AssemblyDoc)doc;
@@ -42,12 +49,12 @@ internal static partial class BuildNodeEnclosure
         AddDualConfig(doc, DualLayout, "Lid removed; shows the printed parts and nominal electronic envelopes");
         ActivateConfiguration(doc, DualClosed);
         AddDualConfig(doc, DualService, "Two upper end supports, clips and lid removed for lower access");
-        foreach (string name in new[] { "DP_Lid", "DP_Upper_USB", "DP_Upper_Bolt", "DP_Edge_Clip", "DP_Layout_References" })
+        foreach (string name in new[] { PrintableLid, PrintableUsb, PrintableBolt, PrintableClip, PrintableReference })
             foreach (var component in PartComponents(asm, name)) SetDualSuppression(doc, component);
         ActivateConfiguration(doc, DualClosed);
-        SetDualSuppression(doc, PartComponents(asm, "DP_Layout_References").Single());
+        SetDualSuppression(doc, PartComponents(asm, PrintableReference).Single());
         ActivateConfiguration(doc, DualLayout);
-        SetDualSuppression(doc, PartComponents(asm, "DP_Lid").Single());
+        SetDualSuppression(doc, PartComponents(asm, PrintableLid).Single());
         CheckPrintable(doc);
         ActivateConfiguration(doc, DualLayout);
         View(doc);
@@ -74,7 +81,7 @@ internal static partial class BuildNodeEnclosure
             Rect(s, -32, 2, -26.3, 6.8);
         });
         VerifyPart(doc, 13.3, 34.8, ShelfT + BoardRest);
-        return SavePart(doc, "DP_Upper_USB", new[] { .23, .51, .52 });
+        return SavePart(doc, PrintableUsb, new[] { .23, .51, .52 });
     }
 
     private static void PrintBoltSlots(SketchManager s)
@@ -99,7 +106,7 @@ internal static partial class BuildNodeEnclosure
             PrintBoltSlots(s);
         });
         VerifyPart(doc, 13.8, 34.8, ShelfT + BoardRest);
-        return SavePart(doc, "DP_Upper_Bolt", new[] { .23, .51, .52 });
+        return SavePart(doc, PrintableBolt, new[] { .23, .51, .52 });
     }
 
     private static ModelDoc2 PrintHangingPlate()
@@ -118,7 +125,7 @@ internal static partial class BuildNodeEnclosure
             Circles(s, centers, 1.025);
         });
         VerifyPart(doc, 64, 22.8, 2.2 + PrintPowerStand);
-        return SavePart(doc, "DP_Hanging_Plate", new[] { .26, .46, .56 });
+        return SavePart(doc, PrintableHanging, new[] { .26, .46, .56 });
     }
 
     private static void CheckPrintable(ModelDoc2 doc)
@@ -126,7 +133,7 @@ internal static partial class BuildNodeEnclosure
         var asm = (AssemblyDoc)doc;
         ActivateConfiguration(doc, DualClosed);
         CheckDualState(doc, 7, true);
-        var lid = PartComponents(asm, "DP_Lid").Single();
+        var lid = PartComponents(asm, PrintableLid).Single();
         Near(1000 * ((double[])lid.Transform2.ArrayData)[11] + DualLidT, 60, "Printed model height");
         ActivateConfiguration(doc, DualLayout);
         CheckDualState(doc, 7, true);
@@ -151,10 +158,12 @@ internal static partial class BuildNodeEnclosure
             DualLayout, ref err, ref warn);
         Require(doc != null && err == 0 && (warn & ~(int)swFileLoadWarning_e.swFileLoadWarning_NeedsRegen) == 0,
             "Reopen printable assembly: " + err + "/" + warn);
+        var names = PrintableParts.Concat(new[] { PrintableReference }).ToArray();
         foreach (var c in ((object[])((AssemblyDoc)doc).GetComponents(true)).Cast<Component2>())
         {
             string file = c.GetPathName();
-            Require(string.Equals(Path.GetDirectoryName(file), output, StringComparison.OrdinalIgnoreCase) && File.Exists(file),
+            Require(string.Equals(Path.GetDirectoryName(file), output, StringComparison.OrdinalIgnoreCase) && File.Exists(file) &&
+                names.Contains(Path.GetFileNameWithoutExtension(file)),
                 "Missing or nonlocal component " + file);
         }
         CheckPrintable(doc);

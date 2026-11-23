@@ -364,8 +364,9 @@ internal static partial class BuildNodeEnclosure
     private static void CheckDualState(ModelDoc2 doc, int expected, bool checkInterference)
     {
         string config = doc.IGetActiveConfiguration().Name;
-        Require(doc.ForceRebuild3(false), config + " rebuild.");
         var asm = (AssemblyDoc)doc;
+        asm.ResolveAllLightWeightComponents(false);
+        Require(doc.ForceRebuild3(false), config + " rebuild.");
         var components = ((object[])asm.GetComponents(true)).Cast<Component2>().Where(c => !c.IsSuppressed()).ToArray();
         Require(components.Length == expected, config + " part count: " + components.Length + " expected " + expected);
         Require(components.All(c => c.GetModelDoc2() != null && c.IsFixed()), config + " has unresolved or unfixed parts.");

@@ -176,7 +176,7 @@ internal static partial class BuildNodeEnclosure
         Require(doc.ForceRebuild3(false), "Measured reference rebuild.");
         Require(Solids(doc).Length == (printable ? 9 : 11), "Unexpected layout envelope count.");
         View(doc);
-        Save(doc, printable ? "DP_Layout_References.SLDPRT" : "DM_Layout_References.SLDPRT");
+        Save(doc, printable ? PrintableReference + ".SLDPRT" : "DM_Layout_References.SLDPRT");
         return doc;
     }
 
