@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 
-internal static class BuildNodeEnclosure
+internal static partial class BuildNodeEnclosure
 {
     private const double Rim = 51, Floor = 3.2, TrayZ = 8.2, TrayT = 3.2, LidLip = 4, LidT = 3.2;
     private const string Closed = "Assembled", Open = "Lid_Removed";
@@ -22,6 +22,9 @@ internal static class BuildNodeEnclosure
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         try
         {
+            if (args.Length == 2 && args[1] == "--dual") return BuildDual(args[0]);
+            if (args.Length == 2 && args[1] == "--dual-assemble") return BuildDual(args[0], true);
+            if (args.Length == 2 && args[1] == "--dual-verify") return VerifySavedDual(args[0]);
             bool assembleOnly = args.Length == 2 && args[1] == "--assemble";
             if (args.Length != 1 && !assembleOnly) throw new ArgumentException("Specify an empty output directory or an existing part directory followed by --assemble.");
             output = Path.GetFullPath(args[0]);
